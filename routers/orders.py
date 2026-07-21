@@ -1,0 +1,420 @@
+# Checkout (cart -> order) and the customer-facing order endpoints, plus
+# staff-only status advancement and its order_status_history audit log.
+
+import logging
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+
+from audit import write_audit_log
+from database import get_db
+from envelope import EnvelopeRoute
+from models import (
+    Branch,
+    Cart,
+    CartItem,
+    CartStatus,
+    Customer,
+    InventoryMovement,
+    InventoryRecord,
+    MovementType,
+    Order,
+    OrderItem,
+    OrderStatus,
+    OrderStatusHistory,
+    Product,
+    ProductVariant,
+    StaffRole,
+    StaffUser,
+)
+from routers.cart import get_current_cart
+from routers.inventory import InsufficientInventoryError
+from schemas import CheckoutRequest, OrderAddressUpdate, OrderItemRead, OrderRead, OrderStatusHistoryRead, OrderStatusUpdate
+from security import bearer_scheme, decode_token_claims, get_current_customer, require_staff_role
+
+router = APIRouter(prefix="/orders", tags=["orders"], route_class=EnvelopeRoute)
+
+logger = logging.getLogger(__name__)
+
+
+class InvalidStateTransitionError(Exception):
+    # Same pattern as InsufficientInventoryError/DuplicatePaymentError - a
+    # plain exception, turned into a 409 by the handler registered in
+    # main.py.
+    pass
+
+
+# Mirrors the order_status lifecycle from the DB design doc §6.1 exactly:
+# pending -> confirmed -> packed -> out_for_delivery -> delivered, with
+# cancellation only possible from pending/confirmed. Delivered/cancelled
+# are terminal - no further transition is ever valid from either.
+VALID_STATUS_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
+    OrderStatus.PENDING: {OrderStatus.CONFIRMED, OrderStatus.CANCELLED},
+    OrderStatus.CONFIRMED: {OrderStatus.PACKED, OrderStatus.CANCELLED},
+    OrderStatus.PACKED: {OrderStatus.OUT_FOR_DELIVERY},
+    OrderStatus.OUT_FOR_DELIVERY: {OrderStatus.DELIVERED},
+    OrderStatus.DELIVERED: set(),
+    OrderStatus.CANCELLED: set(),
+}
+
+STATUS_ADVANCE_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER)
+
+
+def _resolve_order_actor(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    # Same "either a customer or any staff role" pattern as
+    # routers/payments.py's _resolve_actor - status-history visibility
+    # follows the same "Owning Customer or Staff" rule payments do.
+    invalid_token = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    claims = decode_token_claims(credentials.credentials)
+    if claims is None:
+        raise invalid_token
+
+    if claims.get("type") == "customer":
+        customer = db.get(Customer, uuid.UUID(claims["sub"]))
+        if customer is None:
+            raise invalid_token
+        return "customer", customer
+
+    if claims.get("type") == "staff":
+        staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
+        if staff is None or not staff.is_active:
+            raise invalid_token
+        return "staff", staff
+
+    raise invalid_token
+
+# Statuses in which an order can still be changed by the customer -
+# per the docs, editing/cancelling stops being allowed once it's out for
+# delivery (it might already be on a bike heading to the customer).
+EDITABLE_STATUSES = {OrderStatus.PENDING, OrderStatus.CONFIRMED, OrderStatus.PACKED}
+
+
+def _generate_order_number(db: Session) -> str:
+    # Format: JN-YYYYMMDD-NNNN, sequential within the day. Counting
+    # today's existing orders isn't perfectly race-safe under concurrent
+    # checkouts, but that level of hardening is a later-phase concern, not
+    # something to solve while still learning the basics.
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    count_today = db.query(Order).filter(Order.order_number.like(f"JN-{today}-%")).count()
+    return f"JN-{today}-{count_today + 1:04d}"
+
+
+def _find_fulfilling_branch(db: Session, cart_items: list[CartItem]) -> Branch | None:
+    # Naive rule (the docs don't specify the real one): the first active
+    # branch that has enough quantity_available of EVERY item in the cart.
+    branches = db.query(Branch).filter(Branch.is_active == True).all()  # noqa: E712
+    for branch in branches:
+        has_enough_stock = True
+        for item in cart_items:
+            record = (
+                db.query(InventoryRecord)
+                .filter(
+                    InventoryRecord.branch_id == branch.id,
+                    InventoryRecord.variant_id == item.variant_id,
+                )
+                .first()
+            )
+            if record is None or record.quantity_available < item.quantity:
+                has_enough_stock = False
+                break
+        if has_enough_stock:
+            return branch
+    return None
+
+
+def _build_order_read(order: Order, db: Session) -> OrderRead:
+    items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+    return OrderRead(
+        id=order.id,
+        order_number=order.order_number,
+        customer_id=order.customer_id,
+        fulfilling_branch_id=order.fulfilling_branch_id,
+        guest_full_name=order.guest_full_name,
+        guest_phone_number=order.guest_phone_number,
+        guest_email=order.guest_email,
+        delivery_address=order.delivery_address,
+        status=order.status,
+        requires_prepayment=order.requires_prepayment,
+        subtotal=order.subtotal,
+        total=order.total,
+        created_at=order.created_at,
+        updated_at=order.updated_at,
+        items=[OrderItemRead.model_validate(i) for i in items],
+    )
+
+
+@router.post("", response_model=OrderRead)
+def checkout(
+    request: CheckoutRequest,
+    cart: Cart = Depends(get_current_cart),
+    db: Session = Depends(get_db),
+):
+    cart_items = db.query(CartItem).filter(CartItem.cart_id == cart.id).all()
+    if not cart_items:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cart is empty")
+
+    branch = _find_fulfilling_branch(db, cart_items)
+    if branch is None:
+        # warning, not error - this is a real business event worth having
+        # visibility into (repeated occurrences might mean a restocking
+        # problem), but it's an EXPECTED outcome the app already handles
+        # cleanly (409 via InsufficientInventoryError), not a bug. Sentry's
+        # LoggingIntegration only turns ERROR+ into its own Issue by
+        # default, so this becomes a breadcrumb/log entry, not a false-alarm
+        # error notification.
+        logger.warning("Checkout failed: no branch has enough stock for cart %s", cart.id)
+        raise InsufficientInventoryError("No branch has enough stock to fulfill this order")
+
+    # Build the order's line items BEFORE touching inventory, so if
+    # anything here fails, we haven't already decremented stock we then
+    # have no order to justify.
+    order_items = []
+    subtotal = 0.0
+    for item in cart_items:
+        variant = db.get(ProductVariant, item.variant_id)
+        product = db.get(Product, variant.product_id)
+        line_total = item.quantity * item.unit_price_snapshot
+        subtotal += line_total
+        order_items.append(
+            OrderItem(
+                variant_id=item.variant_id,
+                product_name_snapshot=product.name,
+                variant_label_snapshot=variant.variant_label,
+                quantity=item.quantity,
+                unit_price=item.unit_price_snapshot,
+                line_total=line_total,
+            )
+        )
+
+    new_order = Order(
+        order_number=_generate_order_number(db),
+        customer_id=cart.customer_id,
+        fulfilling_branch_id=branch.id,
+        guest_full_name=request.guest_full_name,
+        guest_phone_number=request.guest_phone_number,
+        guest_email=request.guest_email,
+        delivery_address=request.delivery_address,
+        subtotal=subtotal,
+        total=subtotal,  # no tax/delivery fee/discount logic yet
+    )
+    db.add(new_order)
+    db.flush()  # assigns new_order.id without fully committing yet, so
+    # the order_items below can reference a real order_id
+
+    for order_item in order_items:
+        order_item.order_id = new_order.id
+        db.add(order_item)
+
+    # Decrement the chosen branch's stock for every item now that the
+    # order is committed to existing.
+    for item in cart_items:
+        record = (
+            db.query(InventoryRecord)
+            .filter(InventoryRecord.branch_id == branch.id, InventoryRecord.variant_id == item.variant_id)
+            .first()
+        )
+        record.quantity_available -= item.quantity
+        # staff_user_id=None - a checkout is system-generated (the docs
+        # explicitly call this out: null for system-generated 'sold'
+        # movements), there's no staff actor to attribute it to.
+        db.add(
+            InventoryMovement(
+                inventory_record_id=record.id,
+                movement_type=MovementType.SOLD,
+                quantity_changed=-item.quantity,
+                staff_user_id=None,
+                order_id=new_order.id,
+            )
+        )
+
+    # The cart that was just checked out is done being "active" - a later
+    # add-to-cart call will create a fresh one.
+    cart.status = CartStatus.CONVERTED
+
+    db.commit()
+    db.refresh(new_order)
+    logger.info(
+        "Order %s placed (branch=%s, total=%s)", new_order.order_number, branch.id, new_order.total
+    )
+    return _build_order_read(new_order, db)
+
+
+@router.get("", response_model=list[OrderRead])
+def list_my_orders(
+    skip: int = 0,
+    limit: int = 10,
+    current_customer=Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    orders = (
+        db.query(Order)
+        .filter(Order.customer_id == current_customer.id)
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    return [_build_order_read(o, db) for o in orders]
+
+
+@router.get("/{order_id}", response_model=OrderRead)
+def read_order(
+    order_id: uuid.UUID,
+    current_customer=Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    order = db.get(Order, order_id)
+    # Same 404 whether the order truly doesn't exist or just isn't the
+    # caller's - confirming "it exists but isn't yours" would leak
+    # information a non-owner shouldn't get.
+    if order is None or order.customer_id != current_customer.id:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return _build_order_read(order, db)
+
+
+@router.patch("/{order_id}", response_model=OrderRead)
+def update_order_address(
+    order_id: uuid.UUID,
+    update: OrderAddressUpdate,
+    current_customer=Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    order = db.get(Order, order_id)
+    if order is None or order.customer_id != current_customer.id:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status not in EDITABLE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order can no longer be edited (status: {order.status.value})",
+        )
+
+    order.delivery_address = update.delivery_address
+    db.commit()
+    db.refresh(order)
+    return _build_order_read(order, db)
+
+
+@router.patch("/{order_id}/cancel", response_model=OrderRead)
+def cancel_order(
+    order_id: uuid.UUID,
+    current_customer=Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    order = db.get(Order, order_id)
+    if order is None or order.customer_id != current_customer.id:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.status not in EDITABLE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order can no longer be cancelled (status: {order.status.value})",
+        )
+
+    # Give back the stock this order had reserved, since it's no longer
+    # going to be fulfilled.
+    order_items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+    for item in order_items:
+        record = (
+            db.query(InventoryRecord)
+            .filter(
+                InventoryRecord.branch_id == order.fulfilling_branch_id,
+                InventoryRecord.variant_id == item.variant_id,
+            )
+            .first()
+        )
+        if record is not None:
+            record.quantity_available += item.quantity
+            # Closest fit among the docs' fixed movement_type set for "an
+            # order was cancelled, its reserved stock is coming back" -
+            # staff_user_id=None since this endpoint is customer-initiated,
+            # not a staff action (see routers/orders.py's cancel_order auth).
+            db.add(
+                InventoryMovement(
+                    inventory_record_id=record.id,
+                    movement_type=MovementType.ADJUSTMENT,
+                    quantity_changed=item.quantity,
+                    reason="Order cancelled - stock restored",
+                    staff_user_id=None,
+                    order_id=order.id,
+                )
+            )
+
+    order.status = OrderStatus.CANCELLED
+    db.commit()
+    db.refresh(order)
+    return _build_order_read(order, db)
+
+
+@router.patch("/{order_id}/status", response_model=OrderRead)
+def advance_order_status(
+    order_id: uuid.UUID,
+    update: OrderStatusUpdate,
+    current_staff: StaffUser = Depends(require_staff_role(*STATUS_ADVANCE_ROLES)),
+    db: Session = Depends(get_db),
+):
+    # Staff can act on ANY order here - unlike the customer-facing routes
+    # above, there's no ownership check, just a real 404 if it doesn't exist.
+    order = db.get(Order, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if update.to_status not in VALID_STATUS_TRANSITIONS[order.status]:
+        raise InvalidStateTransitionError(
+            f"Cannot transition order from '{order.status.value}' to '{update.to_status.value}'"
+        )
+
+    previous_status = order.status.value
+    db.add(
+        OrderStatusHistory(
+            order_id=order.id,
+            from_status=previous_status,
+            to_status=update.to_status.value,
+            changed_by_staff_id=current_staff.id,
+            notes=update.notes,
+        )
+    )
+    order.status = update.to_status
+    write_audit_log(
+        db,
+        staff_user_id=current_staff.id,
+        action="order.status_change",
+        resource_type="order",
+        resource_id=order.id,
+        previous_value={"status": previous_status},
+        new_value={"status": update.to_status.value},
+    )
+    db.commit()
+    db.refresh(order)
+    return _build_order_read(order, db)
+
+
+@router.get("/{order_id}/status-history", response_model=list[OrderStatusHistoryRead])
+def read_order_status_history(
+    order_id: uuid.UUID,
+    actor=Depends(_resolve_order_actor),
+    db: Session = Depends(get_db),
+):
+    actor_type, actor_account = actor
+    order = db.get(Order, order_id)
+    # Same "identical 404 either way" privacy pattern as the rest of this
+    # file - a non-owner customer can't distinguish "wrong id" from "not yours".
+    if order is None or (actor_type == "customer" and order.customer_id != actor_account.id):
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return (
+        db.query(OrderStatusHistory)
+        .filter(OrderStatusHistory.order_id == order.id)
+        .order_by(OrderStatusHistory.created_at)
+        .all()
+    )

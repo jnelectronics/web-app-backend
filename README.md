@@ -12,17 +12,20 @@
 
 ## Overview
 
-This service is the FastAPI backend for the JN Electronics Online Shopping Platform. It exposes a versioned REST API (`/api/v1/`) consumed by the React storefront, the administrative dashboard, and future Flutter mobile apps.
+This service is the FastAPI backend for the JN Electronics Online Shopping Platform. It exposes a versioned REST API (`/api/v1/`) consumed by the storefront frontend and future admin/mobile clients.
 
 Full requirements and design context live in [`docs/`](docs/):
 
 | Document | Purpose |
 |---|---|
+| `DATABASE_SCHEMA.md` | **Current, actual** database schema — generated from the real models, kept up to date. Start here for table/column reference. |
+| `JN_API_Specification.md` | Endpoint reference (original design — some endpoints/response shapes have evolved since; the live OpenAPI spec at `/docs` is authoritative for exact request/response shapes) |
+| `JN_Database_Design_Document.md` | Original schema design — superseded by `DATABASE_SCHEMA.md` for anything that's since changed |
 | `JN_SRS.docx` | Software Requirements Specification |
 | `JN_SAD.docx` | System Architecture Document |
-| `JN_Database_Design_Document.md` | Schema, entities, relationships |
-| `JN_API_Specification.md` | Full endpoint reference |
-| `JN_Developer_Documentation.md` | Setup, conventions, workflow |
+| `JN_Developer_Documentation.md` | Original setup/conventions doc — see this README and `CLAUDE.md` for the current setup |
+
+`CLAUDE.md` (repo root) has the full architecture/conventions/gotchas reference for anyone (human or AI) working on this codebase.
 
 ## Tech Stack
 
@@ -30,44 +33,50 @@ Full requirements and design context live in [`docs/`](docs/):
 |---|---|
 | Framework | FastAPI |
 | ORM / Migrations | SQLAlchemy 2.0 / Alembic |
-| Database | PostgreSQL (Neon) |
-| Queue / Cache | Redis + RQ |
+| Database | PostgreSQL (Neon, hosted) |
+| Queue / Background jobs | Redis + RQ |
 | Auth | JWT (access + refresh), Argon2 password hashing |
-| Media storage | Cloudinary |
+| Payments | PesaPal API 3.0 |
+| Error monitoring / logging | Sentry |
+| Media storage | Client-hosted URLs today — no Cloudinary integration yet |
 
 ## Repository Structure
 
-```
-app/
-├── core/            # config, security, logging, exceptions, shared deps
-├── db/              # session, declarative base, enums, generic repository
-├── modules/          # one folder per business domain
-│   ├── auth/  users/  branches/  categories/  products/
-│   ├── inventory/  cart/  orders/  payments/
-│   └── promotions/  dashboard/  audit/
-├── integrations/    # cloudinary, email, payment, storage clients
-├── workers/         # email, payment, promotion, cleanup background jobs
-├── middleware/
-└── main.py
+Flat, not modular — everything lives at the repo root rather than under `app/`:
 
+```
+main.py              # FastAPI app, router wiring, exception handlers, CORS, Sentry/logging setup
+database.py          # engine/session/Base/mixins
+models.py            # every SQLAlchemy model
+schemas.py           # every Pydantic schema
+security.py          # password hashing, JWT, auth dependencies
+envelope.py           # the {success,message,data} response envelope (route_class)
+audit.py             # audit_logs writer
+observability.py     # shared Sentry + logging setup (used by both main.py and worker.py)
+pesapal_client.py    # PesaPal API 3.0 wrapper
+redis_queue.py       # Redis connection + RQ queue
+jobs.py              # background job functions (run by worker.py)
+worker.py            # background worker process entry point
+routers/             # one file per domain - routes only
 alembic/             # migrations
-tests/
-├── unit/  integration/  api/
-scripts/             # one-off ops scripts (e.g. seed_admin)
-requirements/         # base / dev / prod dependency sets
+tests/                # pytest suite, one file per phase
+seed_admin.py         # one-off script: creates the first System Administrator
+register_pesapal_ipn.py  # one-off script: registers the PesaPal webhook URL
 ```
 
-Each module owns its own `router.py`, `schemas.py`, `service.py`, `repository.py`, and `models.py`. Business logic lives in the service layer; repositories stay dumb; routers stay thin. See the Developer Documentation for the full conventions.
+This was chosen deliberately over a layered `app/modules/<domain>/{router,service,repository,schemas,models}.py` structure — simpler to reason about at this project's size. See `CLAUDE.md` for the full rationale and conventions.
 
 ## Getting Started
 
 ### Prerequisites
 
-| Tool | Version |
+| Tool | Notes |
 |---|---|
-| Docker & Docker Compose | latest stable |
-| Python | 3.11+ (if running outside Docker) |
-| Git | latest stable |
+| Python | 3.11+ |
+| Git | |
+| Docker | Only needed to run Redis locally (see below) — the API itself does not run in a container |
+
+No local Postgres needed — this project runs against a hosted Neon instance.
 
 ### 1. Clone and configure
 
@@ -77,72 +86,91 @@ cd web-app-backend
 cp .env.example .env
 ```
 
-Fill in `.env` with local values — never commit it.
+Fill in `.env` with real values — see `.env.example` for every variable this project reads (database, JWT secret, Redis, PesaPal, CORS, Sentry). **Never commit `.env`.**
 
-### 2. Start the environment
-
-```bash
-docker compose up --build
-```
-
-This brings up the FastAPI API, an RQ worker, Redis, and a local PostgreSQL instance.
-
-### 3. Run database migrations
+### 2. Install dependencies
 
 ```bash
-docker compose exec api alembic upgrade head
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # macOS/Linux
+pip install -r requirements.txt
 ```
 
-### 4. Seed the initial System Administrator
-
-Per FR-AUTH-011, the platform ships with exactly one seeded System Administrator account, created via a one-off script (no account yet has permission to create it through the API):
+### 3. Start Redis (for background jobs)
 
 ```bash
-docker compose exec api python -m scripts.seed_admin
+docker run -d --name jn-redis -p 6379:6379 --restart unless-stopped redis:7-alpine
 ```
 
-### 5. Verify it's running
+### 4. Run database migrations
+
+```bash
+alembic upgrade head
+```
+
+### 5. Seed the initial System Administrator
+
+The platform ships with exactly one seeded System Administrator account, created via a one-off script (no account has permission to create one through the API):
+
+```bash
+python seed_admin.py
+```
+
+### 6. Run the API
+
+```bash
+uvicorn main:app --reload
+```
+
+### 7. Run the background worker (separate terminal, for password-reset emails etc.)
+
+```bash
+python worker.py
+```
+
+### 8. Verify it's running
 
 | Service | URL |
 |---|---|
 | API | http://localhost:8000/api/v1 |
-| Health check | http://localhost:8000/health |
 | Swagger docs | http://localhost:8000/docs |
 | ReDoc | http://localhost:8000/redoc |
 
-## Running Without Docker
+### PesaPal webhook (local dev only)
+
+PesaPal can't reach `localhost`, so testing real payment callbacks locally needs a public tunnel:
 
 ```bash
-pip install -r requirements/dev.txt
-uvicorn app.main:app --reload
+ngrok http 8000
+python register_pesapal_ipn.py https://<your-ngrok-url>/api/v1/payments/webhook
 ```
+
+Put the printed `ipn_id` into `.env` as `PESAPAL_IPN_ID`.
 
 ## Testing
 
 ```bash
-docker compose exec api pytest
-docker compose exec api pytest --cov=app --cov-report=term-missing
+pytest tests/ -v
 ```
 
-- `tests/unit/` — service-layer business rules, no DB/network.
-- `tests/integration/` — repository + DB, each test rolled back.
-- `tests/api/` — endpoint tests via FastAPI's `TestClient`.
+Runs against the real (hosted) database — there's no separate test database or transactional rollback-per-test. External services PesaPal talks to are mocked at the test boundary (`tests/test_payments.py`'s `mock_pesapal` fixture); everything else (Postgres, Redis) is hit for real.
 
 ## API Conventions
 
-- Base path: `/api/v1/`. Breaking changes go to `/api/v2/`.
+- Base path: `/api/v1/`.
 - All request/response bodies are JSON, `snake_case` fields, UUID identifiers.
-- Every response follows the standard envelope (`success`, `message`, `data`, optional `pagination`); errors carry an `error_code` — see `JN_API_Specification.md` §2–§6.
+- Every successful response is wrapped in `{"success": true, "message": ..., "data": ...}`; errors are `{"success": false, "message": ..., "error_code": ...}`.
 - Access tokens: `Authorization: Bearer <token>`. Guest cart/checkout: `X-Guest-Token` header.
+- The FastAPI-generated OpenAPI spec at `/docs` is the authoritative, always-current contract.
 
-The FastAPI-generated OpenAPI spec at `/docs` is the authoritative, always-current contract; `JN_API_Specification.md` is its human-readable companion.
+## Deployment
+
+Hosted on [Render](https://render.com) (free tier, connected directly to this GitHub repo for auto-deploy on push to `main`). Required environment variables match `.env.example` — set them in Render's dashboard, not in a committed file. Redis and the background worker also need to run somewhere reachable by the deployed API, not just locally.
 
 ## Contributing
 
-- Branch naming: `feature/<desc>`, `fix/<desc>`, `chore/<desc>`.
-- Open a Pull Request against `main`; at least one review + passing CI required.
-- New/changed endpoints must be reflected in the API Specification document in the same PR.
-- New/changed tables/columns must be reflected in the Database Design Document.
+- New/changed tables or columns: update `docs/DATABASE_SCHEMA.md` in the same change.
+- New/changed endpoints: the live OpenAPI spec at `/docs` is authoritative; update `JN_API_Specification.md` if it materially diverges.
 - Never commit secrets or `.env` files.
-
-See `docs/JN_Developer_Documentation.md` for the full contribution checklist.
+- Run `pytest tests/ -v` before pushing.

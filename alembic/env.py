@@ -1,34 +1,54 @@
 from logging.config import fileConfig
 
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+
 from alembic import context
-from sqlalchemy import engine_from_config, pool
 
-from app.core.config import settings
-from app.db.base import Base
+# Import our own database setup and models so Alembic knows what tables
+# should exist. Importing `models` runs that file, which registers the
+# Product class onto Base.metadata - that's what "autogenerate" reads
+# to figure out what migration to write.
+from database import Base, DATABASE_URL
+import models  # noqa: F401  (imported for its side effect of registering models)
 
-# Import every module's models so Base.metadata is fully populated for autogenerate.
-from app.modules.auth import models as auth_models  # noqa: F401
-from app.modules.users import models as users_models  # noqa: F401
-from app.modules.branches import models as branches_models  # noqa: F401
-from app.modules.categories import models as categories_models  # noqa: F401
-from app.modules.products import models as products_models  # noqa: F401
-from app.modules.inventory import models as inventory_models  # noqa: F401
-from app.modules.cart import models as cart_models  # noqa: F401
-from app.modules.orders import models as orders_models  # noqa: F401
-from app.modules.payments import models as payments_models  # noqa: F401
-from app.modules.promotions import models as promotions_models  # noqa: F401
-from app.modules.audit import models as audit_models  # noqa: F401
-
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
+# Instead of hardcoding the DB connection string in alembic.ini (which would
+# mean keeping a secret in two places), we reuse the same DATABASE_URL our
+# app already reads from .env.
+config.set_main_option("sqlalchemy.url", DATABASE_URL)
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# This tells Alembic's "autogenerate" what our models say the database
+# SHOULD look like, so it can compare that against what the database
+# ACTUALLY looks like and write the difference as a migration.
 target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
 
 
 def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
@@ -36,11 +56,18 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
+
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -48,7 +75,9 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
 
         with context.begin_transaction():
             context.run_migrations()

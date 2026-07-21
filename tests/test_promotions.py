@@ -1,0 +1,138 @@
+# Covers Promotions: public banner listing (respecting the active
+# schedule window, not just is_active) and Inventory-Manager-only writes
+# for both banners and per-product discounts.
+
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from conftest import unwrap
+from models import Banner, Category, Product, ProductDiscount, StaffRole, StaffUser
+from security import create_access_token, hash_password
+
+
+@pytest.fixture
+def inventory_manager_token(db):
+    staff = StaffUser(
+        full_name="Promo Manager",
+        email=f"promomgr-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("Password123"),
+        role=StaffRole.INVENTORY_MANAGER,
+    )
+    db.add(staff)
+    db.commit()
+
+    yield create_access_token(subject=str(staff.id), account_type="staff")
+
+    db.query(StaffUser).filter(StaffUser.id == staff.id).delete()
+    db.commit()
+
+
+def _auth(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def scheduled_banners(db):
+    now = datetime.now(timezone.utc)
+    live = Banner(title="Live Banner", image_url="https://example.com/live.png", is_active=True)
+    future = Banner(
+        title="Future Banner",
+        image_url="https://example.com/future.png",
+        is_active=True,
+        starts_at=now + timedelta(days=1),
+    )
+    expired = Banner(
+        title="Expired Banner",
+        image_url="https://example.com/expired.png",
+        is_active=True,
+        ends_at=now - timedelta(days=1),
+    )
+    inactive = Banner(title="Inactive Banner", image_url="https://example.com/off.png", is_active=False)
+    db.add_all([live, future, expired, inactive])
+    db.commit()
+
+    yield live
+
+    db.query(Banner).filter(Banner.id.in_([live.id, future.id, expired.id, inactive.id])).delete(
+        synchronize_session=False
+    )
+    db.commit()
+
+
+def test_public_banner_list_only_shows_currently_live_ones(client, scheduled_banners):
+    response = client.get("/api/v1/banners")
+    assert response.status_code == 200
+    titles = {b["title"] for b in unwrap(response)}
+    assert titles == {"Live Banner"}
+
+
+def test_banner_write_requires_inventory_manager(client, inventory_manager_token, db):
+    response = client.post(
+        "/api/v1/banners", json={"title": "New Banner", "image_url": "https://example.com/new.png"}
+    )
+    assert response.status_code in (401, 403)
+
+    response = client.post(
+        "/api/v1/banners",
+        json={"title": "New Banner", "image_url": "https://example.com/new.png"},
+        headers=_auth(inventory_manager_token),
+    )
+    assert response.status_code == 200
+    banner = unwrap(response)
+    assert banner["is_active"] is True
+
+    response = client.patch(
+        f"/api/v1/banners/{banner['id']}/status", headers=_auth(inventory_manager_token)
+    )
+    assert response.status_code == 200
+    assert unwrap(response)["is_active"] is False
+
+    db.query(Banner).filter(Banner.id == uuid.UUID(banner["id"])).delete()
+    db.commit()
+
+
+@pytest.fixture
+def product(db):
+    category = Category(name=f"Promo Test Category {uuid.uuid4().hex[:8]}")
+    db.add(category)
+    db.flush()
+    product = Product(category_id=category.id, name="Promo Test Product")
+    db.add(product)
+    db.commit()
+
+    yield product
+
+    db.query(ProductDiscount).filter(ProductDiscount.product_id == product.id).delete()
+    db.commit()
+    db.query(Product).filter(Product.id == product.id).delete()
+    db.commit()
+    db.query(Category).filter(Category.id == category.id).delete()
+    db.commit()
+
+
+def test_product_discount_lifecycle(client, product, inventory_manager_token):
+    response = client.post(
+        f"/api/v1/products/{product.id}/discounts",
+        json={"discount_type": "percentage", "discount_value": 15},
+        headers=_auth(inventory_manager_token),
+    )
+    assert response.status_code == 200
+    discount = unwrap(response)
+    assert discount["is_active"] is True
+
+    response = client.put(
+        f"/api/v1/products/{product.id}/discounts/{discount['id']}",
+        json={"discount_type": "fixed_amount", "discount_value": 5000},
+        headers=_auth(inventory_manager_token),
+    )
+    assert response.status_code == 200
+    assert unwrap(response)["discount_type"] == "fixed_amount"
+
+    response = client.patch(
+        f"/api/v1/products/{product.id}/discounts/{discount['id']}/status",
+        headers=_auth(inventory_manager_token),
+    )
+    assert response.status_code == 200
+    assert unwrap(response)["is_active"] is False

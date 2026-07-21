@@ -1,0 +1,303 @@
+# Payment attempts against an order, backed by the REAL PesaPal API 3.0
+# gateway (pesapal_client.py) - no longer simulated. initiate_payment calls
+# PesaPal's SubmitOrderRequest and returns a redirect_url the frontend
+# sends the customer's browser to (PesaPal's own hosted checkout page).
+#
+# /payments/webhook is PesaPal's IPN callback. It's on a SEPARATE router
+# (webhook_router, no route_class=EnvelopeRoute) - PesaPal's own systems
+# parse this response directly and expect an exact JSON shape (see
+# payment_webhook below), not our API's usual {"success","message","data"}
+# envelope. Wrapping it would break PesaPal's ability to read it.
+
+import logging
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+
+from database import get_db
+from envelope import EnvelopeRoute
+from models import Customer, Order, Payment, PaymentStatus, StaffUser
+from pesapal_client import PesaPalError, get_transaction_status, is_configured, submit_order_request
+from schemas import PaymentInitiate, PaymentRead
+from security import bearer_scheme, decode_token_claims
+
+router = APIRouter(tags=["payments"], route_class=EnvelopeRoute)
+webhook_router = APIRouter(tags=["payments"])
+
+logger = logging.getLogger(__name__)
+
+
+class DuplicatePaymentError(Exception):
+    # Raised when an order already has a successful payment - mirrors
+    # InsufficientInventoryError's pattern (routers/inventory.py): a plain
+    # exception class, turned into a clean 409 by the handler registered
+    # in main.py, instead of every call site building its own HTTPException.
+    pass
+
+
+class PaymentsUnavailableError(Exception):
+    # Raised when PesaPal isn't configured yet (see pesapal_client.is_configured) -
+    # e.g. while a real merchant account is still going through PesaPal's
+    # business verification. Turned into a clean 503 with a friendly
+    # customer-facing message by the handler in main.py, instead of every
+    # checkout attempt failing deep inside a PesaPal HTTP error.
+    pass
+
+
+def _resolve_actor(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> tuple[str, Customer | StaffUser]:
+    # Payments are the first endpoint where BOTH a customer and a staff
+    # token are valid - unlike get_current_customer/get_current_staff in
+    # security.py, which each only accept one token type. Returns
+    # ("customer", Customer) or ("staff", StaffUser) so the route can decide
+    # what "allowed to see this order" means for each case.
+    invalid_token = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    claims = decode_token_claims(credentials.credentials)
+    if claims is None:
+        raise invalid_token
+
+    if claims.get("type") == "customer":
+        customer = db.get(Customer, uuid.UUID(claims["sub"]))
+        if customer is None:
+            raise invalid_token
+        return "customer", customer
+
+    if claims.get("type") == "staff":
+        staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
+        if staff is None or not staff.is_active:
+            raise invalid_token
+        return "staff", staff
+
+    raise invalid_token
+
+
+def _get_visible_order(order_id: uuid.UUID, actor_type: str, actor, db: Session) -> Order:
+    # Staff (any role - the docs don't restrict payments to a specific
+    # role, unlike catalog writes) can see any order. A customer can only
+    # see their own - same "identical 404 either way" privacy pattern
+    # routers/orders.py already uses, so a non-owner can't tell the
+    # difference between "wrong order id" and "not yours".
+    order = db.get(Order, order_id)
+    not_found = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    if order is None:
+        raise not_found
+    if actor_type == "customer" and order.customer_id != actor.id:
+        raise not_found
+    return order
+
+
+def _map_pesapal_status(payment_status_description: str) -> tuple[PaymentStatus, str | None]:
+    # PesaPal has four possible statuses; this project's PaymentStatus enum
+    # only has PENDING/AWAITING_PAYMENT/PAID/FAILED. REVERSED (a payment
+    # that succeeded and was later reversed/refunded) collapses onto
+    # FAILED here too - this project doesn't model refunds as their own
+    # state yet, a deliberate scope line, not an oversight.
+    #
+    # .upper() is load-bearing, not defensive fluff - a real live sandbox
+    # test returned "Completed" (Title Case), not "COMPLETED" as the docs'
+    # examples show, and an exact-match comparison silently mapped a
+    # genuinely successful payment to FAILED. Confirmed no test would have
+    # caught this - the mocked unit tests control this value directly, so
+    # they never exercise the real casing PesaPal actually sends.
+    normalized = payment_status_description.upper()
+    if normalized == "COMPLETED":
+        return PaymentStatus.PAID, None
+    if normalized == "REVERSED":
+        return PaymentStatus.FAILED, "Payment was reversed"
+    if normalized == "INVALID":
+        return PaymentStatus.FAILED, "Payment is invalid"
+    return PaymentStatus.FAILED, "Payment failed"
+
+
+@router.post("/orders/{order_id}/payments", response_model=PaymentRead, status_code=status.HTTP_201_CREATED)
+def initiate_payment(
+    order_id: uuid.UUID,
+    request: PaymentInitiate,
+    actor=Depends(_resolve_actor),
+    db: Session = Depends(get_db),
+):
+    actor_type, actor_account = actor
+    # Ownership check BEFORE the is_configured() check below - a caller
+    # who can't see this order shouldn't learn anything about payment
+    # availability for it either, same "identical 404 either way" privacy
+    # reasoning _get_visible_order already applies elsewhere.
+    order = _get_visible_order(order_id, actor_type, actor_account, db)
+
+    if not is_configured():
+        raise PaymentsUnavailableError("Payment services will be available soon. Please check back later.")
+
+    already_paid = (
+        db.query(Payment)
+        .filter(Payment.order_id == order.id, Payment.status == PaymentStatus.PAID)
+        .first()
+    )
+    if already_paid is not None:
+        raise DuplicatePaymentError(f"Order {order.order_number} has already been paid")
+
+    new_payment = Payment(
+        order_id=order.id,
+        provider=request.provider,
+        amount=request.amount,
+        status=PaymentStatus.AWAITING_PAYMENT,
+        initiated_at=datetime.now(timezone.utc),
+    )
+    db.add(new_payment)
+    db.flush()  # assigns new_payment.id - used below as PesaPal's unique merchant reference
+
+    # guest_full_name is a single field on Order (see routers/orders.py) -
+    # naive split into first/last, since PesaPal's billing_address wants
+    # them separately and this project never collected them that way.
+    first_name, _, last_name = order.guest_full_name.partition(" ")
+
+    try:
+        pesapal_result = submit_order_request(
+            merchant_reference=str(new_payment.id),
+            amount=request.amount,
+            currency="UGX",
+            description=f"Order {order.order_number} ({request.provider})",
+            billing_email=order.guest_email,
+            billing_phone=order.guest_phone_number,
+            billing_first_name=first_name,
+            billing_last_name=last_name or first_name,
+        )
+    except PesaPalError as exc:
+        # logger.exception (not .info/.warning) - this is a genuine
+        # infrastructure problem (PesaPal unreachable, rejected our
+        # request, etc.), not an expected business outcome, so it SHOULD
+        # become a real Sentry Issue worth being alerted on. exc_info is
+        # attached automatically, giving the full traceback in Sentry.
+        logger.exception("PesaPal SubmitOrderRequest failed for order %s", order.id)
+        # Rolls back the Payment row too - if PesaPal never accepted the
+        # order, there's nothing real for this row to represent.
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Payment gateway error: {exc}")
+
+    new_payment.provider_reference = pesapal_result["order_tracking_id"]
+    new_payment.redirect_url = pesapal_result["redirect_url"]
+    db.commit()
+    db.refresh(new_payment)
+    logger.info(
+        "Payment %s initiated for order %s (provider=%s, amount=%s)",
+        new_payment.id,
+        order.id,
+        request.provider,
+        request.amount,
+    )
+    return new_payment
+
+
+@router.get("/orders/{order_id}/payments", response_model=list[PaymentRead])
+def list_order_payments(
+    order_id: uuid.UUID,
+    actor=Depends(_resolve_actor),
+    db: Session = Depends(get_db),
+):
+    actor_type, actor_account = actor
+    order = _get_visible_order(order_id, actor_type, actor_account, db)
+    return (
+        db.query(Payment)
+        .filter(Payment.order_id == order.id)
+        .order_by(Payment.created_at)
+        .all()
+    )
+
+
+@router.get("/payments/{payment_id}", response_model=PaymentRead)
+def read_payment(
+    payment_id: uuid.UUID,
+    actor=Depends(_resolve_actor),
+    db: Session = Depends(get_db),
+):
+    payment = db.get(Payment, payment_id)
+    if payment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+
+    actor_type, actor_account = actor
+    # Re-run the same visibility check via the payment's order, so a
+    # customer can't fetch someone else's payment just by guessing its id.
+    _get_visible_order(payment.order_id, actor_type, actor_account, db)
+    return payment
+
+
+@webhook_router.get("/payments/webhook")
+def payment_webhook(
+    order_tracking_id: str = Query(alias="OrderTrackingId"),
+    order_merchant_reference: str = Query(alias="OrderMerchantReference"),
+    order_notification_type: str = Query(default="IPNCHANGE", alias="OrderNotificationType"),
+    db: Session = Depends(get_db),
+):
+    # PesaPal's IPN deliberately does NOT include the payment's actual
+    # status in this callback (a security measure - see pesapal_client.py)
+    # - just these tracking ids. Finding out what really happened means
+    # calling GetTransactionStatus ourselves, below.
+
+    # The exact acknowledgment shape PesaPal's own systems expect back -
+    # not a response for OUR API's clients. status: 200 = "we handled it",
+    # 500 = "something went wrong on our end, please retry."
+    def ack(processing_status: int) -> dict:
+        return {
+            "orderNotificationType": order_notification_type,
+            "orderTrackingId": order_tracking_id,
+            "orderMerchantReference": order_merchant_reference,
+            "status": processing_status,
+        }
+
+    payment = db.query(Payment).filter(Payment.provider_reference == order_tracking_id).first()
+    if payment is None:
+        # warning, not error - could be a stale/replayed callback (e.g.
+        # from an old test) rather than a real bug, but still worth
+        # knowing about if it happens a lot.
+        logger.warning("PesaPal IPN for unknown order_tracking_id=%s", order_tracking_id)
+        return ack(500)
+
+    # Idempotent per PAYINT-005: once paid, any further callback (even a
+    # legitimate duplicate) is a no-op - never reprocessed or reversed here.
+    if payment.status == PaymentStatus.PAID:
+        return ack(200)
+
+    try:
+        pesapal_status = get_transaction_status(order_tracking_id)
+    except PesaPalError:
+        # A real Sentry Issue, same reasoning as initiate_payment's
+        # PesaPalError handling - PesaPal itself failing to answer a
+        # status check is an infrastructure problem, not a business outcome.
+        logger.exception("PesaPal GetTransactionStatus failed for payment %s", payment.id)
+        return ack(500)
+
+    new_status, failure_reason = _map_pesapal_status(pesapal_status["payment_status_description"])
+
+    if new_status == PaymentStatus.PAID:
+        # Defensive re-check: a DIFFERENT attempt for the same order could
+        # have been confirmed paid in between this payment being created
+        # and this callback arriving. The partial unique index on the
+        # table is the last line of defense against this actually
+        # violating BR-PAY-005; this just avoids trying in the first place.
+        already_paid = (
+            db.query(Payment)
+            .filter(Payment.order_id == payment.order_id, Payment.status == PaymentStatus.PAID)
+            .first()
+        )
+        if already_paid is not None:
+            return ack(200)
+
+    payment.status = new_status
+    payment.failure_reason = failure_reason
+    payment.completed_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # info, not warning, even for a FAILED outcome here - a declined card
+    # is a normal, expected business event at real-world volume, not
+    # something to flag for attention every time it happens.
+    logger.info("Payment %s resolved via webhook: status=%s", payment.id, new_status.value)
+    return ack(200)
