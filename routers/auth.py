@@ -234,13 +234,14 @@ def forgot_password(
     # this low-stakes, revisit if that ever stops being true.
     background_tasks.add_task(send_password_reset_email, customer.email, reset_token)
 
-    # No real email integration exists in this project (see routers/payments.py's
-    # module docstring for the same situation with a payment gateway) - the
-    # token is ALSO returned directly here (on top of being queued above),
-    # so the flow stays fully testable via /docs without a real mail server
-    # or a running worker process. A real deployment would rely on the
-    # queued email job actually being delivered, and would NOT return the
-    # token in the API response.
+    # jobs.py's send_password_reset_email now sends a REAL email (Gmail
+    # SMTP via email_client.py) - but the token is ALSO returned directly
+    # here, on top of being queued above. That's now a deliberate choice
+    # rather than a forced one: it keeps the flow testable via /docs
+    # without needing to check a real inbox every time, at the cost of the
+    # reset token being visible to anyone who can see this API response.
+    # Acceptable for a pilot; worth removing once real customers are using
+    # this endpoint and the token should only ever reach them by email.
     generic_response["reset_token"] = reset_token
     return generic_response
 
