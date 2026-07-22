@@ -2,12 +2,37 @@
 # One pair per domain - a *Create schema (what a client sends us) and a
 # *Read schema (what we send back).
 
+import re
 import uuid
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import AfterValidator, BaseModel, ConfigDict, computed_field
 
 from models import CustomerStatus, CustomerType, DiscountType, MovementType, OrderStatus, PaymentStatus, StaffRole
+
+
+def _validate_password_strength(password: str) -> str:
+    # Deliberately modest requirements for a pilot - long enough and mixed
+    # enough to rule out trivial passwords ("password", "12345678"), not
+    # so strict it becomes user-hostile. AfterValidator runs this AFTER
+    # Pydantic's own type check, so `password` here is already guaranteed
+    # to be a str.
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long")
+    if not re.search(r"[A-Za-z]", password):
+        raise ValueError("Password must contain at least one letter")
+    if not re.search(r"[0-9]", password):
+        raise ValueError("Password must contain at least one digit")
+    return password
+
+
+# A reusable annotated type - anywhere a NEW password is being set (not
+# `current_password` fields, which check an existing password against its
+# hash and shouldn't reject a login/verification just because a password
+# set before this rule existed happens to be weak) uses this instead of
+# plain `str`, so the rule lives in exactly one place.
+PasswordStr = Annotated[str, AfterValidator(_validate_password_strength)]
 
 
 class CategoryCreate(BaseModel):
@@ -145,7 +170,7 @@ class CustomerRegister(BaseModel):
     full_name: str
     email: str
     phone_number: str | None = None
-    password: str
+    password: PasswordStr
 
 
 class CustomerRead(BaseModel):
@@ -168,7 +193,7 @@ class CustomerProfileUpdate(BaseModel):
 
 class CustomerPasswordChange(BaseModel):
     current_password: str
-    new_password: str
+    new_password: PasswordStr
 
 
 class CustomerLogin(BaseModel):
@@ -216,7 +241,7 @@ class PasswordForgotRequest(BaseModel):
 
 class PasswordResetRequest(BaseModel):
     token: str
-    new_password: str
+    new_password: PasswordStr
 
 
 class InventoryAdjust(BaseModel):
@@ -352,7 +377,7 @@ class StaffCreate(BaseModel):
     full_name: str
     email: str
     phone_number: str | None = None
-    password: str
+    password: PasswordStr
     # Deliberately no way to request SYSTEM_ADMINISTRATOR through this
     # schema alone - the router additionally rejects it even though
     # someone could technically pass that value here, since Pydantic can't
@@ -404,7 +429,7 @@ class SalesSummary(BaseModel):
 
 class StaffPasswordChange(BaseModel):
     current_password: str
-    new_password: str
+    new_password: PasswordStr
 
 
 class StaffUpdate(BaseModel):

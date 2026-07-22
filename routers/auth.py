@@ -13,6 +13,7 @@ from database import get_db
 from envelope import EnvelopeRoute
 from jobs import send_password_reset_email
 from models import Customer, CustomerStatus, OwnerType, RefreshToken, StaffUser
+from rate_limit import check_not_locked_out, clear_failed_attempts, record_failed_attempt
 from schemas import (
     CustomerLogin,
     CustomerRead,
@@ -85,6 +86,13 @@ def register(customer: CustomerRegister, db: Session = Depends(get_db)):
 
 @router.post("/login", response_model=TokenPair)
 def login(credentials: CustomerLogin, db: Session = Depends(get_db)):
+    # Keyed by email, prefixed "customer:" so this can never collide with
+    # a staff lockout for the same email address (two separate systems -
+    # see rate_limit.py). Checked BEFORE even looking the customer up, so
+    # a locked-out attacker can't use response timing to learn anything.
+    rate_limit_key = f"customer:{credentials.email}"
+    check_not_locked_out(rate_limit_key)
+
     customer = db.query(Customer).filter(Customer.email == credentials.email).first()
 
     # Deliberately the SAME error for "no such email" and "wrong password" -
@@ -95,9 +103,16 @@ def login(credentials: CustomerLogin, db: Session = Depends(get_db)):
     )
 
     if customer is None or customer.password_hash is None:
+        record_failed_attempt(rate_limit_key)
         raise invalid_credentials
     if not verify_password(credentials.password, customer.password_hash):
+        record_failed_attempt(rate_limit_key)
         raise invalid_credentials
+
+    # The password WAS correct at this point - clear the lockout counter
+    # regardless of what happens next (e.g. the deactivated-account check
+    # below), since this wasn't a guessing failure.
+    clear_failed_attempts(rate_limit_key)
 
     # Checked AFTER verifying the password (not before) - otherwise the
     # response would leak whether a given email belongs to a deactivated
@@ -112,6 +127,9 @@ def login(credentials: CustomerLogin, db: Session = Depends(get_db)):
 
 @router.post("/staff/login", response_model=TokenPair)
 def staff_login(credentials: StaffLogin, db: Session = Depends(get_db)):
+    rate_limit_key = f"staff:{credentials.email}"
+    check_not_locked_out(rate_limit_key)
+
     staff = db.query(StaffUser).filter(StaffUser.email == credentials.email).first()
 
     invalid_credentials = HTTPException(
@@ -119,9 +137,13 @@ def staff_login(credentials: StaffLogin, db: Session = Depends(get_db)):
     )
 
     if staff is None or not staff.is_active:
+        record_failed_attempt(rate_limit_key)
         raise invalid_credentials
     if not verify_password(credentials.password, staff.password_hash):
+        record_failed_attempt(rate_limit_key)
         raise invalid_credentials
+
+    clear_failed_attempts(rate_limit_key)
 
     access_token = create_access_token(subject=str(staff.id), account_type="staff")
     refresh_token = _issue_refresh_token(db, OwnerType.STAFF, staff.id)

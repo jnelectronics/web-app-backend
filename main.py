@@ -2,12 +2,14 @@ import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from observability import setup_observability
+from rate_limit import RateLimitedError
 from routers import audit, auth, branches, cart, categories, customers, dashboard, inventory, orders, payments, products, promotions, staff, variants
 from routers.inventory import InsufficientInventoryError
 from routers.orders import InvalidStateTransitionError
@@ -92,6 +94,19 @@ def payments_unavailable_handler(request: Request, exc: PaymentsUnavailableError
     )
 
 
+# Same pattern again, for repeated failed login attempts (rate_limit.py) -
+# 429 is the standard HTTP status for "too many requests," and the
+# Retry-After header (not just the message body) is the standard way to
+# tell a well-behaved client exactly how long to back off.
+@app.exception_handler(RateLimitedError)
+def rate_limited_handler(request: Request, exc: RateLimitedError):
+    return JSONResponse(
+        status_code=429,
+        content={"success": False, "message": str(exc), "error_code": "RATE_LIMITED"},
+        headers={"Retry-After": str(exc.retry_after_seconds)},
+    )
+
+
 # Same pattern again, for the order status lifecycle rule (FR-ORDER-012:
 # an order can only move to specific next statuses from its current one).
 @app.exception_handler(InvalidStateTransitionError)
@@ -124,6 +139,15 @@ def http_exception_handler(request: Request, exc: StarletteHTTPException):
 # normally bypass HTTPException entirely, so they need their own handler to
 # land in the same error envelope shape instead of FastAPI's default
 # {"detail": [...]} array.
+#
+# jsonable_encoder (not raw exc.errors()) - a custom Pydantic validator
+# that raises a plain ValueError (see schemas.py's PasswordStr) makes
+# Pydantic embed the actual ValueError OBJECT inside exc.errors()'s
+# "ctx.error" field. json.dumps() can't serialize a raw exception object,
+# and JSONResponse built from a plain dict like this doesn't run its
+# content through FastAPI's encoder automatically - jsonable_encoder does
+# that conversion explicitly (same helper FastAPI's own default handler
+# uses internally for exactly this reason).
 @app.exception_handler(RequestValidationError)
 def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
@@ -132,7 +156,7 @@ def validation_exception_handler(request: Request, exc: RequestValidationError):
             "success": False,
             "message": "Validation failed.",
             "error_code": "VALIDATION_ERROR",
-            "errors": exc.errors(),
+            "errors": jsonable_encoder(exc.errors()),
         },
     )
 
