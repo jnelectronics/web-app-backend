@@ -235,14 +235,12 @@ def forgot_password(
     background_tasks.add_task(send_password_reset_email, customer.email, reset_token)
 
     # jobs.py's send_password_reset_email now sends a REAL email (Gmail
-    # SMTP via email_client.py) - but the token is ALSO returned directly
-    # here, on top of being queued above. That's now a deliberate choice
-    # rather than a forced one: it keeps the flow testable via /docs
-    # without needing to check a real inbox every time, at the cost of the
-    # reset token being visible to anyone who can see this API response.
-    # Acceptable for a pilot; worth removing once real customers are using
-    # this endpoint and the token should only ever reach them by email.
-    generic_response["reset_token"] = reset_token
+    # SMTP via email_client.py), so the token is NO LONGER echoed back in
+    # this response the way it was while email was still simulated -
+    # returning it here would let anyone who can see this API response
+    # reset that account's password without ever touching the real email,
+    # which defeats the point of a password reset flow. The only way to
+    # get the token now is to actually receive the email.
     return generic_response
 
 

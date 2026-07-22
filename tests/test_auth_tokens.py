@@ -5,7 +5,13 @@
 import uuid
 
 from conftest import unwrap
+from jobs import PASSWORD_RESET_URL
 from models import Customer, RefreshToken
+
+# mock_email is defined in conftest.py - /auth/password/forgot no longer
+# echoes the reset token back in its response (see routers/auth.py), so
+# this suite has to pull it out of the (mocked) email instead, the same
+# way a real customer would have to actually check their inbox.
 
 
 def test_register_issues_both_tokens(client, db):
@@ -63,7 +69,7 @@ def test_refresh_and_logout(client, db):
         db.commit()
 
 
-def test_password_forgot_and_reset(client, db):
+def test_password_forgot_and_reset(client, db, mock_email):
     email = f"resettest-{uuid.uuid4().hex[:8]}@example.com"
     register_response = client.post(
         "/api/v1/auth/register",
@@ -76,10 +82,19 @@ def test_password_forgot_and_reset(client, db):
         response = client.post("/api/v1/auth/password/forgot", json={"email": "nobody@example.com"})
         assert response.status_code == 200
         assert "reset_token" not in unwrap(response)
+        assert len(mock_email) == 0  # no customer found - no email job queued at all
 
         response = client.post("/api/v1/auth/password/forgot", json={"email": email})
         assert response.status_code == 200
-        reset_token = unwrap(response)["reset_token"]
+        assert "reset_token" not in unwrap(response)
+
+        # The token only ever reaches the customer through the (mocked)
+        # email now - pull it out of the link the same way a real reset
+        # link would be built: PASSWORD_RESET_URL + "?token=" + the token.
+        assert len(mock_email) == 1
+        link_prefix = f"{PASSWORD_RESET_URL}?token="
+        body = mock_email[0]["body"]
+        reset_token = body[body.index(link_prefix) + len(link_prefix) :].split("\n")[0].strip()
 
         # A bogus reset token is rejected
         response = client.post(

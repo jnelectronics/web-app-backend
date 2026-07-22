@@ -15,28 +15,12 @@
 
 import uuid
 
-import pytest
-
 from conftest import unwrap
+from jobs import PASSWORD_RESET_URL
 from models import Customer, RefreshToken
 
-
-@pytest.fixture
-def mock_email(monkeypatch):
-    # jobs.py does `import email_client` (the whole module, not
-    # `from email_client import send_email`), so patching the attribute on
-    # email_client itself is enough - jobs.py looks it up on the same
-    # module object at call time, unlike routers/payments.py's PesaPal
-    # functions which needed patching at their point of use instead (see
-    # mock_pesapal's comment in test_payments.py for that distinction).
-    sent = []
-
-    def fake_send_email(to_email, subject, body):
-        sent.append({"to_email": to_email, "subject": subject, "body": body})
-
-    monkeypatch.setattr("email_client.is_configured", lambda: True)
-    monkeypatch.setattr("email_client.send_email", fake_send_email)
-    return sent
+# mock_email is defined in conftest.py - shared with test_auth_tokens.py,
+# which also triggers this same job.
 
 
 def test_password_forgot_runs_the_email_job(client, db, caplog, mock_email):
@@ -58,8 +42,10 @@ def test_password_forgot_runs_the_email_job(client, db, caplog, mock_email):
         # process is still the one that handles it either way).
         assert len(mock_email) == 1
         assert mock_email[0]["to_email"] == email
-        reset_token = unwrap(response)["reset_token"]
-        assert reset_token in mock_email[0]["body"]
+        # The reset token is no longer echoed back in the API response
+        # (see routers/auth.py's forgot_password) - the email itself is
+        # the only place it should now appear, so check for the link here.
+        assert f"{PASSWORD_RESET_URL}?token=" in mock_email[0]["body"]
         assert f"Password reset email sent to {email}" in caplog.text
     finally:
         db.query(RefreshToken).filter(RefreshToken.owner_id == customer_id).delete()
