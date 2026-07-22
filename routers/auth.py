@@ -5,7 +5,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,6 @@ from database import get_db
 from envelope import EnvelopeRoute
 from jobs import send_password_reset_email
 from models import Customer, CustomerStatus, OwnerType, RefreshToken, StaffUser
-from redis_queue import job_queue
 from schemas import (
     CustomerLogin,
     CustomerRead,
@@ -190,7 +189,9 @@ def logout(
 
 
 @router.post("/password/forgot")
-def forgot_password(request: PasswordForgotRequest, db: Session = Depends(get_db)):
+def forgot_password(
+    request: PasswordForgotRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)
+):
     customer = db.query(Customer).filter(Customer.email == request.email).first()
 
     # Same response whether the email exists or not - otherwise this
@@ -201,11 +202,15 @@ def forgot_password(request: PasswordForgotRequest, db: Session = Depends(get_db
 
     reset_token = create_password_reset_token(subject=str(customer.id))
 
-    # Hands the "send an email" job to Redis and returns immediately -
-    # jobs.py's send_password_reset_email actually RUNS later, on a
-    # separate worker.py process, not here. This request doesn't wait for
-    # it either way.
-    job_queue.enqueue(send_password_reset_email, customer.email, reset_token)
+    # FastAPI's BackgroundTasks - runs jobs.py's send_password_reset_email
+    # AFTER the response has already been sent, in this SAME process, not
+    # on a separate worker. Chosen over the RQ+Redis+worker.py setup
+    # (still in the codebase, just not wired in here - see CLAUDE.md) for
+    # the pilot launch: zero extra cost, since Render's Background Worker
+    # service type has no free tier. Trade-off: if this web process
+    # restarts mid-task, the task is lost - an acceptable risk for a job
+    # this low-stakes, revisit if that ever stops being true.
+    background_tasks.add_task(send_password_reset_email, customer.email, reset_token)
 
     # No real email integration exists in this project (see routers/payments.py's
     # module docstring for the same situation with a payment gateway) - the

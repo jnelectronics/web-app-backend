@@ -119,33 +119,39 @@ Client chose PesaPal over LivePay (LivePay had a 0/100 ScamAdviser trust score, 
 - Audit logging covers product/inventory/staff/order-status writes only, not categories/branches/variants/banners/discounts/images yet.
 - Refresh tokens aren't rotated on use, only revoked.
 
-**Background workers (Redis + RQ) — built.** `redis_queue.py` (connection + the shared `job_queue`), `jobs.py` (job functions - currently just `send_password_reset_email`, which prints instead of actually emailing, same "no real integration" pattern as everything else), `worker.py` (the standalone process: `python worker.py`, runs forever pulling jobs off Redis). `routers/auth.py`'s `forgot_password` enqueues the email job AND still returns the reset token directly in the response (belt-and-suspenders - the token is returned for testability without a running worker, the job demonstrates the real async pattern working end to end).
+**Background workers — built two ways; only one is currently wired in.**
 
-Redis itself runs locally via Docker: `docker run -d --name jn-redis -p 6379:6379 --restart unless-stopped redis:7-alpine`, `REDIS_URL=redis://localhost:6379` in `.env`. `--restart unless-stopped` means it survives a Docker Desktop restart automatically.
+**Currently ACTIVE: FastAPI `BackgroundTasks`.** `routers/auth.py`'s `forgot_password` calls `background_tasks.add_task(send_password_reset_email, ...)` (`jobs.py`) - runs in the same process as the API, after the response is sent, no separate worker or Redis needed. Chosen for the pilot launch specifically because **Render's Background Worker service type has no free tier at all (starts at $7/month)**, while the free Web Service plan was already sufficient. Trade-off, accepted deliberately: if the web process restarts mid-task, the task is lost - acceptable for a job this low-stakes (worst case, a user re-requests a password reset); revisit if a future job actually needs to survive a restart or genuinely can't run in-process.
 
-**Two genuine Windows/RQ incompatibilities hit while building this - both fixed, both worth knowing before touching `worker.py`/`jobs.py` again:**
-- RQ's regular `Worker` class forks a child process per job (`os.fork()`) for isolation - `os.fork()` doesn't exist on Windows at all and crashes the instant a job arrives. Fixed by using `SimpleWorker` instead (runs jobs in the same process, no fork) - both `worker.py` and `tests/test_background_jobs.py` use it. Trade-off: a job that crashes badly enough could in theory take the whole worker down with it, not just itself - acceptable for this project's jobs.
+**Built but NOT called from anywhere: RQ + Redis + a real worker process.** `redis_queue.py` (connection + the shared `job_queue`), `worker.py` (the standalone process: `python worker.py`, runs forever pulling jobs off Redis). This is a fully working, previously-verified-live alternative - switching back means changing exactly one call site (`background_tasks.add_task(...)` → `job_queue.enqueue(...)` in `routers/auth.py`), not rebuilding anything. Worth reviving if: job volume grows enough that blocking the request thread matters, a job needs to survive a process restart, or the project reaches a point where $7/month is trivial compared to what real cross-process queueing buys.
+
+Redis for that path runs locally via Docker: `docker run -d --name jn-redis -p 6379:6379 --restart unless-stopped redis:7-alpine`, `REDIS_URL=redis://localhost:6379` in `.env`. `--restart unless-stopped` means it survives a Docker Desktop restart automatically. (A free Render Key Value instance was also confirmed available if this path gets revived in production - only the Background Worker service type itself is the paid piece.)
+
+**Two genuine Windows/RQ incompatibilities were hit building the RQ path - both fixed, both worth knowing before reviving `worker.py`/`jobs.py`'s RQ call site:**
+- RQ's regular `Worker` class forks a child process per job (`os.fork()`) for isolation - `os.fork()` doesn't exist on Windows at all and crashes the instant a job arrives. Fixed by using `SimpleWorker` instead (runs jobs in the same process, no fork). Trade-off: a job that crashes badly enough could in theory take the whole worker down with it, not just itself - acceptable for this project's jobs.
 - RQ's default job-timeout mechanism (`death_penalty_class`) relies on `signal.SIGALRM`, also Unix-only. Fixed by overriding it to `rq.timeouts.TimerDeathPenalty` (a background-thread-based timeout that works cross-platform) - it's a class attribute, not a constructor argument, so it gets set on the worker instance after construction (`worker.death_penalty_class = TimerDeathPenalty`), not passed into `SimpleWorker(...)`.
 
-Tests use `SimpleWorker(...).work(burst=True)` (process whatever's queued right now, then stop) instead of running a real `worker.py` process in the background during `pytest`.
+`tests/test_background_jobs.py` tests the currently-active `BackgroundTasks` path - `TestClient` runs background tasks to completion before `client.post(...)` returns, so a plain assertion after the call works, no special waiting needed.
 
 ## Pilot readiness
 
 Tracking the gap between "matches the docs" (done) and "safe to put in front of real users." Checklist, updated as items close:
 
 **Done:**
-- ✅ Payments — real PesaPal integration, **verified with a live end-to-end sandbox test** (real checkout, real IPN via ngrok, real DB update — caught and fixed a real case-sensitivity bug in the process, see the Payments section above). Gracefully degrades to a 503 "coming soon" for real (live-credential) users while business verification/settlement contract is pending.
-- ✅ CORS — `CORSMiddleware` in `main.py`, origins configurable via `CORS_ALLOWED_ORIGINS` in `.env` (comma-separated), defaults cover local Vite/CRA dev ports. **Add the real deployed frontend origin(s) here before launch** — the default won't cover a production domain.
+- ✅ Payments — real PesaPal integration, **verified with a live end-to-end sandbox test** (real checkout, real IPN via ngrok, real DB update — caught and fixed a real case-sensitivity bug in the process, see the Payments section above). Gracefully degrades to a 503 "coming soon" for real (live-credential) users while business verification/settlement contract is pending. Webhook now registered against the real deployed URL, not the old ngrok tunnel.
+- ✅ CORS — `CORSMiddleware` in `main.py`, origins configurable via `CORS_ALLOWED_ORIGINS` in `.env`. Real frontend origin (`jnelectronics.vercel.app`) added and confirmed working against the deployed API.
 - ✅ Staff self-service password change — `PATCH /staff/me/password` (mirrors `/customers/me/password`), open to every staff role including Sales Attendant (the one deliberate exception to BR-USER-003's "locked out of this whole module" rule) — closes the gap where the seeded admin account (`seed_admin.py`, well-known default password) had no way to change its own password through the API.
 - ✅ Error monitoring + logging — Sentry, **verified live** (a real test exception was sent and confirmed visible in the dashboard). See "Observability" below for the full setup.
+- ✅ **Deployed** — live on Render (free Web Service), auto-deploys on push to `main`. Required a Python version pin (`.python-version`, see the gotchas list) since Render's default (3.14) broke SQLAlchemy 2.0.30. Verified live: real endpoints, real CORS, real OpenAPI docs.
+- ✅ Background jobs — running via FastAPI `BackgroundTasks`, not RQ/Redis (see "Background workers" above for the full reasoning: Render's Background Worker service type has no free tier).
 
 **Decided, not yet actioned (waiting on the user):**
 - Real email sending — waiting on a domain purchase before setting up a real provider.
-- Hosting — decided: Render free tier to start. Not yet actually deployed anywhere; this is still `uvicorn --reload` on a local machine. Still needs: a way to run Redis + `worker.py` on Render too (not just locally), and secrets (`.env` values) entered into Render's environment variable UI.
-- Neon DB — decided: moved off auto-deleting test branches onto one set to 30-day retention, for now. Will move to the permanent production branch when ready to actually launch.
+- Neon DB — decided: staying on the current 30-day-retention branch through continued dev/testing and the pilot itself; will move to a permanent production branch when ready to actually launch. **Known consequence, explicitly accepted:** local `pytest` runs and the live deployed API currently share this exact same database — test-fixture data (categories/products/customers named things like `"OS Test Category"`) is visible through the real public API right now. Confirmed harmless for now since no real user data exists yet, but revisit before real users start signing up.
 
 **Still open / no decision yet:**
 - Login/password rate limiting and complexity rules — none exist yet; the docs themselves defer general rate limiting past the pilot phase, but brute-forceable login is still a real gap.
+- Whether/when to seed a real System Administrator account on the branch Render is actually using (`seed_admin.py`) — not yet confirmed done.
 
 ## Observability (Sentry + logging)
 

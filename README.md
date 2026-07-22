@@ -34,7 +34,7 @@ Full requirements and design context live in [`docs/`](docs/):
 | Framework | FastAPI |
 | ORM / Migrations | SQLAlchemy 2.0 / Alembic |
 | Database | PostgreSQL (Neon, hosted) |
-| Queue / Background jobs | Redis + RQ |
+| Background jobs | FastAPI `BackgroundTasks` (in-process) — Redis + RQ code exists (`redis_queue.py`/`worker.py`) but isn't currently wired in; see `CLAUDE.md` |
 | Auth | JWT (access + refresh), Argon2 password hashing |
 | Payments | PesaPal API 3.0 |
 | Error monitoring / logging | Sentry |
@@ -54,9 +54,9 @@ envelope.py           # the {success,message,data} response envelope (route_clas
 audit.py             # audit_logs writer
 observability.py     # shared Sentry + logging setup (used by both main.py and worker.py)
 pesapal_client.py    # PesaPal API 3.0 wrapper
-redis_queue.py       # Redis connection + RQ queue
-jobs.py              # background job functions (run by worker.py)
-worker.py            # background worker process entry point
+jobs.py              # background job functions - called via FastAPI BackgroundTasks today
+redis_queue.py       # Redis connection + RQ queue - NOT currently used (see CLAUDE.md)
+worker.py            # RQ worker process entry point - NOT currently used (see CLAUDE.md)
 routers/             # one file per domain - routes only
 alembic/             # migrations
 tests/                # pytest suite, one file per phase
@@ -72,9 +72,9 @@ This was chosen deliberately over a layered `app/modules/<domain>/{router,servic
 
 | Tool | Notes |
 |---|---|
-| Python | 3.11+ |
+| Python | 3.11+ (see `.python-version` — deployment pins this exactly) |
 | Git | |
-| Docker | Only needed to run Redis locally (see below) — the API itself does not run in a container |
+| Docker | Only needed if reviving the RQ/Redis worker path — not required for normal local dev right now |
 
 No local Postgres needed — this project runs against a hosted Neon instance.
 
@@ -97,19 +97,13 @@ source .venv/bin/activate     # macOS/Linux
 pip install -r requirements.txt
 ```
 
-### 3. Start Redis (for background jobs)
-
-```bash
-docker run -d --name jn-redis -p 6379:6379 --restart unless-stopped redis:7-alpine
-```
-
-### 4. Run database migrations
+### 3. Run database migrations
 
 ```bash
 alembic upgrade head
 ```
 
-### 5. Seed the initial System Administrator
+### 4. Seed the initial System Administrator
 
 The platform ships with exactly one seeded System Administrator account, created via a one-off script (no account has permission to create one through the API):
 
@@ -117,19 +111,15 @@ The platform ships with exactly one seeded System Administrator account, created
 python seed_admin.py
 ```
 
-### 6. Run the API
+### 5. Run the API
 
 ```bash
 uvicorn main:app --reload
 ```
 
-### 7. Run the background worker (separate terminal, for password-reset emails etc.)
+That's it — background jobs (currently just password-reset "emails") run via FastAPI's `BackgroundTasks`, in this same process, no separate worker needed. (There's also an RQ + Redis + `worker.py` path in the codebase if this project ever needs real cross-process job queueing again — see `CLAUDE.md`'s "Background workers" section — but it isn't used right now.)
 
-```bash
-python worker.py
-```
-
-### 8. Verify it's running
+### 6. Verify it's running
 
 | Service | URL |
 |---|---|
@@ -154,7 +144,7 @@ Put the printed `ipn_id` into `.env` as `PESAPAL_IPN_ID`.
 pytest tests/ -v
 ```
 
-Runs against the real (hosted) database — there's no separate test database or transactional rollback-per-test. External services PesaPal talks to are mocked at the test boundary (`tests/test_payments.py`'s `mock_pesapal` fixture); everything else (Postgres, Redis) is hit for real.
+Runs against the real (hosted) database — there's no separate test database or transactional rollback-per-test. External services PesaPal talks to are mocked at the test boundary (`tests/test_payments.py`'s `mock_pesapal` fixture); everything else is hit for real.
 
 ## API Conventions
 
@@ -166,7 +156,7 @@ Runs against the real (hosted) database — there's no separate test database or
 
 ## Deployment
 
-Hosted on [Render](https://render.com) (free tier, connected directly to this GitHub repo for auto-deploy on push to `main`). Required environment variables match `.env.example` — set them in Render's dashboard, not in a committed file. Redis and the background worker also need to run somewhere reachable by the deployed API, not just locally.
+Hosted on [Render](https://render.com) (free tier, connected directly to this GitHub repo for auto-deploy on push to `main`). Required environment variables match `.env.example` — set them in Render's dashboard, not in a committed file. Python version is pinned via `.python-version` — Render's default is much newer than this project has ever been tested against.
 
 ## Contributing
 
