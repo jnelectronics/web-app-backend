@@ -144,13 +144,14 @@ Tracking the gap between "matches the docs" (done) and "safe to put in front of 
 - ✅ Error monitoring + logging — Sentry, **verified live** (a real test exception was sent and confirmed visible in the dashboard). See "Observability" below for the full setup.
 - ✅ **Deployed** — live on Render (free Web Service), auto-deploys on push to `main`. Required a Python version pin (`.python-version`, see the gotchas list) since Render's default (3.14) broke SQLAlchemy 2.0.30. Verified live: real endpoints, real CORS, real OpenAPI docs.
 - ✅ Background jobs — running via FastAPI `BackgroundTasks`, not RQ/Redis (see "Background workers" above for the full reasoning: Render's Background Worker service type has no free tier).
+- ✅ Real System Administrator seeded — `seed_admin.py` run against the branch Render actually uses (`admin@jnelectronics.com` / `changeme123` — **still needs its password changed** via `PATCH /staff/me/password`, that default is only meant to survive the first login). Verified via a full live end-to-end workflow test against the deployed URL: customer sign-up → sign-in → cart → checkout → staff account creation → staff sign-in → role-gated order status advancement, all 200s.
 
 **Decided, not yet actioned (waiting on the user):**
 - Real email sending — waiting on a domain purchase before setting up a real provider.
 - Neon DB — decided: staying on the current 30-day-retention branch through continued dev/testing and the pilot itself; will move to a permanent production branch when ready to actually launch. **Known consequence, explicitly accepted:** local `pytest` runs and the live deployed API currently share this exact same database — test-fixture data (categories/products/customers named things like `"OS Test Category"`) is visible through the real public API right now. Confirmed harmless for now since no real user data exists yet, but revisit before real users start signing up.
 
 **Still open / no decision yet:**
-- Login/password rate limiting and complexity rules — none exist yet; the docs themselves defer general rate limiting past the pilot phase, but brute-forceable login is still a real gap.
+- Login/password rate limiting and complexity rules — none exist yet; the docs themselves defer general rate limiting past the pilot phase, but brute-forceable login is still a real gap. **This is the only remaining item with no external dependency** — everything else left is either done or blocked on something outside this codebase (the domain purchase).
 - Whether/when to seed a real System Administrator account on the branch Render is actually using (`seed_admin.py`) — not yet confirmed done.
 
 ## Observability (Sentry + logging)
