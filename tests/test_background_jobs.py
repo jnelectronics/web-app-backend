@@ -5,10 +5,10 @@
 # for a possible future switch, but not called from routers/auth.py
 # anymore - see CLAUDE.md's "Background workers" section for why).
 #
-# email_client's real Gmail SMTP call is mocked here (see mock_email below)
+# email_client's real Resend API call is mocked here (see mock_email below)
 # - same idea as test_payments.py's mock_pesapal fixture for PesaPal. This
 # suite verifies OUR logic (the job runs, builds the right link, logs the
-# right outcome), not that Gmail itself works - that got verified once,
+# right outcome), not that Resend itself works - that got verified once,
 # separately, by actually sending a real email to a real inbox (see
 # CLAUDE.md's Pilot readiness section), not on every pytest run, which
 # shouldn't depend on network access or real credentials.

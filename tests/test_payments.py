@@ -10,6 +10,7 @@
 # every test run, which shouldn't depend on network access or secrets.
 
 import uuid
+from datetime import timedelta
 
 import pytest
 
@@ -245,6 +246,55 @@ def test_payment_lifecycle(client, order_setup, mock_pesapal):
     assert response.status_code == 409
 
 
+def test_payment_confirmed_email_sent_when_webhook_marks_paid(client, db, order_setup, mock_pesapal, mock_email):
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    # order_setup's Order has no guest_email set (see that fixture) - set
+    # one here directly, since send_payment_confirmed_email only fires
+    # when there's actually somewhere to send it (same optional-email
+    # reasoning as send_order_confirmation_email).
+    order.guest_email = "payer-inbox@example.com"
+    db.commit()
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+        headers=headers,
+    )
+    payment = unwrap(response)
+
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Completed"}
+    response = _webhook_call(client, payment["provider_reference"], payment["id"])
+    assert response.status_code == 200
+
+    confirmation = next((e for e in mock_email if e["to_email"] == "payer-inbox@example.com"), None)
+    assert confirmation is not None
+    assert order.order_number in confirmation["subject"]
+    assert order.order_number in confirmation["body"]
+    assert order.order_number in confirmation["html"]
+
+
+def test_no_payment_confirmed_email_when_webhook_marks_failed(client, db, order_setup, mock_pesapal, mock_email):
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+    order.guest_email = "payer-inbox@example.com"
+    db.commit()
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "card", "amount": 50000.0},
+        headers=headers,
+    )
+    payment = unwrap(response)
+
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Failed"}
+    response = _webhook_call(client, payment["provider_reference"], payment["id"])
+    assert response.status_code == 200
+
+    assert not any(e["to_email"] == "payer-inbox@example.com" for e in mock_email)
+
+
 def test_webhook_failed_payment(client, order_setup, mock_pesapal):
     order = order_setup["order"]
     headers = _auth(order_setup["owner_token"])
@@ -268,6 +318,66 @@ def test_webhook_failed_payment(client, order_setup, mock_pesapal):
     assert body["failure_reason"] == "Payment failed"
 
     # A failed attempt doesn't block a new attempt on the same order
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+        headers=headers,
+    )
+    assert response.status_code == 201
+
+
+def test_second_payment_blocked_while_first_still_pending(client, order_setup, mock_pesapal):
+    # Prevents a real double-charge risk: without this, a double-click (or
+    # a retried request) could open a SECOND real PesaPal checkout session
+    # for the same order while the first is still unresolved. Our DB-level
+    # uniqueness only stops us from RECORDING two successful payments - it
+    # does nothing to stop PesaPal from actually taking the customer's
+    # money twice if they went on to complete both.
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "card", "amount": 50000.0},
+        headers=headers,
+    )
+    assert response.status_code == 201
+
+    # A second attempt while the first is still awaiting_payment is
+    # rejected with a DIFFERENT error code than "already paid" - the
+    # frontend needs to tell a customer "wait, one's already in progress"
+    # apart from "this order is already paid for".
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+        headers=headers,
+    )
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "PAYMENT_IN_PROGRESS"
+
+
+def test_stale_pending_payment_does_not_block_retry(client, order_setup, mock_pesapal, db):
+    # The block above has a deliberate time limit (PENDING_PAYMENT_WINDOW_MINUTES,
+    # routers/payments.py) - a customer whose first attempt genuinely
+    # stalled (closed the tab, lost connection) must still be able to
+    # retry eventually, not be locked out of paying at all.
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "card", "amount": 50000.0},
+        headers=headers,
+    )
+    first_payment_id = unwrap(response)["id"]
+
+    # Simulate time passing by directly backdating initiated_at, rather
+    # than actually waiting - this test needs to run in seconds, not
+    # PENDING_PAYMENT_WINDOW_MINUTES real minutes.
+    stale_payment = db.get(Payment, uuid.UUID(first_payment_id))
+    stale_payment.initiated_at = stale_payment.initiated_at - timedelta(minutes=20)
+    db.commit()
+
     response = client.post(
         f"/api/v1/orders/{order.id}/payments",
         json={"provider": "mobile_money", "amount": 50000.0},

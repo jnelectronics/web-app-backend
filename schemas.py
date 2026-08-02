@@ -120,12 +120,11 @@ class VariantRead(BaseModel):
     attributes: dict[str, str]
 
 
-class ProductImageCreate(BaseModel):
-    # No cloudinary_public_id here - that's only ever set by a real
-    # Cloudinary upload, which this project doesn't have (see the model's
-    # comment). The client just supplies a URL to an already-hosted image.
-    image_url: str
-    display_order: int = 0
+# No ProductImageCreate here anymore - POST/PUT .../images now take a real
+# uploaded file (multipart/form-data), not a JSON body, so routers/products.py
+# declares `file: UploadFile` and `display_order: int = Form(0)` directly on
+# the route function instead of via a Pydantic request-body model. Pydantic
+# models describe JSON bodies; a file upload isn't one.
 
 
 class ProductImageRead(BaseModel):
@@ -199,6 +198,14 @@ class CustomerPasswordChange(BaseModel):
 class CustomerLogin(BaseModel):
     email: str
     password: str
+
+
+class GoogleSignIn(BaseModel):
+    # The raw ID token the FRONTEND gets back from Google's own JavaScript
+    # library after the customer signs in with Google - google_auth_client.py
+    # is what actually verifies this is genuine, not this schema. This
+    # model's only job is describing the request body shape.
+    id_token: str
 
 
 class StaffLogin(BaseModel):

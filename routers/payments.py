@@ -11,14 +11,16 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
+from jobs import send_payment_confirmed_email
 from models import Customer, Order, Payment, PaymentStatus, StaffUser
 from pesapal_client import PesaPalError, get_transaction_status, is_configured, submit_order_request
 from schemas import PaymentInitiate, PaymentRead
@@ -29,12 +31,33 @@ webhook_router = APIRouter(tags=["payments"])
 
 logger = logging.getLogger(__name__)
 
+# Not in the original API spec - added as a deliberate safety net once this
+# project switched to real PesaPal credentials (see initiate_payment below).
+# A payment attempt older than this is treated as abandoned rather than
+# still-in-flight, so a customer whose first attempt genuinely stalled
+# (closed the tab, connection dropped) isn't locked out of retrying forever.
+PENDING_PAYMENT_WINDOW_MINUTES = 15
+
 
 class DuplicatePaymentError(Exception):
     # Raised when an order already has a successful payment - mirrors
     # InsufficientInventoryError's pattern (routers/inventory.py): a plain
     # exception class, turned into a clean 409 by the handler registered
     # in main.py, instead of every call site building its own HTTPException.
+    pass
+
+
+class PaymentInProgressError(Exception):
+    # Raised when the order already has a RECENT unresolved payment attempt
+    # (see PENDING_PAYMENT_WINDOW_MINUTES) - prevents a double-click or a
+    # retried request from opening a SECOND real PesaPal checkout session
+    # for the same order. This matters because our own DB-level uniqueness
+    # (Payment's partial unique index, models.py) only stops us from
+    # RECORDING two successful payments - it does nothing to stop PesaPal
+    # from actually charging the customer twice if they went on to complete
+    # two separate checkout sessions. Blocking the second session from ever
+    # being created is the only way to prevent that real double-charge, not
+    # just hide it after the fact.
     pass
 
 
@@ -145,6 +168,22 @@ def initiate_payment(
     if already_paid is not None:
         raise DuplicatePaymentError(f"Order {order.order_number} has already been paid")
 
+    pending_cutoff = datetime.now(timezone.utc) - timedelta(minutes=PENDING_PAYMENT_WINDOW_MINUTES)
+    pending_attempt = (
+        db.query(Payment)
+        .filter(
+            Payment.order_id == order.id,
+            Payment.status == PaymentStatus.AWAITING_PAYMENT,
+            Payment.initiated_at >= pending_cutoff,
+        )
+        .first()
+    )
+    if pending_attempt is not None:
+        raise PaymentInProgressError(
+            f"A payment attempt for order {order.order_number} is already in progress. "
+            "Please wait a few minutes, or check its status, before trying again."
+        )
+
     new_payment = Payment(
         order_id=order.id,
         provider=request.provider,
@@ -232,6 +271,7 @@ def read_payment(
 
 @webhook_router.get("/payments/webhook")
 def payment_webhook(
+    background_tasks: BackgroundTasks,
     order_tracking_id: str = Query(alias="OrderTrackingId"),
     order_merchant_reference: str = Query(alias="OrderMerchantReference"),
     order_notification_type: str = Query(default="IPNCHANGE", alias="OrderNotificationType"),
@@ -294,10 +334,44 @@ def payment_webhook(
     payment.status = new_status
     payment.failure_reason = failure_reason
     payment.completed_at = datetime.now(timezone.utc)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The SELECT re-check above can't fully close a genuine race: TWO
+        # callbacks for TWO DIFFERENT payment attempts on the SAME order
+        # can both pass that check before either commits, if they land at
+        # almost the exact same instant. Only one commit can actually win -
+        # the partial unique index rejects the other one right here. That's
+        # the correct outcome (still only one PAID row, BR-PAY-005 holds),
+        # this just makes sure the LOSING request still acknowledges
+        # cleanly to PesaPal instead of surfacing a raw 500 from an
+        # uncaught database error.
+        db.rollback()
+        logger.warning(
+            "Payment %s lost a same-order PAID race to another attempt - order already paid", payment.id
+        )
+        return ack(200)
 
     # info, not warning, even for a FAILED outcome here - a declined card
     # is a normal, expected business event at real-world volume, not
     # something to flag for attention every time it happens.
     logger.info("Payment %s resolved via webhook: status=%s", payment.id, new_status.value)
+
+    if new_status == PaymentStatus.PAID:
+        # A DIFFERENT event from send_order_confirmation_email (fires at
+        # ORDER placement, before any payment exists) - this one only
+        # fires once money has actually been confirmed received. Only
+        # enqueued when there's an email to send to, same optional-email
+        # reasoning as checkout()'s order confirmation job.
+        order = db.get(Order, payment.order_id)
+        if order.guest_email:
+            background_tasks.add_task(
+                send_payment_confirmed_email,
+                order.guest_email,
+                order.guest_full_name,
+                order.order_number,
+                payment.amount,
+                payment.provider,
+            )
+
     return ack(200)

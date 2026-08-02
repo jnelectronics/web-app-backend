@@ -5,13 +5,14 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
 from audit import write_audit_log
 from database import get_db
 from envelope import EnvelopeRoute
+from jobs import notify_staff_new_order, send_order_confirmation_email
 from models import (
     Branch,
     Cart,
@@ -157,6 +158,7 @@ def _build_order_read(order: Order, db: Session) -> OrderRead:
 @router.post("", response_model=OrderRead)
 def checkout(
     request: CheckoutRequest,
+    background_tasks: BackgroundTasks,
     cart: Cart = Depends(get_current_cart),
     db: Session = Depends(get_db),
 ):
@@ -180,6 +182,12 @@ def checkout(
     # anything here fails, we haven't already decremented stock we then
     # have no order to justify.
     order_items = []
+    # Plain dicts, built alongside order_items above - what
+    # send_order_confirmation_email actually gets handed (see jobs.py for
+    # why: it runs after this request's DB session has closed, so it can
+    # only safely receive plain values, not the OrderItem ORM objects
+    # themselves).
+    item_summaries = []
     subtotal = 0.0
     for item in cart_items:
         variant = db.get(ProductVariant, item.variant_id)
@@ -195,6 +203,14 @@ def checkout(
                 unit_price=item.unit_price_snapshot,
                 line_total=line_total,
             )
+        )
+        item_summaries.append(
+            {
+                "name": product.name,
+                "variant_label": variant.variant_label,
+                "quantity": item.quantity,
+                "line_total": line_total,
+            }
         )
 
     new_order = Order(
@@ -247,6 +263,43 @@ def checkout(
     logger.info(
         "Order %s placed (branch=%s, total=%s)", new_order.order_number, branch.id, new_order.total
     )
+
+    # Spec'd in docs/JN_API_Specification.md's checkout sequence diagram
+    # (§4.2) - both run AFTER this response is sent (see jobs.py's module
+    # docstring for the BackgroundTasks vs RQ trade-off this project made).
+    #
+    # Only enqueued when there's actually an email to send to - guest_email
+    # is optional (schemas.py's CheckoutRequest), so a phone-only guest
+    # checkout has nothing for this job to send to.
+    if request.guest_email:
+        background_tasks.add_task(
+            send_order_confirmation_email,
+            request.guest_email,
+            request.guest_full_name,
+            new_order.order_number,
+            item_summaries,
+            subtotal,
+            new_order.total,
+            request.delivery_address,
+        )
+
+    # Every active staff member, regardless of role - queried NOW (this
+    # request's db session is still open) rather than inside the job
+    # itself, keeping notify_staff_new_order free of any DB dependency,
+    # same reasoning send_order_confirmation_email above takes plain
+    # values instead of ORM objects.
+    active_staff_emails = [
+        email for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
+    ]
+    background_tasks.add_task(
+        notify_staff_new_order,
+        active_staff_emails,
+        new_order.order_number,
+        branch.name,
+        new_order.total,
+        request.delivery_address,
+    )
+
     return _build_order_read(new_order, db)
 
 

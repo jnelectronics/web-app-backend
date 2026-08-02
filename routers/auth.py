@@ -11,6 +11,9 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
+from google_auth_client import GoogleTokenError
+from google_auth_client import is_configured as google_is_configured
+from google_auth_client import verify_id_token as verify_google_id_token
 from jobs import send_password_reset_email
 from models import Customer, CustomerStatus, OwnerType, RefreshToken, StaffUser
 from rate_limit import check_not_locked_out, clear_failed_attempts, record_failed_attempt
@@ -19,6 +22,7 @@ from schemas import (
     CustomerRead,
     CustomerRegister,
     CustomerRegisterResponse,
+    GoogleSignIn,
     PasswordForgotRequest,
     PasswordResetRequest,
     RefreshRequest,
@@ -39,6 +43,15 @@ from security import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"], route_class=EnvelopeRoute)
+
+
+class GoogleSignInUnavailableError(Exception):
+    # Raised when GOOGLE_CLIENT_ID isn't configured yet (see
+    # google_auth_client.is_configured) - same idea as routers/payments.py's
+    # PaymentsUnavailableError: a clean 503 from the handler registered in
+    # main.py, instead of every sign-in attempt failing deep inside a
+    # confusing Google verification error.
+    pass
 
 
 def _issue_refresh_token(db: Session, owner_type: OwnerType, owner_id) -> str:
@@ -118,6 +131,55 @@ def login(credentials: CustomerLogin, db: Session = Depends(get_db)):
     # response would leak whether a given email belongs to a deactivated
     # account before even confirming the password was right.
     if customer.status != CustomerStatus.ACTIVE:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account has been deactivated")
+
+    access_token = create_access_token(subject=str(customer.id), account_type="customer")
+    refresh_token = _issue_refresh_token(db, OwnerType.CUSTOMER, customer.id)
+    return TokenPair(access_token=access_token, refresh_token=refresh_token)
+
+
+@router.post("/google", response_model=TokenPair)
+def google_sign_in(request: GoogleSignIn, db: Session = Depends(get_db)):
+    # No rate limiting here the way /login has (check_not_locked_out etc.) -
+    # that exists to slow down someone GUESSING a password. There's no
+    # equivalent guessable secret in this flow; forging a token that passes
+    # verify_id_token's signature check is a cryptographic problem, not a
+    # brute-forceable one.
+    if not google_is_configured():
+        raise GoogleSignInUnavailableError("Google sign-in will be available soon. Please check back later.")
+
+    try:
+        google_user = verify_google_id_token(request.id_token)
+    except GoogleTokenError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google sign-in token")
+
+    # Required for BOTH creating a new account and auto-linking to an
+    # existing one - an unverified email means Google itself isn't
+    # vouching that this person actually owns that address, so we can't
+    # trust it for either case.
+    if not google_user["email"] or not google_user["email_verified"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Google account email is not verified",
+        )
+
+    customer = db.query(Customer).filter(Customer.email == google_user["email"]).first()
+
+    if customer is None:
+        # New account, no password - password_hash stays NULL, same as a
+        # guest row. This customer can only ever sign in via Google unless
+        # a "set a password" flow gets added later (not built yet).
+        customer = Customer(
+            full_name=google_user["name"],
+            email=google_user["email"],
+            password_hash=None,
+        )
+        db.add(customer)
+        db.commit()
+        db.refresh(customer)
+    elif customer.status != CustomerStatus.ACTIVE:
+        # Same check /login does, just reached a different way here -
+        # a deactivated account shouldn't be usable via ANY sign-in method.
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account has been deactivated")
 
     access_token = create_access_token(subject=str(customer.id), account_type="customer")
@@ -232,10 +294,10 @@ def forgot_password(
     # service type has no free tier. Trade-off: if this web process
     # restarts mid-task, the task is lost - an acceptable risk for a job
     # this low-stakes, revisit if that ever stops being true.
-    background_tasks.add_task(send_password_reset_email, customer.email, reset_token)
+    background_tasks.add_task(send_password_reset_email, customer.email, reset_token, customer.full_name)
 
-    # jobs.py's send_password_reset_email now sends a REAL email (Gmail
-    # SMTP via email_client.py), so the token is NO LONGER echoed back in
+    # jobs.py's send_password_reset_email now sends a REAL email (Resend
+    # via email_client.py), so the token is NO LONGER echoed back in
     # this response the way it was while email was still simulated -
     # returning it here would let anyone who can see this API response
     # reset that account's password without ever touching the real email,

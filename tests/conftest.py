@@ -38,7 +38,7 @@ def unwrap(response):
 def mock_email(monkeypatch):
     # Shared by any test that triggers jobs.send_password_reset_email
     # (currently test_background_jobs.py and test_auth_tokens.py) - patches
-    # email_client's real Gmail SMTP call so tests never send a real email
+    # email_client's real Resend API call so tests never send a real email
     # over the network, same idea as test_payments.py's mock_pesapal
     # fixture for PesaPal. jobs.py does `import email_client` (the whole
     # module, not `from email_client import send_email`), so patching the
@@ -47,8 +47,8 @@ def mock_email(monkeypatch):
     # PesaPal functions which needed patching at their point of use instead.
     sent = []
 
-    def fake_send_email(to_email, subject, body):
-        sent.append({"to_email": to_email, "subject": subject, "body": body})
+    def fake_send_email(to_email, subject, body, html=None):
+        sent.append({"to_email": to_email, "subject": subject, "body": body, "html": html})
 
     monkeypatch.setattr("email_client.is_configured", lambda: True)
     monkeypatch.setattr("email_client.send_email", fake_send_email)

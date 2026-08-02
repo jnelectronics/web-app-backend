@@ -1,0 +1,71 @@
+<!--
+  Rendered by jobs.py's send_order_confirmation_email using Jinja2 - see
+  templates/password_reset.html's comment for how this rendering works and
+  why every style below is inline (a rule that applies here too: never
+  write a literal pair of curly braces as plain example text in this file).
+
+  The for-loop block below is Jinja2's loop syntax - it repeats everything
+  inside it once per item in the `items` list jobs.py passes in, the same
+  way a Python for-loop over that same list would.
+-->
+<div style="background-color: #f4f4f4; padding: 32px 16px; font-family: Arial, Helvetica, sans-serif;">
+  <div style="max-width: 480px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; padding: 32px;">
+
+    <div style="text-align: center;">
+      <img
+        src="https://www.jnelectronics.ug/_astro/logo-suite-14-transparent.CCFaNxOm.svg"
+        alt="JN Electronics"
+        width="160"
+        style="margin-bottom: 24px;"
+      />
+    </div>
+
+    <h1 style="color: #1a1a1a; font-size: 20px; margin: 0 0 16px 0; text-align: center;">Order confirmed</h1>
+
+    <p style="color: #444444; font-size: 15px; line-height: 1.5; margin: 0 0 24px 0;">
+      Hi {{ full_name }}, thanks for your order! <strong>{{ order_number }}</strong> has been placed
+      and is now being processed.
+    </p>
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin-bottom: 16px;">
+      <tr>
+        <th align="left" style="font-size: 13px; color: #888888; border-bottom: 1px solid #eeeeee; padding-bottom: 8px;">Item</th>
+        <th align="center" style="font-size: 13px; color: #888888; border-bottom: 1px solid #eeeeee; padding-bottom: 8px;">Qty</th>
+        <th align="right" style="font-size: 13px; color: #888888; border-bottom: 1px solid #eeeeee; padding-bottom: 8px;">Total</th>
+      </tr>
+      {% for item in items %}
+      <tr>
+        <td style="font-size: 14px; color: #333333; padding: 8px 0; border-bottom: 1px solid #f4f4f4;">
+          {{ item.name }}
+          {% if item.variant_label %}<br /><span style="color: #888888; font-size: 12px;">{{ item.variant_label }}</span>{% endif %}
+        </td>
+        <td align="center" style="font-size: 14px; color: #333333; padding: 8px 0; border-bottom: 1px solid #f4f4f4;">{{ item.quantity }}</td>
+        <td align="right" style="font-size: 14px; color: #333333; padding: 8px 0; border-bottom: 1px solid #f4f4f4;">UGX {{ item.line_total }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin-bottom: 24px;">
+      <tr>
+        <td style="font-size: 14px; color: #888888; padding: 4px 0;">Subtotal</td>
+        <td align="right" style="font-size: 14px; color: #888888; padding: 4px 0;">UGX {{ subtotal }}</td>
+      </tr>
+      <tr>
+        <td style="font-size: 16px; color: #1a1a1a; font-weight: bold; padding: 4px 0;">Total</td>
+        <td align="right" style="font-size: 16px; color: #1a1a1a; font-weight: bold; padding: 4px 0;">UGX {{ total }}</td>
+      </tr>
+    </table>
+
+    <p style="color: #444444; font-size: 14px; line-height: 1.5; margin: 0 0 4px 0;">
+      <strong>Delivering to:</strong>
+    </p>
+    <p style="color: #888888; font-size: 14px; line-height: 1.5; margin: 0 0 24px 0;">
+      {{ delivery_address }}
+    </p>
+
+    <p style="color: #aaaaaa; font-size: 12px; line-height: 1.5; margin: 0;">
+      We'll notify you as your order's status changes.
+    </p>
+
+  </div>
+</div>

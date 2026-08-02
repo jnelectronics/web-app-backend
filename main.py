@@ -11,9 +11,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from observability import setup_observability
 from rate_limit import RateLimitedError
 from routers import audit, auth, branches, cart, categories, customers, dashboard, inventory, orders, payments, products, promotions, staff, variants
+from routers.auth import GoogleSignInUnavailableError
 from routers.inventory import InsufficientInventoryError
 from routers.orders import InvalidStateTransitionError
-from routers.payments import DuplicatePaymentError, PaymentsUnavailableError
+from routers.payments import DuplicatePaymentError, PaymentInProgressError, PaymentsUnavailableError
+from routers.products import ImageUploadUnavailableError
 
 load_dotenv()
 
@@ -82,6 +84,19 @@ def duplicate_payment_handler(request: Request, exc: DuplicatePaymentError):
     )
 
 
+# Same pattern again, for a RECENT unresolved payment attempt on the same
+# order (routers/payments.py's PaymentInProgressError) - a distinct error
+# from DUPLICATE_PAYMENT above (that one means "already succeeded", this
+# one means "still in flight"), so a frontend can tell the two apart and
+# show the customer the right message.
+@app.exception_handler(PaymentInProgressError)
+def payment_in_progress_handler(request: Request, exc: PaymentInProgressError):
+    return JSONResponse(
+        status_code=409,
+        content={"success": False, "message": str(exc), "error_code": "PAYMENT_IN_PROGRESS"},
+    )
+
+
 # Same pattern again, for when PesaPal isn't configured yet (e.g. still
 # going through business verification) - a clean 503 with a friendly
 # message, instead of every checkout attempt failing deep inside a raw
@@ -91,6 +106,28 @@ def payments_unavailable_handler(request: Request, exc: PaymentsUnavailableError
     return JSONResponse(
         status_code=503,
         content={"success": False, "message": str(exc), "error_code": "PAYMENTS_UNAVAILABLE"},
+    )
+
+
+# Same pattern again, for when Cloudinary isn't configured yet - a clean
+# 503 instead of every image upload attempt failing deep inside a raw
+# Cloudinary auth error.
+@app.exception_handler(ImageUploadUnavailableError)
+def image_upload_unavailable_handler(request: Request, exc: ImageUploadUnavailableError):
+    return JSONResponse(
+        status_code=503,
+        content={"success": False, "message": str(exc), "error_code": "IMAGE_UPLOAD_UNAVAILABLE"},
+    )
+
+
+# Same pattern again, for when Google sign-in isn't configured yet (missing
+# GOOGLE_CLIENT_ID) - a clean 503 instead of every attempt failing deep
+# inside a confusing Google verification error.
+@app.exception_handler(GoogleSignInUnavailableError)
+def google_signin_unavailable_handler(request: Request, exc: GoogleSignInUnavailableError):
+    return JSONResponse(
+        status_code=503,
+        content={"success": False, "message": str(exc), "error_code": "GOOGLE_SIGNIN_UNAVAILABLE"},
     )
 
 

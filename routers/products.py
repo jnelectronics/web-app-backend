@@ -1,18 +1,31 @@
 # All the HTTP routes for the "products" domain live here.
 
+import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from audit import write_audit_log
+from cloudinary_client import CloudinaryError, delete_image, is_configured, upload_image
 from database import get_db
 from envelope import EnvelopeRoute
 from models import Category, Product, ProductImage, StaffRole, StaffUser
-from schemas import ProductCreate, ProductImageCreate, ProductImageRead, ProductRead
+from schemas import ProductCreate, ProductImageRead, ProductRead
 from security import require_staff_role
 
+logger = logging.getLogger(__name__)
+
 MAX_IMAGES_PER_PRODUCT = 5
+
+
+class ImageUploadUnavailableError(Exception):
+    # Raised when Cloudinary isn't configured yet (see
+    # cloudinary_client.is_configured) - same idea as routers/payments.py's
+    # PaymentsUnavailableError: turned into a clean 503 by the handler
+    # registered in main.py, instead of every upload attempt failing deep
+    # inside a Cloudinary auth error.
+    pass
 
 # APIRouter is like a mini FastAPI app - we define routes on it here, then
 # "plug it into" the real app in main.py with app.include_router().
@@ -135,12 +148,29 @@ def delete_product(
 @router.post("/{product_id}/images", response_model=ProductImageRead)
 def add_product_image(
     product_id: uuid.UUID,
-    image: ProductImageCreate,
+    # File(...) and Form(...) tell FastAPI this route reads a
+    # multipart/form-data body (like an HTML <form enctype="multipart/
+    # form-data">), not JSON - `file` is the actual uploaded bytes,
+    # `display_order` rides alongside it as a plain text form field.
+    # UploadFile wraps the upload as a stream, so FastAPI doesn't have to
+    # hold the whole file in memory just to receive it.
+    file: UploadFile = File(...),
+    display_order: int = Form(0),
     _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
     db: Session = Depends(get_db),
 ):
     if db.get(Product, product_id) is None:
         raise HTTPException(status_code=404, detail="Product not found")
+
+    if not is_configured():
+        raise ImageUploadUnavailableError("Image uploads will be available soon. Please check back later.")
+
+    # Reject anything that isn't actually an image BEFORE spending an API
+    # call on it - content_type comes from the upload's own headers (set by
+    # the browser/client), so this is a cheap first check, not a guarantee,
+    # but it catches the common accidental-wrong-file case early.
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an image")
 
     existing_count = db.query(ProductImage).filter(ProductImage.product_id == product_id).count()
     if existing_count >= MAX_IMAGES_PER_PRODUCT:
@@ -149,10 +179,27 @@ def add_product_image(
             detail=f"A product can have at most {MAX_IMAGES_PER_PRODUCT} images",
         )
 
+    try:
+        # file.file is the underlying raw file object UploadFile wraps -
+        # .read() on it is a normal, synchronous read (unlike file.read(),
+        # which is async and would need `await`). Every other function in
+        # this file is a plain `def`, not `async def`, to stay consistent
+        # with the rest of this project's synchronous SQLAlchemy sessions,
+        # so this is the version that fits without changing that.
+        uploaded = upload_image(file.file.read(), file.filename)
+    except CloudinaryError as exc:
+        # A genuine infrastructure problem (Cloudinary unreachable,
+        # rejected our request, etc.), not an expected business outcome -
+        # logger.exception (not .info/.warning) so it becomes a real Sentry
+        # Issue, same reasoning as routers/payments.py's PesaPalError handling.
+        logger.exception("Cloudinary upload failed for product %s", product_id)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Image upload failed: {exc}")
+
     new_image = ProductImage(
         product_id=product_id,
-        image_url=image.image_url,
-        display_order=image.display_order,
+        image_url=uploaded["secure_url"],
+        cloudinary_public_id=uploaded["public_id"],
+        display_order=display_order,
         # The FIRST image a product gets becomes primary automatically -
         # every other one needs the dedicated /primary endpoint to become it.
         is_primary=(existing_count == 0),
@@ -167,7 +214,8 @@ def add_product_image(
 def replace_product_image(
     product_id: uuid.UUID,
     image_id: uuid.UUID,
-    image: ProductImageCreate,
+    file: UploadFile = File(...),
+    display_order: int = Form(0),
     _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
     db: Session = Depends(get_db),
 ):
@@ -179,12 +227,41 @@ def replace_product_image(
     if existing is None:
         raise HTTPException(status_code=404, detail="Image not found")
 
+    if not is_configured():
+        raise ImageUploadUnavailableError("Image uploads will be available soon. Please check back later.")
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an image")
+
+    try:
+        uploaded = upload_image(file.file.read(), file.filename)
+    except CloudinaryError as exc:
+        logger.exception("Cloudinary upload failed replacing image %s", image_id)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Image upload failed: {exc}")
+
+    # Remember the OLD Cloudinary asset before overwriting the row, so it
+    # can be cleaned up after the new one is safely saved.
+    old_public_id = existing.cloudinary_public_id
+
     # Doesn't touch is_primary - swapping the picture shouldn't silently
     # change which one is the primary display image.
-    existing.image_url = image.image_url
-    existing.display_order = image.display_order
+    existing.image_url = uploaded["secure_url"]
+    existing.cloudinary_public_id = uploaded["public_id"]
+    existing.display_order = display_order
     db.commit()
     db.refresh(existing)
+
+    if old_public_id:
+        try:
+            delete_image(old_public_id)
+        except CloudinaryError:
+            # The replace itself already succeeded and is committed - a
+            # failure to clean up the OLD asset shouldn't turn a
+            # successful replace into an error response. Still logged as a
+            # real Sentry Issue so a pileup of orphaned Cloudinary assets
+            # doesn't go unnoticed.
+            logger.exception("Failed to delete old Cloudinary asset %s", old_public_id)
+
     return existing
 
 
@@ -205,8 +282,19 @@ def delete_product_image(
     if existing is None:
         raise HTTPException(status_code=404, detail="Image not found")
 
+    public_id = existing.cloudinary_public_id
     db.delete(existing)
     db.commit()
+
+    if public_id:
+        try:
+            delete_image(public_id)
+        except CloudinaryError:
+            # Same reasoning as replace_product_image above - the DB row is
+            # already gone and that's the part the client actually asked
+            # for; a leftover Cloudinary asset is a cleanup problem to
+            # notice via Sentry, not a reason to fail this request.
+            logger.exception("Failed to delete Cloudinary asset %s", public_id)
 
 
 @router.patch("/{product_id}/images/{image_id}/primary", response_model=ProductImageRead)

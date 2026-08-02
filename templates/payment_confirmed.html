@@ -1,0 +1,49 @@
+<!--
+  Rendered by jobs.py's send_payment_confirmed_email using Jinja2 - see
+  templates/password_reset.html's comment for how this rendering works,
+  why every style below is inline, and why a literal pair of curly braces
+  (or a literal Jinja2 block tag) must never appear as plain example text
+  anywhere in this file.
+-->
+<div style="background-color: #f4f4f4; padding: 32px 16px; font-family: Arial, Helvetica, sans-serif;">
+  <div style="max-width: 480px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; padding: 32px; text-align: center;">
+
+    <img
+      src="https://www.jnelectronics.ug/_astro/logo-suite-14-transparent.CCFaNxOm.svg"
+      alt="JN Electronics"
+      width="160"
+      style="margin-bottom: 24px;"
+    />
+
+    <div style="width: 56px; height: 56px; line-height: 56px; border-radius: 50%; background-color: #f5821f; color: #ffffff; font-size: 28px; font-weight: bold; margin: 0 auto 24px auto;">
+      &#10003;
+    </div>
+
+    <h1 style="color: #1a1a1a; font-size: 20px; margin: 0 0 16px 0;">Payment received</h1>
+
+    <p style="color: #444444; font-size: 15px; line-height: 1.5; margin: 0 0 24px 0; text-align: left;">
+      Hi {{ full_name }}, we've received your payment for order <strong>{{ order_number }}</strong>.
+      Your order is confirmed and will be processed shortly.
+    </p>
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin-bottom: 24px; text-align: left;">
+      <tr>
+        <td style="font-size: 14px; color: #888888; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">Order</td>
+        <td align="right" style="font-size: 14px; color: #1a1a1a; font-weight: bold; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">{{ order_number }}</td>
+      </tr>
+      <tr>
+        <td style="font-size: 14px; color: #888888; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">Amount paid</td>
+        <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">UGX {{ amount }}</td>
+      </tr>
+      <tr>
+        <td style="font-size: 14px; color: #888888; padding: 6px 0;">Payment method</td>
+        <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0;">{{ provider }}</td>
+      </tr>
+    </table>
+
+    <p style="color: #aaaaaa; font-size: 12px; line-height: 1.5; margin: 0;">
+      Thanks for shopping with JN Electronics.
+    </p>
+
+  </div>
+</div>
