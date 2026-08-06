@@ -100,7 +100,7 @@ def test_creating_record_with_stock_logs_stock_in(client, db, variant_and_branch
 
     response = client.get(f"/api/v1/inventory/{record_id}/movements", headers=headers)
     assert response.status_code == 200
-    movements = unwrap(response)
+    movements = unwrap(response)["items"]
     assert len(movements) == 1
     assert movements[0]["movement_type"] == "stock_in"
     assert movements[0]["quantity_changed"] == 20
@@ -126,7 +126,7 @@ def test_adjust_logs_custom_movement_type_and_reason(client, db, variant_and_bra
     assert response.status_code == 200
 
     response = client.get(f"/api/v1/inventory/{record.id}/movements", headers=headers)
-    movements = unwrap(response)
+    movements = unwrap(response)["items"]
     assert movements[0]["movement_type"] == "stock_out"
     assert movements[0]["reason"] == "Damaged in storage"
 
@@ -179,7 +179,7 @@ def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, variant_
 
     staff_headers = _auth(staff_tokens[StaffRole.INVENTORY_MANAGER])
     response = client.get(f"/api/v1/inventory/{record.id}/movements", headers=staff_headers)
-    movements = unwrap(response)
+    movements = unwrap(response)["items"]
     assert any(m["movement_type"] == "sold" and m["quantity_changed"] == -2 for m in movements)
     assert all(m["staff_user_id"] is None for m in movements if m["movement_type"] == "sold")
 
@@ -187,7 +187,7 @@ def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, variant_
     assert cancel_response.status_code == 200
 
     response = client.get(f"/api/v1/inventory/{record.id}/movements", headers=staff_headers)
-    movements = unwrap(response)
+    movements = unwrap(response)["items"]
     assert any(
         m["movement_type"] == "adjustment" and m["quantity_changed"] == 2 for m in movements
     )

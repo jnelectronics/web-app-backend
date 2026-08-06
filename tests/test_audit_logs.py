@@ -77,10 +77,12 @@ def test_creating_a_product_writes_an_audit_entry(client, db, staff_tokens):
             headers=_auth(manager_token),
         )
         assert response.status_code == 200
-        entries = unwrap(response)
+        entries = unwrap(response)["items"]
         assert len(entries) == 1
         assert entries[0]["action"] == "product.create"
         assert entries[0]["staff_user_id"] == str(manager.id)
+        assert entries[0]["staff_full_name"] == manager.full_name
+        assert entries[0]["staff_email"] == manager.email
         assert entries[0]["new_value"]["name"] == "Audited Product"
         assert entries[0]["previous_value"] is None
 
@@ -91,7 +93,16 @@ def test_creating_a_product_writes_an_audit_entry(client, db, staff_tokens):
             headers=_auth(manager_token),
         )
         assert response.status_code == 200
-        assert len(unwrap(response)) >= 1
+        assert len(unwrap(response)["items"]) >= 1
+
+        # action filter
+        response = client.get(
+            "/api/v1/audit-logs",
+            params={"action": "product.create", "resource_id": product_id},
+            headers=_auth(manager_token),
+        )
+        assert response.status_code == 200
+        assert len(unwrap(response)["items"]) == 1
     finally:
         db.query(AuditLog).filter(AuditLog.resource_type == "product").filter(
             AuditLog.staff_user_id == manager.id

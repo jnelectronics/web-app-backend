@@ -83,13 +83,13 @@ def test_change_my_password(client, customer):
 
     # The new password now works via the real login endpoint
     response = client.post(
-        "/api/v1/auth/login", json={"email": customer.email, "password": "NewPass456"}
+        "/api/v1/auth/login", json={"identifier": customer.email, "password": "NewPass456"}
     )
     assert response.status_code == 200
 
     # The old password no longer does
     response = client.post(
-        "/api/v1/auth/login", json={"email": customer.email, "password": "OriginalPass123"}
+        "/api/v1/auth/login", json={"identifier": customer.email, "password": "OriginalPass123"}
     )
     assert response.status_code == 401
 
@@ -158,25 +158,37 @@ def test_staff_directory_requires_inventory_manager(client, customer, inventory_
     assert unwrap(response)["id"] == str(customer.id)
 
 
-def test_toggle_customer_status_blocks_login(client, customer, inventory_manager_token):
+def test_set_customer_status_blocks_login(client, customer, inventory_manager_token):
     customer_token_headers = _auth(inventory_manager_token)
 
-    response = client.patch(f"/api/v1/customers/{customer.id}/status", headers=customer_token_headers)
+    response = client.patch(
+        f"/api/v1/customers/{customer.id}/status", json={"status": "inactive"}, headers=customer_token_headers
+    )
+    assert response.status_code == 200
+    assert unwrap(response)["status"] == "inactive"
+
+    # Setting the SAME value again is a safe no-op, not an error and not a
+    # silent flip back to active - the exact case a blind toggle got wrong.
+    response = client.patch(
+        f"/api/v1/customers/{customer.id}/status", json={"status": "inactive"}, headers=customer_token_headers
+    )
     assert response.status_code == 200
     assert unwrap(response)["status"] == "inactive"
 
     # A deactivated customer can no longer log in
     response = client.post(
-        "/api/v1/auth/login", json={"email": customer.email, "password": "OriginalPass123"}
+        "/api/v1/auth/login", json={"identifier": customer.email, "password": "OriginalPass123"}
     )
     assert response.status_code == 403
 
-    # Toggling again reactivates
-    response = client.patch(f"/api/v1/customers/{customer.id}/status", headers=customer_token_headers)
+    # Setting it back to active reactivates
+    response = client.patch(
+        f"/api/v1/customers/{customer.id}/status", json={"status": "active"}, headers=customer_token_headers
+    )
     assert response.status_code == 200
     assert unwrap(response)["status"] == "active"
 
     response = client.post(
-        "/api/v1/auth/login", json={"email": customer.email, "password": "OriginalPass123"}
+        "/api/v1/auth/login", json={"identifier": customer.email, "password": "OriginalPass123"}
     )
     assert response.status_code == 200

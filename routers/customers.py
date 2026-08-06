@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 from database import get_db
 from envelope import EnvelopeRoute
 from models import Customer, CustomerStatus, Order, StaffRole, StaffUser
+from pagination import build_pagination_meta
 from routers.orders import _build_order_read
-from schemas import CustomerPasswordChange, CustomerProfileUpdate, CustomerRead, OrderRead
+from schemas import CustomerPasswordChange, CustomerProfileUpdate, CustomerRead, CustomerStatusUpdate, OrderRead, PaginatedResponse
 from security import get_current_customer, hash_password, require_staff_role, verify_password
 
 router = APIRouter(prefix="/customers", tags=["customers"], route_class=EnvelopeRoute)
@@ -71,14 +72,18 @@ def read_my_orders(
     return [_build_order_read(o, db) for o in orders]
 
 
-@router.get("", response_model=list[CustomerRead])
+@router.get("", response_model=PaginatedResponse[CustomerRead])
 def list_customers(
     skip: int = 0,
     limit: int = 10,
     _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
     db: Session = Depends(get_db),
 ):
-    return db.query(Customer).offset(skip).limit(limit).all()
+    total = db.query(Customer).count()
+    customers = db.query(Customer).offset(skip).limit(limit).all()
+    return PaginatedResponse[CustomerRead](
+        items=customers, pagination=build_pagination_meta(skip, limit, total)
+    )
 
 
 @router.get("/{customer_id}", response_model=CustomerRead)
@@ -94,21 +99,20 @@ def read_customer(
 
 
 @router.patch("/{customer_id}/status", response_model=CustomerRead)
-def toggle_customer_status(
+def set_customer_status(
     customer_id: uuid.UUID,
+    update: CustomerStatusUpdate,
     _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
     db: Session = Depends(get_db),
 ):
-    # Toggles rather than takes a body - same reasoning as
-    # routers/staff.py's toggle_staff_status: the docs describe this as a
-    # single "deactivate/reactivate" flip, not a value the caller sets.
+    # Sets status to whatever the caller asked for, rather than blindly
+    # flipping it - see routers/staff.py's set_staff_status for the full
+    # idempotency reasoning (a toggle isn't safe to retry/double-click).
     customer = db.get(Customer, customer_id)
     if customer is None:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    customer.status = (
-        CustomerStatus.INACTIVE if customer.status == CustomerStatus.ACTIVE else CustomerStatus.ACTIVE
-    )
+    customer.status = update.status
     db.commit()
     db.refresh(customer)
     return customer

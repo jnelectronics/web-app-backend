@@ -4,6 +4,7 @@
 # means "this branch currently has none of this variant."
 
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
@@ -13,7 +14,8 @@ from audit import write_audit_log
 from database import get_db
 from envelope import EnvelopeRoute
 from models import Branch, InventoryMovement, InventoryRecord, MovementType, ProductVariant, StaffRole, StaffUser
-from schemas import InventoryAdjust, InventoryCreate, InventoryMovementRead, InventoryRead
+from pagination import build_pagination_meta
+from schemas import InventoryAdjust, InventoryCreate, InventoryMovementRead, InventoryRead, PaginatedResponse
 from security import require_staff_role
 
 # Both roles allowed to just VIEW inventory, per the docs - only Inventory
@@ -26,10 +28,61 @@ VIEW_INVENTORY_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER)
 # rule is expressed in code as "insufficient inventory", independent of how
 # it eventually gets turned into an HTTP response.
 class InsufficientInventoryError(Exception):
-    pass
+    def __init__(self, message: str, short_items: list[dict] | None = None):
+        # short_items is optional - only routers/orders.py's checkout
+        # populates it (it's the only call site with a whole cart's worth
+        # of items to report on); the adjust endpoint below just raises
+        # with a message, same as before.
+        super().__init__(message)
+        self.short_items = short_items
 
 
 router = APIRouter(prefix="/inventory", tags=["inventory"], route_class=EnvelopeRoute)
+
+
+# Not in the original spec - the only movement endpoint used to be scoped
+# to ONE inventory record, meaning a branch-wide "what's moved here
+# recently" view (the admin dashboard's stock history) needed one request
+# PER inventory record - an N+1 that grows with the catalogue. Registered
+# BEFORE "/{inventory_id}" below, same reasoning as routers/orders.py's
+# "/staff" - a fixed path ahead of a param path that could otherwise
+# swallow it (see CLAUDE.md's route-registration-order gotcha).
+@router.get("/movements", response_model=PaginatedResponse[InventoryMovementRead])
+def list_movements(
+    branch_id: uuid.UUID | None = None,
+    variant_id: uuid.UUID | None = None,
+    movement_type: MovementType | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    skip: int = 0,
+    limit: int = 10,
+    _current_staff: StaffUser = Depends(require_staff_role(*VIEW_INVENTORY_ROLES)),
+    db: Session = Depends(get_db),
+):
+    # branch_id/variant_id aren't columns on InventoryMovement itself - it
+    # only points at inventory_record_id - so filtering by either means
+    # joining through InventoryRecord first.
+    query = db.query(InventoryMovement).join(
+        InventoryRecord, InventoryMovement.inventory_record_id == InventoryRecord.id
+    )
+
+    if branch_id is not None:
+        query = query.filter(InventoryRecord.branch_id == branch_id)
+    if variant_id is not None:
+        query = query.filter(InventoryRecord.variant_id == variant_id)
+    if movement_type is not None:
+        query = query.filter(InventoryMovement.movement_type == movement_type)
+    if start_date is not None:
+        query = query.filter(InventoryMovement.created_at >= start_date)
+    if end_date is not None:
+        query = query.filter(InventoryMovement.created_at <= end_date)
+
+    query = query.order_by(InventoryMovement.created_at.desc())
+    total = query.count()
+    movements = query.offset(skip).limit(limit).all()
+    return PaginatedResponse[InventoryMovementRead](
+        items=movements, pagination=build_pagination_meta(skip, limit, total)
+    )
 
 
 @router.get("/{inventory_id}", response_model=InventoryRead)
@@ -44,7 +97,7 @@ def read_inventory_record(
     return record
 
 
-@router.get("", response_model=list[InventoryRead])
+@router.get("", response_model=PaginatedResponse[InventoryRead])
 def list_inventory_records(
     branch_id: uuid.UUID | None = None,
     variant_id: uuid.UUID | None = None,
@@ -62,7 +115,9 @@ def list_inventory_records(
     if variant_id is not None:
         query = query.filter(InventoryRecord.variant_id == variant_id)
 
-    return query.offset(skip).limit(limit).all()
+    total = query.count()
+    records = query.offset(skip).limit(limit).all()
+    return PaginatedResponse[InventoryRead](items=records, pagination=build_pagination_meta(skip, limit, total))
 
 
 @router.post("", response_model=InventoryRead)
@@ -160,7 +215,7 @@ def adjust_inventory_quantity(
     return record
 
 
-@router.get("/{inventory_id}/movements", response_model=list[InventoryMovementRead])
+@router.get("/{inventory_id}/movements", response_model=PaginatedResponse[InventoryMovementRead])
 def read_inventory_movements(
     inventory_id: uuid.UUID,
     skip: int = 0,
@@ -171,11 +226,9 @@ def read_inventory_movements(
     if db.get(InventoryRecord, inventory_id) is None:
         raise HTTPException(status_code=404, detail="Inventory record not found")
 
-    return (
-        db.query(InventoryMovement)
-        .filter(InventoryMovement.inventory_record_id == inventory_id)
-        .order_by(InventoryMovement.created_at)
-        .offset(skip)
-        .limit(limit)
-        .all()
+    query = db.query(InventoryMovement).filter(InventoryMovement.inventory_record_id == inventory_id)
+    total = query.count()
+    movements = query.order_by(InventoryMovement.created_at).offset(skip).limit(limit).all()
+    return PaginatedResponse[InventoryMovementRead](
+        items=movements, pagination=build_pagination_meta(skip, limit, total)
     )

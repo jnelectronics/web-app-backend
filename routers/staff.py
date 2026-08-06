@@ -4,6 +4,7 @@
 # through this router at all - that account only ever comes from
 # seed_admin.py, run once outside the API.
 
+import secrets
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,7 +14,16 @@ from audit import write_audit_log
 from database import get_db
 from envelope import EnvelopeRoute
 from models import StaffRole, StaffUser
-from schemas import StaffCreate, StaffPasswordChange, StaffRead, StaffUpdate
+from pagination import build_pagination_meta
+from schemas import (
+    PaginatedResponse,
+    StaffCreate,
+    StaffPasswordChange,
+    StaffPasswordResetResult,
+    StaffRead,
+    StaffStatusUpdate,
+    StaffUpdate,
+)
 from security import get_current_staff, hash_password, require_staff_role, verify_password
 
 router = APIRouter(prefix="/staff", tags=["staff"], route_class=EnvelopeRoute)
@@ -42,14 +52,39 @@ def change_my_password(
     return {"message": "Password changed successfully"}
 
 
-@router.get("", response_model=list[StaffRead])
+@router.get("/me", response_model=StaffRead)
+def read_my_staff_profile(current_staff: StaffUser = Depends(get_current_staff)):
+    # Not gated to MANAGE_STAFF_ROLES, same reasoning as change_my_password
+    # above - every staff member needs to be able to see their OWN profile
+    # (name, role) regardless of role, not just Inventory Manager/System
+    # Administrator. Registered BEFORE "/{staff_id}" below so "me" is never
+    # matched as a (not-yet-validated) staff_id - see CLAUDE.md's route-
+    # registration-order gotcha.
+    return current_staff
+
+
+@router.get("", response_model=PaginatedResponse[StaffRead])
 def list_staff(
     skip: int = 0,
     limit: int = 10,
     _current_staff: StaffUser = Depends(require_staff_role(*MANAGE_STAFF_ROLES)),
     db: Session = Depends(get_db),
 ):
-    return db.query(StaffUser).offset(skip).limit(limit).all()
+    total = db.query(StaffUser).count()
+    staff = db.query(StaffUser).offset(skip).limit(limit).all()
+    return PaginatedResponse[StaffRead](items=staff, pagination=build_pagination_meta(skip, limit, total))
+
+
+@router.get("/{staff_id}", response_model=StaffRead)
+def read_staff(
+    staff_id: uuid.UUID,
+    _current_staff: StaffUser = Depends(require_staff_role(*MANAGE_STAFF_ROLES)),
+    db: Session = Depends(get_db),
+):
+    staff = db.get(StaffUser, staff_id)
+    if staff is None:
+        raise HTTPException(status_code=404, detail="Staff account not found")
+    return staff
 
 
 @router.post("", response_model=StaffRead)
@@ -127,19 +162,56 @@ def update_staff(
     return existing
 
 
-@router.patch("/{staff_id}/status", response_model=StaffRead)
-def toggle_staff_status(
+@router.post("/{staff_id}/reset-password", response_model=StaffPasswordResetResult)
+def reset_staff_password(
     staff_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(*MANAGE_STAFF_ROLES)),
+    current_staff: StaffUser = Depends(require_staff_role(*MANAGE_STAFF_ROLES)),
     db: Session = Depends(get_db),
 ):
-    # Toggles rather than takes a body - matches the docs' description
-    # ("Deactivate/reactivate") as a single flip, not a value the caller sets.
+    # Not in the original spec - see StaffPasswordResetResult's comment
+    # for why this exists (a locked-out staff member had no recovery
+    # route at all before this). token_urlsafe generates a long,
+    # cryptographically random string - the same generator
+    # security.generate_refresh_token already uses for refresh tokens,
+    # reused here since it's exactly the "unguessable random string"
+    # property a temporary password needs too.
     existing = db.get(StaffUser, staff_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Staff account not found")
 
-    existing.is_active = not existing.is_active
+    temporary_password = secrets.token_urlsafe(9)
+    existing.password_hash = hash_password(temporary_password)
+    write_audit_log(
+        db,
+        staff_user_id=current_staff.id,
+        action="staff.password_reset",
+        resource_type="staff_user",
+        resource_id=existing.id,
+        # No previous_value/new_value - the whole point is not persisting
+        # either the old or new password anywhere, even hashed context.
+    )
+    db.commit()
+    return StaffPasswordResetResult(temporary_password=temporary_password)
+
+
+@router.patch("/{staff_id}/status", response_model=StaffRead)
+def set_staff_status(
+    staff_id: uuid.UUID,
+    update: StaffStatusUpdate,
+    _current_staff: StaffUser = Depends(require_staff_role(*MANAGE_STAFF_ROLES)),
+    db: Session = Depends(get_db),
+):
+    # Sets is_active to whatever the caller asked for, rather than
+    # blindly flipping it - a toggle isn't idempotent (a double-click, a
+    # retried request, or two staff acting on the same account at once can
+    # all silently reverse the intended change instead of erroring or
+    # no-op-ing). Setting an explicit value means a repeat of the exact
+    # same request is always safe.
+    existing = db.get(StaffUser, staff_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Staff account not found")
+
+    existing.is_active = update.is_active
     db.commit()
     db.refresh(existing)
     return existing
