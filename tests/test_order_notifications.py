@@ -144,6 +144,28 @@ def _add_to_cart(client, token, variant_id, quantity=1):
     assert response.status_code == 200
 
 
+def test_checkout_409_reports_which_items_are_short(client, checkout_setup, active_staff, mock_email):
+    # checkout_setup's InventoryRecord has 10 units available - requesting
+    # more than that means no branch can fulfill it.
+    _add_to_cart(client, checkout_setup["token"], checkout_setup["variant"].id, quantity=999)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "guest_full_name": "Notify Test Customer",
+            "guest_phone_number": "+256700000004",
+            "delivery_address": "1 Test Way, Kampala",
+        },
+        headers=_auth(checkout_setup["token"]),
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error_code"] == "INSUFFICIENT_INVENTORY"
+    assert body["short_items"] == [
+        {"variant_id": str(checkout_setup["variant"].id), "requested": 999, "available": 10}
+    ]
+
+
 def test_checkout_sends_order_confirmation_when_email_given(client, checkout_setup, active_staff, mock_email):
     _add_to_cart(client, checkout_setup["token"], checkout_setup["variant"].id)
 

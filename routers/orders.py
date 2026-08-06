@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from audit import write_audit_log
@@ -31,9 +32,10 @@ from models import (
     StaffRole,
     StaffUser,
 )
+from pagination import build_pagination_meta
 from routers.cart import get_current_cart
 from routers.inventory import InsufficientInventoryError
-from schemas import CheckoutRequest, OrderAddressUpdate, OrderItemRead, OrderRead, OrderStatusHistoryRead, OrderStatusUpdate
+from schemas import CheckoutRequest, OrderAddressUpdate, OrderItemRead, OrderRead, OrderStatusHistoryRead, OrderStatusUpdate, PaginatedResponse
 from security import bearer_scheme, decode_token_claims, get_current_customer, require_staff_role
 
 router = APIRouter(prefix="/orders", tags=["orders"], route_class=EnvelopeRoute)
@@ -134,6 +136,31 @@ def _find_fulfilling_branch(db: Session, cart_items: list[CartItem]) -> Branch |
     return None
 
 
+def _find_short_items(db: Session, cart_items: list[CartItem]) -> list[dict]:
+    # Only called when NO single branch could fulfill the whole cart -
+    # reports, per item, the most stock available at any ONE active branch
+    # vs what was requested. Not in the original spec.
+    #
+    # An item with enough stock SOMEWHERE (just not at the same branch as
+    # everything else in the cart) won't show up here - this reports
+    # genuine system-wide shortfalls, not the "split across branches"
+    # case, which is a real but different problem this simple per-branch
+    # fulfillment rule doesn't attempt to solve (see _find_fulfilling_branch).
+    short_items = []
+    for item in cart_items:
+        best_available = (
+            db.query(func.max(InventoryRecord.quantity_available))
+            .join(Branch, InventoryRecord.branch_id == Branch.id)
+            .filter(InventoryRecord.variant_id == item.variant_id, Branch.is_active == True)  # noqa: E712
+            .scalar()
+        ) or 0
+        if best_available < item.quantity:
+            short_items.append(
+                {"variant_id": str(item.variant_id), "requested": item.quantity, "available": best_available}
+            )
+    return short_items
+
+
 def _build_order_read(order: Order, db: Session) -> OrderRead:
     items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
     return OrderRead(
@@ -176,7 +203,10 @@ def checkout(
         # default, so this becomes a breadcrumb/log entry, not a false-alarm
         # error notification.
         logger.warning("Checkout failed: no branch has enough stock for cart %s", cart.id)
-        raise InsufficientInventoryError("No branch has enough stock to fulfill this order")
+        raise InsufficientInventoryError(
+            "No branch has enough stock to fulfill this order",
+            short_items=_find_short_items(db, cart_items),
+        )
 
     # Build the order's line items BEFORE touching inventory, so if
     # anything here fails, we haven't already decremented stock we then
@@ -216,6 +246,11 @@ def checkout(
     new_order = Order(
         order_number=_generate_order_number(db),
         customer_id=cart.customer_id,
+        # NULL for a registered customer's cart, a real value for a
+        # guest's - see the model's comment. This is what lets a guest
+        # prove ownership of this order later, when paying for it
+        # (routers/payments.py), since they have no account/login at all.
+        guest_token=cart.guest_token,
         fulfilling_branch_id=branch.id,
         guest_full_name=request.guest_full_name,
         guest_phone_number=request.guest_phone_number,
@@ -303,21 +338,65 @@ def checkout(
     return _build_order_read(new_order, db)
 
 
-@router.get("", response_model=list[OrderRead])
+@router.get("", response_model=PaginatedResponse[OrderRead])
 def list_my_orders(
     skip: int = 0,
     limit: int = 10,
     current_customer=Depends(get_current_customer),
     db: Session = Depends(get_db),
 ):
-    orders = (
-        db.query(Order)
-        .filter(Order.customer_id == current_customer.id)
-        .offset(skip)
-        .limit(limit)
-        .all()
+    query = db.query(Order).filter(Order.customer_id == current_customer.id)
+    total = query.count()
+    orders = query.offset(skip).limit(limit).all()
+    return PaginatedResponse[OrderRead](
+        items=[_build_order_read(o, db) for o in orders],
+        pagination=build_pagination_meta(skip, limit, total),
     )
-    return [_build_order_read(o, db) for o in orders]
+
+
+# Not in the original spec - GET "" above is scoped to "my orders" (a
+# customer's own), and there was previously no way for staff to browse
+# ALL orders at all - the only staff-visible list was the admin
+# dashboard's recent-orders widget, an unfiltered capped feed never meant
+# to support real fulfilment work. A separate path (not overloading GET ""
+# with different behavior depending on who's asking) keeps "what does this
+# endpoint return" unambiguous regardless of caller.
+@router.get("/staff", response_model=PaginatedResponse[OrderRead])
+def list_all_orders_staff(
+    skip: int = 0,
+    limit: int = 10,
+    order_status: OrderStatus | None = None,
+    search: str | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    _current_staff: StaffUser = Depends(require_staff_role(*STATUS_ADVANCE_ROLES)),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Order)
+
+    if order_status is not None:
+        query = query.filter(Order.status == order_status)
+    if search:
+        # order number OR the guest phone number on file - staff typically
+        # have one or the other in hand (a customer reading out their
+        # order number, or a phone number from a delivery note), not
+        # necessarily both.
+        like_pattern = f"%{search}%"
+        query = query.filter(
+            or_(Order.order_number.ilike(like_pattern), Order.guest_phone_number.ilike(like_pattern))
+        )
+    if start_date is not None:
+        query = query.filter(Order.created_at >= start_date)
+    if end_date is not None:
+        query = query.filter(Order.created_at <= end_date)
+
+    query = query.order_by(Order.created_at.desc())
+    total = query.count()
+    orders = query.offset(skip).limit(limit).all()
+    return PaginatedResponse[OrderRead](
+        items=[_build_order_read(o, db) for o in orders],
+        pagination=build_pagination_meta(skip, limit, total),
+    )
 
 
 @router.get("/{order_id}", response_model=OrderRead)
@@ -353,6 +432,15 @@ def update_order_address(
         )
 
     order.delivery_address = update.delivery_address
+    # Optional - only touched if actually provided, so a caller that only
+    # wants to change the address doesn't have to resend the existing
+    # contact details just to avoid accidentally clearing them.
+    if update.guest_full_name is not None:
+        order.guest_full_name = update.guest_full_name
+    if update.guest_phone_number is not None:
+        order.guest_phone_number = update.guest_phone_number
+    if update.guest_email is not None:
+        order.guest_email = update.guest_email
     db.commit()
     db.refresh(order)
     return _build_order_read(order, db)

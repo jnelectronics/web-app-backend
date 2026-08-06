@@ -60,6 +60,31 @@ def test_register_issues_both_tokens(client, db):
     db.commit()
 
 
+def test_login_accepts_email_or_phone(client, db):
+    email = f"phonelogin-{uuid.uuid4().hex[:8]}@example.com"
+    phone = f"+2567{uuid.uuid4().hex[:8]}"
+    register_response = client.post(
+        "/api/v1/auth/register",
+        json={"full_name": "Phone Login Test", "email": email, "phone_number": phone, "password": "Password123"},
+    )
+    customer_id = uuid.UUID(unwrap(register_response)["customer"]["id"])
+
+    try:
+        response = client.post("/api/v1/auth/login", json={"identifier": email, "password": "Password123"})
+        assert response.status_code == 200
+
+        response = client.post("/api/v1/auth/login", json={"identifier": phone, "password": "Password123"})
+        assert response.status_code == 200
+
+        response = client.post("/api/v1/auth/login", json={"identifier": "not-a-real-identifier", "password": "Password123"})
+        assert response.status_code == 401
+    finally:
+        db.query(RefreshToken).filter(RefreshToken.owner_id == customer_id).delete()
+        db.commit()
+        db.query(Customer).filter(Customer.id == customer_id).delete()
+        db.commit()
+
+
 def test_refresh_and_logout(client, db):
     email = f"refreshtest-{uuid.uuid4().hex[:8]}@example.com"
     register_response = client.post(
@@ -236,9 +261,9 @@ def test_password_forgot_and_reset(client, db, mock_email):
         assert response.status_code == 200
 
         # New password works, old one doesn't
-        response = client.post("/api/v1/auth/login", json={"email": email, "password": "NewPassword456"})
+        response = client.post("/api/v1/auth/login", json={"identifier": email, "password": "NewPassword456"})
         assert response.status_code == 200
-        response = client.post("/api/v1/auth/login", json={"email": email, "password": "OldPassword123"})
+        response = client.post("/api/v1/auth/login", json={"identifier": email, "password": "OldPassword123"})
         assert response.status_code == 401
     finally:
         db.query(RefreshToken).filter(RefreshToken.owner_id == customer_id).delete()

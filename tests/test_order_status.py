@@ -188,3 +188,36 @@ def test_status_history_visible_to_owner_and_staff_not_others(client, order_setu
         f"/api/v1/orders/{order.id}/status-history", headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT])
     )
     assert response.status_code == 200
+
+
+def test_order_edit_widened_to_contact_fields(client, order_setup):
+    order = order_setup["order"]
+    tokens = order_setup["tokens"]
+
+    response = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={
+            "delivery_address": "New Address, Kampala",
+            "guest_full_name": "Updated Name",
+            "guest_phone_number": "+256711111111",
+            "guest_email": "updated@example.com",
+        },
+        headers=_auth(tokens["owner"]),
+    )
+    assert response.status_code == 200
+    body = unwrap(response)
+    assert body["delivery_address"] == "New Address, Kampala"
+    assert body["guest_full_name"] == "Updated Name"
+    assert body["guest_phone_number"] == "+256711111111"
+    assert body["guest_email"] == "updated@example.com"
+
+    # Omitting the contact fields leaves them as they are, not cleared
+    response = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"delivery_address": "Yet Another Address"},
+        headers=_auth(tokens["owner"]),
+    )
+    assert response.status_code == 200
+    body = unwrap(response)
+    assert body["delivery_address"] == "Yet Another Address"
+    assert body["guest_full_name"] == "Updated Name"

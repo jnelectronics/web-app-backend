@@ -133,12 +133,12 @@ def test_login_locks_out_after_repeated_failures(client, customer_with_password)
     email = customer_with_password.email
 
     for _ in range(MAX_FAILED_ATTEMPTS):
-        response = client.post("/api/v1/auth/login", json={"email": email, "password": "WrongPassword1"})
+        response = client.post("/api/v1/auth/login", json={"identifier": email, "password": "WrongPassword1"})
         assert response.status_code == 401
 
     # Even the CORRECT password is now rejected - the account is locked,
     # not just "that one guess was wrong."
-    response = client.post("/api/v1/auth/login", json={"email": email, "password": "RealPassword123"})
+    response = client.post("/api/v1/auth/login", json={"identifier": email, "password": "RealPassword123"})
     assert response.status_code == 429
     assert response.json()["error_code"] == "RATE_LIMITED"
     assert "Retry-After" in response.headers
@@ -149,12 +149,12 @@ def test_successful_login_resets_the_failure_count(client, customer_with_passwor
 
     # A couple of failures, but under the limit.
     for _ in range(MAX_FAILED_ATTEMPTS - 1):
-        client.post("/api/v1/auth/login", json={"email": email, "password": "WrongPassword1"})
+        client.post("/api/v1/auth/login", json={"identifier": email, "password": "WrongPassword1"})
 
-    response = client.post("/api/v1/auth/login", json={"email": email, "password": "RealPassword123"})
+    response = client.post("/api/v1/auth/login", json={"identifier": email, "password": "RealPassword123"})
     assert response.status_code == 200
 
     # If the counter had carried over, one more wrong guess would now
     # trip the lockout - it shouldn't, since success reset it to zero.
-    response = client.post("/api/v1/auth/login", json={"email": email, "password": "WrongPassword1"})
+    response = client.post("/api/v1/auth/login", json={"identifier": email, "password": "WrongPassword1"})
     assert response.status_code == 401

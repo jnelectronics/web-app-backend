@@ -13,20 +13,30 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from fastapi.security import HTTPAuthorizationCredentials
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
 from jobs import send_payment_confirmed_email
-from models import Customer, Order, Payment, PaymentStatus, StaffUser
+from models import Customer, Order, Payment, PaymentStatus, StaffRole, StaffUser
 from pesapal_client import PesaPalError, get_transaction_status, is_configured, submit_order_request
-from schemas import PaymentInitiate, PaymentRead
-from security import bearer_scheme, decode_token_claims
+from schemas import PaymentInitiate, PaymentProvider, PaymentRead
+from security import decode_token_claims, require_staff_role
 
 router = APIRouter(tags=["payments"], route_class=EnvelopeRoute)
+
+# A SEPARATE HTTPBearer instance from security.py's shared bearer_scheme,
+# with auto_error=False - security.py's version REJECTS the request
+# outright (403) the instant no Authorization header is present, before
+# _resolve_actor below ever runs, which is exactly right for
+# customer/staff-only endpoints but wrong here: a guest has no Bearer
+# token at all, only an X-Guest-Token header, so this router needs to be
+# able to receive "no Authorization header" as a normal case, not an
+# automatic rejection, and decide for itself what that means.
+_optional_bearer_scheme = HTTPBearer(auto_error=False)
 webhook_router = APIRouter(tags=["payments"])
 
 logger = logging.getLogger(__name__)
@@ -71,35 +81,49 @@ class PaymentsUnavailableError(Exception):
 
 
 def _resolve_actor(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer_scheme),
+    x_guest_token: str | None = Header(default=None, alias="X-Guest-Token"),
     db: Session = Depends(get_db),
-) -> tuple[str, Customer | StaffUser]:
-    # Payments are the first endpoint where BOTH a customer and a staff
-    # token are valid - unlike get_current_customer/get_current_staff in
-    # security.py, which each only accept one token type. Returns
-    # ("customer", Customer) or ("staff", StaffUser) so the route can decide
-    # what "allowed to see this order" means for each case.
+) -> tuple[str, Customer | StaffUser | str]:
+    # Payments accept THREE kinds of caller, not just two: a customer, any
+    # staff role, or - since a guest checkout has no account/login at all
+    # - a guest identified only by the SAME X-Guest-Token header cart
+    # operations already use (routers/cart.py's get_current_cart). Returns
+    # ("customer", Customer), ("staff", StaffUser), or ("guest", <the raw
+    # token string>) - a guest resolves to no DB row of its own, since
+    # there's no account to look up; whether it's actually allowed to see
+    # a given order is decided by _get_visible_order below, by comparing
+    # this string against that ONE order's own stored guest_token.
     invalid_token = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    claims = decode_token_claims(credentials.credentials)
-    if claims is None:
+    if credentials is not None:
+        claims = decode_token_claims(credentials.credentials)
+        if claims is None:
+            raise invalid_token
+
+        if claims.get("type") == "customer":
+            customer = db.get(Customer, uuid.UUID(claims["sub"]))
+            if customer is None:
+                raise invalid_token
+            return "customer", customer
+
+        if claims.get("type") == "staff":
+            staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
+            if staff is None or not staff.is_active:
+                raise invalid_token
+            return "staff", staff
+
         raise invalid_token
 
-    if claims.get("type") == "customer":
-        customer = db.get(Customer, uuid.UUID(claims["sub"]))
-        if customer is None:
-            raise invalid_token
-        return "customer", customer
-
-    if claims.get("type") == "staff":
-        staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
-        if staff is None or not staff.is_active:
-            raise invalid_token
-        return "staff", staff
+    # No Bearer token at all - fall back to the guest header. An empty/
+    # missing X-Guest-Token here means the caller sent NEITHER kind of
+    # credential, so there's genuinely nothing to authenticate with.
+    if x_guest_token:
+        return "guest", x_guest_token
 
     raise invalid_token
 
@@ -107,15 +131,19 @@ def _resolve_actor(
 def _get_visible_order(order_id: uuid.UUID, actor_type: str, actor, db: Session) -> Order:
     # Staff (any role - the docs don't restrict payments to a specific
     # role, unlike catalog writes) can see any order. A customer can only
-    # see their own - same "identical 404 either way" privacy pattern
-    # routers/orders.py already uses, so a non-owner can't tell the
-    # difference between "wrong order id" and "not yours".
+    # see their own, and a guest only an order whose OWN stored
+    # guest_token matches the one they sent - same "identical 404 either
+    # way" privacy pattern routers/orders.py already uses, so a non-owner
+    # (of any kind) can't tell the difference between "wrong order id" and
+    # "not yours".
     order = db.get(Order, order_id)
     not_found = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
     if order is None:
         raise not_found
     if actor_type == "customer" and order.customer_id != actor.id:
+        raise not_found
+    if actor_type == "guest" and (order.guest_token is None or order.guest_token != actor):
         raise not_found
     return order
 
@@ -151,15 +179,15 @@ def initiate_payment(
     db: Session = Depends(get_db),
 ):
     actor_type, actor_account = actor
-    # Ownership check BEFORE the is_configured() check below - a caller
+    # Ownership check BEFORE anything provider-specific below - a caller
     # who can't see this order shouldn't learn anything about payment
     # availability for it either, same "identical 404 either way" privacy
     # reasoning _get_visible_order already applies elsewhere.
     order = _get_visible_order(order_id, actor_type, actor_account, db)
 
-    if not is_configured():
-        raise PaymentsUnavailableError("Payment services will be available soon. Please check back later.")
-
+    # Provider-agnostic checks - an order shouldn't be payable twice, or
+    # have two attempts in flight at once, REGARDLESS of how it's being
+    # paid for, so these run before branching on request.provider below.
     already_paid = (
         db.query(Payment)
         .filter(Payment.order_id == order.id, Payment.status == PaymentStatus.PAID)
@@ -184,9 +212,33 @@ def initiate_payment(
             "Please wait a few minutes, or check its status, before trying again."
         )
 
+    # Not in the original spec (added 2026-08-06) - cash/pay-on-collection
+    # never touches PesaPal at all: no redirect, no gateway session, just a
+    # record that stock/fulfillment can proceed against, waiting for staff
+    # to confirm the cash was actually collected (see mark_cash_payment_paid
+    # below). PaymentStatus.PENDING is exactly this - "recorded, not yet
+    # resolved, no gateway involved" - already in the enum, just never
+    # actually reachable through any code path before this one.
+    if request.provider == PaymentProvider.CASH_ON_DELIVERY:
+        new_payment = Payment(
+            order_id=order.id,
+            provider=request.provider.value,
+            amount=request.amount,
+            status=PaymentStatus.PENDING,
+            initiated_at=datetime.now(timezone.utc),
+        )
+        db.add(new_payment)
+        db.commit()
+        db.refresh(new_payment)
+        logger.info("Cash-on-delivery payment %s recorded for order %s", new_payment.id, order.id)
+        return new_payment
+
+    if not is_configured():
+        raise PaymentsUnavailableError("Payment services will be available soon. Please check back later.")
+
     new_payment = Payment(
         order_id=order.id,
-        provider=request.provider,
+        provider=request.provider.value,
         amount=request.amount,
         status=PaymentStatus.AWAITING_PAYMENT,
         initiated_at=datetime.now(timezone.utc),
@@ -204,7 +256,7 @@ def initiate_payment(
             merchant_reference=str(new_payment.id),
             amount=request.amount,
             currency="UGX",
-            description=f"Order {order.order_number} ({request.provider})",
+            description=f"Order {order.order_number} ({request.provider.value})",
             billing_email=order.guest_email,
             billing_phone=order.guest_phone_number,
             billing_first_name=first_name,
@@ -230,7 +282,7 @@ def initiate_payment(
         "Payment %s initiated for order %s (provider=%s, amount=%s)",
         new_payment.id,
         order.id,
-        request.provider,
+        request.provider.value,
         request.amount,
     )
     return new_payment
@@ -266,6 +318,61 @@ def read_payment(
     # Re-run the same visibility check via the payment's order, so a
     # customer can't fetch someone else's payment just by guessing its id.
     _get_visible_order(payment.order_id, actor_type, actor_account, db)
+    return payment
+
+
+# Same roles that can advance an order's fulfillment status
+# (routers/orders.py's STATUS_ADVANCE_ROLES) - whoever's handling the
+# order at collection/delivery time is who'd actually be confirming cash
+# changed hands, not a separate permission concept.
+MARK_CASH_PAID_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER)
+
+
+@router.patch("/payments/{payment_id}/mark-paid", response_model=PaymentRead)
+def mark_cash_payment_paid(
+    payment_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    _current_staff: StaffUser = Depends(require_staff_role(*MARK_CASH_PAID_ROLES)),
+    db: Session = Depends(get_db),
+):
+    # Not in the original spec - the staff-side half of cash-on-delivery
+    # (see initiate_payment above): there's no gateway webhook for cash, so
+    # a human has to be the one confirming it was actually collected.
+    payment = db.get(Payment, payment_id)
+    if payment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+
+    if payment.provider != PaymentProvider.CASH_ON_DELIVERY.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only cash-on-delivery payments can be marked paid this way",
+        )
+    if payment.status != PaymentStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Payment is not awaiting cash collection (status: {payment.status.value})",
+        )
+
+    payment.status = PaymentStatus.PAID
+    payment.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(payment)
+
+    order = db.get(Order, payment.order_id)
+    if order.guest_email:
+        # Same job the PesaPal webhook fires on a successful online
+        # payment - the customer gets the same confirmation regardless of
+        # how they actually paid.
+        background_tasks.add_task(
+            send_payment_confirmed_email,
+            order.guest_email,
+            order.guest_full_name,
+            order.order_number,
+            payment.amount,
+            payment.provider,
+        )
+
+    logger.info("Cash-on-delivery payment %s marked paid for order %s", payment.id, payment.order_id)
     return payment
 
 

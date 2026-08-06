@@ -5,8 +5,9 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -15,6 +16,7 @@ from google_auth_client import GoogleTokenError
 from google_auth_client import is_configured as google_is_configured
 from google_auth_client import verify_id_token as verify_google_id_token
 from jobs import send_password_reset_email
+from routers.cart import merge_guest_cart_into_customer
 from models import Customer, CustomerStatus, OwnerType, RefreshToken, StaffUser
 from rate_limit import check_not_locked_out, clear_failed_attempts, record_failed_attempt
 from schemas import (
@@ -73,7 +75,11 @@ def _issue_refresh_token(db: Session, owner_type: OwnerType, owner_id) -> str:
 
 
 @router.post("/register", response_model=CustomerRegisterResponse)
-def register(customer: CustomerRegister, db: Session = Depends(get_db)):
+def register(
+    customer: CustomerRegister,
+    db: Session = Depends(get_db),
+    x_guest_token: str | None = Header(default=None, alias="X-Guest-Token"),
+):
     # Reject a duplicate email with a clean 409 - otherwise Postgres's own
     # UNIQUE constraint would raise a raw IntegrityError instead.
     if db.query(Customer).filter(Customer.email == customer.email).first() is not None:
@@ -90,6 +96,13 @@ def register(customer: CustomerRegister, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_customer)
 
+    # Not in the original spec (added 2026-08-06) - a shopper who added
+    # items to a cart BEFORE creating an account shouldn't lose them the
+    # moment they register. Only does anything if X-Guest-Token was
+    # actually sent AND that guest has an active cart with items in it.
+    if x_guest_token:
+        merge_guest_cart_into_customer(db, new_customer.id, x_guest_token)
+
     access_token = create_access_token(subject=str(new_customer.id), account_type="customer")
     refresh_token = _issue_refresh_token(db, OwnerType.CUSTOMER, new_customer.id)
     return CustomerRegisterResponse(
@@ -98,21 +111,34 @@ def register(customer: CustomerRegister, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenPair)
-def login(credentials: CustomerLogin, db: Session = Depends(get_db)):
-    # Keyed by email, prefixed "customer:" so this can never collide with
-    # a staff lockout for the same email address (two separate systems -
-    # see rate_limit.py). Checked BEFORE even looking the customer up, so
-    # a locked-out attacker can't use response timing to learn anything.
-    rate_limit_key = f"customer:{credentials.email}"
+def login(
+    credentials: CustomerLogin,
+    db: Session = Depends(get_db),
+    x_guest_token: str | None = Header(default=None, alias="X-Guest-Token"),
+):
+    # Keyed by identifier, prefixed "customer:" so this can never collide
+    # with a staff lockout for the same email address (two separate
+    # systems - see rate_limit.py). Checked BEFORE even looking the
+    # customer up, so a locked-out attacker can't use response timing to
+    # learn anything.
+    rate_limit_key = f"customer:{credentials.identifier}"
     check_not_locked_out(rate_limit_key)
 
-    customer = db.query(Customer).filter(Customer.email == credentials.email).first()
+    # identifier can be EITHER an email or a phone number (added
+    # 2026-08-06) - both are unique columns, so matching either is
+    # unambiguous. or_ means "find a Customer where email matches OR
+    # phone_number matches" - exactly one column needs to match, not both.
+    customer = (
+        db.query(Customer)
+        .filter(or_(Customer.email == credentials.identifier, Customer.phone_number == credentials.identifier))
+        .first()
+    )
 
-    # Deliberately the SAME error for "no such email" and "wrong password" -
-    # telling an attacker which one was wrong would confirm whether a given
-    # email is registered at all.
+    # Deliberately the SAME error for "no such account" and "wrong
+    # password" - telling an attacker which one was wrong would confirm
+    # whether a given identifier is registered at all.
     invalid_credentials = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password"
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email/phone number or password"
     )
 
     if customer is None or customer.password_hash is None:
@@ -133,13 +159,20 @@ def login(credentials: CustomerLogin, db: Session = Depends(get_db)):
     if customer.status != CustomerStatus.ACTIVE:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account has been deactivated")
 
+    if x_guest_token:
+        merge_guest_cart_into_customer(db, customer.id, x_guest_token)
+
     access_token = create_access_token(subject=str(customer.id), account_type="customer")
     refresh_token = _issue_refresh_token(db, OwnerType.CUSTOMER, customer.id)
     return TokenPair(access_token=access_token, refresh_token=refresh_token)
 
 
 @router.post("/google", response_model=TokenPair)
-def google_sign_in(request: GoogleSignIn, db: Session = Depends(get_db)):
+def google_sign_in(
+    request: GoogleSignIn,
+    db: Session = Depends(get_db),
+    x_guest_token: str | None = Header(default=None, alias="X-Guest-Token"),
+):
     # No rate limiting here the way /login has (check_not_locked_out etc.) -
     # that exists to slow down someone GUESSING a password. There's no
     # equivalent guessable secret in this flow; forging a token that passes
@@ -181,6 +214,9 @@ def google_sign_in(request: GoogleSignIn, db: Session = Depends(get_db)):
         # Same check /login does, just reached a different way here -
         # a deactivated account shouldn't be usable via ANY sign-in method.
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account has been deactivated")
+
+    if x_guest_token:
+        merge_guest_cart_into_customer(db, customer.id, x_guest_token)
 
     access_token = create_access_token(subject=str(customer.id), account_type="customer")
     refresh_token = _issue_refresh_token(db, OwnerType.CUSTOMER, customer.id)

@@ -460,3 +460,189 @@ def test_staff_can_manage_any_orders_payments(client, order_setup, staff_token, 
     response = client.get(f"/api/v1/orders/{order.id}/payments", headers=headers)
     assert response.status_code == 200
     assert len(unwrap(response)) == 1
+
+
+@pytest.fixture
+def guest_order_setup(db):
+    # A guest order built directly (not through a real cart/checkout flow -
+    # that path is already covered elsewhere, e.g. test_order_notifications.py)
+    # with a known guest_token, so payments' guest-authorization logic can
+    # be tested in isolation.
+    category = Category(name=f"Guest Pay Test Category {uuid.uuid4().hex[:8]}")
+    db.add(category)
+    db.flush()
+
+    product = Product(category_id=category.id, name="Guest Pay Test Product")
+    db.add(product)
+    db.flush()
+
+    variant = ProductVariant(product_id=product.id, sku=f"SKU-{uuid.uuid4().hex[:8]}", price=50000.0)
+    db.add(variant)
+    db.flush()
+
+    branch = Branch(name="Guest Pay Test Branch", address="1 Guest Way")
+    db.add(branch)
+    db.flush()
+
+    inventory = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
+    db.add(inventory)
+
+    guest_token = f"guest-{uuid.uuid4().hex}"
+    order = Order(
+        order_number=f"JN-TEST-{uuid.uuid4().hex[:8]}",
+        customer_id=None,
+        guest_token=guest_token,
+        fulfilling_branch_id=branch.id,
+        guest_full_name="Guest Payer",
+        guest_phone_number="+256700000099",
+        delivery_address="Test Address",
+        subtotal=50000.0,
+        total=50000.0,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        OrderItem(
+            order_id=order.id,
+            variant_id=variant.id,
+            product_name_snapshot=product.name,
+            variant_label_snapshot=None,
+            quantity=1,
+            unit_price=50000.0,
+            line_total=50000.0,
+        )
+    )
+    db.commit()
+
+    yield {"order": order, "guest_token": guest_token}
+
+    db.query(Payment).filter(Payment.order_id == order.id).delete()
+    db.commit()
+    db.query(OrderItem).filter(OrderItem.order_id == order.id).delete()
+    db.commit()
+    db.query(Order).filter(Order.id == order.id).delete()
+    db.commit()
+    db.query(InventoryRecord).filter(InventoryRecord.id == inventory.id).delete()
+    db.commit()
+    db.query(ProductVariant).filter(ProductVariant.id == variant.id).delete()
+    db.commit()
+    db.query(Product).filter(Product.id == product.id).delete()
+    db.commit()
+    db.query(Category).filter(Category.id == category.id).delete()
+    db.commit()
+    db.query(Branch).filter(Branch.id == branch.id).delete()
+    db.commit()
+
+
+def test_guest_can_pay_for_own_order(client, guest_order_setup, mock_pesapal):
+    order = guest_order_setup["order"]
+    headers = {"X-Guest-Token": guest_order_setup["guest_token"]}
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+        headers=headers,
+    )
+    assert response.status_code == 201
+    payment = unwrap(response)
+
+    response = client.get(f"/api/v1/payments/{payment['id']}", headers=headers)
+    assert response.status_code == 200
+
+    response = client.get(f"/api/v1/orders/{order.id}/payments", headers=headers)
+    assert response.status_code == 200
+    assert len(unwrap(response)) == 1
+
+
+def test_guest_cannot_pay_with_wrong_guest_token(client, guest_order_setup):
+    order = guest_order_setup["order"]
+    wrong_headers = {"X-Guest-Token": "not-the-real-token"}
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+        headers=wrong_headers,
+    )
+    assert response.status_code == 404
+
+
+def test_payment_endpoints_require_some_credential(client, guest_order_setup):
+    order = guest_order_setup["order"]
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+    )
+    assert response.status_code == 401
+
+
+def test_payment_provider_rejects_unknown_value(client, order_setup):
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "bitcoin", "amount": 50000.0},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+def test_cash_on_delivery_skips_pesapal_and_staff_can_mark_it_paid(
+    client, db, order_setup, staff_token, mock_email
+):
+    # Deliberately NOT using mock_pesapal - cash-on-delivery should never
+    # touch pesapal_client at all, so if it did, this test would fail with
+    # a real network call instead of a mocked one.
+    order = order_setup["order"]
+    order.guest_email = "cash-payer@example.com"
+    db.commit()
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "cash_on_delivery", "amount": 50000.0},
+        headers=headers,
+    )
+    assert response.status_code == 201
+    payment = unwrap(response)
+    assert payment["status"] == "pending"
+    assert payment["redirect_url"] is None
+    assert payment["provider_reference"] is None
+
+    staff_headers = _auth(staff_token)
+    response = client.patch(f"/api/v1/payments/{payment['id']}/mark-paid", headers=staff_headers)
+    assert response.status_code == 200
+    assert unwrap(response)["status"] == "paid"
+
+    confirmation = next((e for e in mock_email if e["to_email"] == "cash-payer@example.com"), None)
+    assert confirmation is not None
+    assert order.order_number in confirmation["subject"]
+
+    # Can't mark it paid twice
+    response = client.patch(f"/api/v1/payments/{payment['id']}/mark-paid", headers=staff_headers)
+    assert response.status_code == 409
+
+    # A customer (not staff) can't mark it paid
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "cash_on_delivery", "amount": 50000.0},
+        headers=headers,
+    )
+    assert response.status_code == 409  # already paid (the first cash payment)
+
+
+def test_mark_paid_rejects_non_cash_payments(client, order_setup, staff_token, mock_pesapal):
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+        headers=headers,
+    )
+    payment = unwrap(response)
+
+    response = client.patch(
+        f"/api/v1/payments/{payment['id']}/mark-paid", headers=_auth(staff_token)
+    )
+    assert response.status_code == 400
