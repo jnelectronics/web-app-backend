@@ -68,10 +68,13 @@ _ERROR_CODES = {
 # catch it individually.
 @app.exception_handler(InsufficientInventoryError)
 def insufficient_inventory_handler(request: Request, exc: InsufficientInventoryError):
-    return JSONResponse(
-        status_code=409,
-        content={"success": False, "message": str(exc), "error_code": "INSUFFICIENT_INVENTORY"},
-    )
+    content = {"success": False, "message": str(exc), "error_code": "INSUFFICIENT_INVENTORY"}
+    # Only present when routers/orders.py's checkout raised this - lets the
+    # frontend highlight exactly which cart items don't have enough stock,
+    # instead of just a generic "insufficient inventory" with no detail.
+    if exc.short_items:
+        content["short_items"] = exc.short_items
+    return JSONResponse(status_code=409, content=content)
 
 
 # Same pattern as above, for the payments-specific business rule (BR-PAY-005:

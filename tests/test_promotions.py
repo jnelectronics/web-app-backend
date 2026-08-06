@@ -84,10 +84,32 @@ def test_banner_write_requires_inventory_manager(client, inventory_manager_token
     assert banner["is_active"] is True
 
     response = client.patch(
-        f"/api/v1/banners/{banner['id']}/status", headers=_auth(inventory_manager_token)
+        f"/api/v1/banners/{banner['id']}/status",
+        json={"is_active": False},
+        headers=_auth(inventory_manager_token),
     )
     assert response.status_code == 200
     assert unwrap(response)["is_active"] is False
+
+    # Setting the same value again is a safe no-op
+    response = client.patch(
+        f"/api/v1/banners/{banner['id']}/status",
+        json={"is_active": False},
+        headers=_auth(inventory_manager_token),
+    )
+    assert response.status_code == 200
+    assert unwrap(response)["is_active"] is False
+
+    # An inactive/scheduled banner is invisible on the public list...
+    response = client.get("/api/v1/banners")
+    assert banner["id"] not in {b["id"] for b in unwrap(response)}
+    # ...but visible to staff via include_inactive=true
+    response = client.get("/api/v1/banners?include_inactive=true", headers=_auth(inventory_manager_token))
+    assert banner["id"] in {b["id"] for b in unwrap(response)}
+    # A non-staff request for include_inactive is rejected, not silently
+    # downgraded to the public view
+    response = client.get("/api/v1/banners?include_inactive=true")
+    assert response.status_code == 401
 
     db.query(Banner).filter(Banner.id == uuid.UUID(banner["id"])).delete()
     db.commit()
@@ -130,8 +152,15 @@ def test_product_discount_lifecycle(client, product, inventory_manager_token):
     assert response.status_code == 200
     assert unwrap(response)["discount_type"] == "fixed_amount"
 
+    # GET returns the full history for this product, including the one
+    # just created above
+    response = client.get(f"/api/v1/products/{product.id}/discounts")
+    assert response.status_code == 200
+    assert discount["id"] in {d["id"] for d in unwrap(response)}
+
     response = client.patch(
         f"/api/v1/products/{product.id}/discounts/{discount['id']}/status",
+        json={"is_active": False},
         headers=_auth(inventory_manager_token),
     )
     assert response.status_code == 200

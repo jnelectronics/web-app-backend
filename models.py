@@ -67,7 +67,39 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(200))
 
+    # Longer marketing copy for the product detail page - nullable since a
+    # product can exist (e.g. just created) before anyone's written this yet.
+    description: Mapped[str | None] = mapped_column(String(2000))
+
+    # For the homepage's featured-products rail - a plain manual flag, not
+    # derived from anything else.
+    is_featured: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # URL-friendly identifier for product detail pages (/products/{slug}
+    # instead of /products/{uuid}) - server-generated once at creation time
+    # (see routers/products.py's _generate_unique_slug) and never changed
+    # afterward, even if the name is later edited, so existing links/SEO
+    # never break out from under a customer.
+    #
+    # The `default=` here is a FALLBACK only, for tests/scripts that
+    # construct a Product directly via the ORM instead of going through
+    # POST /products - it guarantees a unique value exists either way
+    # (the column is NOT NULL + unique) without every existing test
+    # fixture needing to be touched. Real product creation always
+    # overrides this with a real, name-derived slug.
+    slug: Mapped[str] = mapped_column(
+        String(220), unique=True, default=lambda: f"product-{uuid.uuid4().hex[:8]}"
+    )
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # NOTE: is_discounted is deliberately NOT a column here - product_discounts
+    # (see ProductDiscount below) has its own starts_at/ends_at/is_active
+    # window, so "is this product currently discounted" is a question that
+    # can only be answered by checking the CURRENT time against that table,
+    # not something safe to cache as a static boolean that could drift out
+    # of sync. Computed at read time instead - see
+    # routers/products.py's _build_product_read.
 
 
 class ProductVariant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -294,7 +326,9 @@ class Cart(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # guest session, never both at once. Which one is NULL is what tells
     # the two cases apart.
     customer_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("customers.id"))
-    guest_token: Mapped[str | None] = mapped_column(String(100), unique=True)
+    # NOT unique=True here - see the partial index below for why a plain
+    # column-level unique constraint is wrong for this column specifically.
+    guest_token: Mapped[str | None] = mapped_column(String(100))
 
     status: Mapped[CartStatus] = mapped_column(
         Enum(CartStatus, name="cart_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
@@ -307,6 +341,24 @@ class Cart(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "customer_id IS NOT NULL OR guest_token IS NOT NULL",
             name="ck_cart_has_owner",
+        ),
+        # A PARTIAL unique index (found 2026-08-06, same pattern as
+        # Payment's uq_payments_order_paid below) - only ACTIVE carts are
+        # checked for uniqueness, so a guest_token that's already been used
+        # by an OLDER, now-converted/abandoned cart can be reused for a
+        # brand new active one. A plain column-level unique=True (the
+        # original setup) made this impossible: the very first time a
+        # guest's cart converted (via checkout OR the new login-time merge
+        # below), that guest_token became permanently unusable - the next
+        # time the same browser tried to add anything to cart,
+        # get_current_cart's own fallback (create a new Cart for this
+        # token) would hit that same old unique constraint and crash with
+        # a raw database error instead of quietly starting a fresh cart.
+        Index(
+            "uq_carts_guest_token_active",
+            "guest_token",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
         ),
     )
 
@@ -351,6 +403,15 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # NULL for a guest order - there's no customer row to point at.
     customer_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("customers.id"))
+
+    # Copied from Cart.guest_token at checkout time (NULL for a registered
+    # customer's order, same as customer_id is NULL for a guest's) - this
+    # is what lets a guest, who has no account/login at all, prove after
+    # the fact that a given order is "theirs" when paying for it or
+    # checking payment status (routers/payments.py) - the same
+    # X-Guest-Token header already used for cart operations, just checked
+    # against this snapshot instead of a live Cart row.
+    guest_token: Mapped[str | None] = mapped_column(String(100))
 
     # NULL until a branch with enough stock is found during checkout.
     fulfilling_branch_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("branches.id"))

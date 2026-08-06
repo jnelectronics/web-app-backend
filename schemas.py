@@ -2,14 +2,34 @@
 # One pair per domain - a *Create schema (what a client sends us) and a
 # *Read schema (what we send back).
 
+import enum
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Generic, TypeVar
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, computed_field
 
 from models import CustomerStatus, CustomerType, DiscountType, MovementType, OrderStatus, PaymentStatus, StaffRole
+
+# Generic wrapper for every collection response - see pagination.py for the
+# actual page/total_pages math. `T` stands in for whatever *Read schema a
+# given list endpoint returns (ProductRead, OrderRead, etc.) - PaginatedResponse[ProductRead]
+# reads as "a page of products", the same idea as list[ProductRead] but with
+# a pagination block alongside the items instead of just a bare array.
+T = TypeVar("T")
+
+
+class PaginationMeta(BaseModel):
+    page: int
+    page_size: int
+    total_records: int
+    total_pages: int
+
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: list[T]
+    pagination: PaginationMeta
 
 
 def _validate_password_strength(password: str) -> str:
@@ -78,6 +98,8 @@ class ProductCreate(BaseModel):
     # matches the NOT NULL foreign key on the real products table.
     category_id: uuid.UUID
     name: str
+    description: str | None = None
+    is_featured: bool = False
 
 
 class ProductRead(BaseModel):
@@ -86,6 +108,17 @@ class ProductRead(BaseModel):
     id: uuid.UUID
     category_id: uuid.UUID
     name: str
+    description: str | None
+    is_featured: bool
+    # NOT from_attributes-mapped off the Product row directly - both are
+    # assembled by routers/products.py's _build_product_read (images come
+    # from a separate table; is_discounted is computed from
+    # product_discounts' current time window, never stored). ProductRead
+    # still gets constructed explicitly there either way, same pattern
+    # OrderRead already uses for its own `items` list.
+    slug: str
+    is_discounted: bool
+    images: list["ProductImageRead"]
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -118,6 +151,13 @@ class VariantRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     attributes: dict[str, str]
+    # Aggregate across EVERY branch's InventoryRecord for this variant -
+    # deliberately just a boolean, exposing no actual quantities or which
+    # branch(es) have stock (inventory levels are staff-only information).
+    # No "low_stock" flag alongside this yet - that needs a threshold
+    # (how few units counts as "low"?) that's a product decision, not
+    # something to invent a number for here.
+    in_stock: bool
 
 
 # No ProductImageCreate here anymore - POST/PUT .../images now take a real
@@ -137,6 +177,13 @@ class ProductImageRead(BaseModel):
     is_primary: bool
     display_order: int
     created_at: datetime
+
+
+# ProductRead references "ProductImageRead" as a forward-reference STRING
+# (it's defined earlier in this file, before this class exists yet) -
+# model_rebuild() tells Pydantic to resolve that string now that the real
+# class is available, rather than leaving it unresolved.
+ProductRead.model_rebuild()
 
 
 class InventoryCreate(BaseModel):
@@ -190,13 +237,24 @@ class CustomerProfileUpdate(BaseModel):
     phone_number: str | None = None
 
 
+class CustomerStatusUpdate(BaseModel):
+    # Sets status to exactly this value - same "not a toggle" reasoning as
+    # StaffStatusUpdate above, using this resource's own enum rather than
+    # a plain bool since that's what Customer.status actually is.
+    status: CustomerStatus
+
+
 class CustomerPasswordChange(BaseModel):
     current_password: str
     new_password: PasswordStr
 
 
 class CustomerLogin(BaseModel):
-    email: str
+    # "identifier" (not "email") - matches the original written spec, and
+    # lets a customer log in with either their email OR phone number
+    # (added 2026-08-06 - previously email-only, even though registration
+    # already collected an optional phone number).
+    identifier: str
     password: str
 
 
@@ -294,6 +352,19 @@ class CartItemRead(BaseModel):
 
     id: uuid.UUID
     variant_id: uuid.UUID
+    # NOT real columns on CartItem - routers/cart.py's _build_cart_read
+    # builds these explicitly, by looking up the variant/product/primary
+    # image fresh each time (not snapshotted the way unit_price_snapshot
+    # is - a product's NAME/image changing later should show up on an
+    # unpurchased cart line; only the price is deliberately frozen at
+    # add-to-cart time). Nullable in case the underlying variant/product
+    # somehow can't be found (soft-deleted rows still exist, so this
+    # should be rare to never in practice, not a normal case).
+    product_id: uuid.UUID | None
+    product_name: str | None
+    variant_label: str | None
+    sku: str | None
+    image_url: str | None
     quantity: int
     unit_price_snapshot: float
 
@@ -360,7 +431,14 @@ class OrderRead(BaseModel):
 
 
 class OrderAddressUpdate(BaseModel):
+    # delivery_address stays required (unchanged contract) - the three
+    # contact fields are optional additions (FR-ORDER-010 allows editing
+    # contact details too, not just the address): omitted means "leave
+    # this one as it is", not "clear it".
     delivery_address: str
+    guest_full_name: str | None = None
+    guest_phone_number: str | None = None
+    guest_email: str | None = None
 
 
 class OrderStatusUpdate(BaseModel):
@@ -405,11 +483,29 @@ class StaffRead(BaseModel):
     updated_at: datetime
 
 
+class StaffStatusUpdate(BaseModel):
+    # Sets is_active to exactly this value - deliberately NOT a toggle
+    # (see routers/staff.py) - a caller says what they want the result to
+    # be, rather than "flip whatever's there", so a double-click/retry/
+    # replay can't silently reverse the intended change.
+    is_active: bool
+
+
 class AuditLogRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     staff_user_id: uuid.UUID
+    # NOT auto-mapped off the AuditLog row (from_attributes can't reach
+    # across a table it doesn't have a column for) - routers/audit.py
+    # builds these explicitly, from a JOIN against staff_users. Nullable
+    # because a StaffUser row COULD be gone by the time someone reads this
+    # audit entry (test fixtures hard-delete; a real DB admin technically
+    # could too, even though the API itself never deletes one) - the
+    # audit entry itself should never disappear just because the actor
+    # eventually did.
+    staff_full_name: str | None
+    staff_email: str | None
     action: str
     resource_type: str
     resource_id: uuid.UUID
@@ -439,6 +535,18 @@ class StaffPasswordChange(BaseModel):
     new_password: PasswordStr
 
 
+class StaffPasswordResetResult(BaseModel):
+    # Not in the original spec - a staff member who forgets their password
+    # had no recovery route at all (StaffPasswordChange above needs
+    # knowing the CURRENT password, and there's no staff equivalent of
+    # /auth/password/forgot). This is the admin-initiated alternative: an
+    # Inventory Manager/System Administrator generates a random temporary
+    # password server-side and relays it to the locked-out staff member
+    # through a trusted channel (in person, a call) - not emailed, so this
+    # doesn't need a new frontend page the way the customer flow does.
+    temporary_password: str
+
+
 class StaffUpdate(BaseModel):
     full_name: str
     email: str
@@ -446,8 +554,22 @@ class StaffUpdate(BaseModel):
     role: StaffRole
 
 
+class PaymentProvider(str, enum.Enum):
+    # Formalizes values that were already de facto in use throughout the
+    # codebase (tests, real PesaPal integration) but never actually
+    # validated - found 2026-08-06 that Payment.provider accepted ANY
+    # string at all, including a typo or an empty one. Deliberately a
+    # SCHEMA-only enum, not a models.py/DB one - Payment.provider itself
+    # stays a plain VARCHAR(50) (see that column's own comment: the set of
+    # providers is expected to grow without needing a migration each
+    # time), this just validates what a CLIENT is allowed to send.
+    MOBILE_MONEY = "mobile_money"
+    CARD = "card"
+    CASH_ON_DELIVERY = "cash_on_delivery"
+
+
 class PaymentInitiate(BaseModel):
-    provider: str
+    provider: PaymentProvider
     amount: float
 
 
@@ -495,6 +617,12 @@ class BannerRead(BaseModel):
     updated_at: datetime
 
 
+class BannerStatusUpdate(BaseModel):
+    # Sets is_active to exactly this value - same "not a toggle" reasoning
+    # as StaffStatusUpdate above.
+    is_active: bool
+
+
 class ProductDiscountCreate(BaseModel):
     discount_type: DiscountType
     discount_value: float
@@ -514,3 +642,9 @@ class ProductDiscountRead(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class ProductDiscountStatusUpdate(BaseModel):
+    # Sets is_active to exactly this value - same "not a toggle" reasoning
+    # as StaffStatusUpdate above.
+    is_active: bool

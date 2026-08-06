@@ -10,7 +10,8 @@ from sqlalchemy.orm import Session
 from database import get_db
 from envelope import EnvelopeRoute
 from models import Category, StaffRole, StaffUser
-from schemas import CategoryCreate, CategoryRead
+from pagination import build_pagination_meta
+from schemas import CategoryCreate, CategoryRead, PaginatedResponse
 from security import require_staff_role
 
 router = APIRouter(prefix="/categories", tags=["categories"], route_class=EnvelopeRoute)
@@ -24,14 +25,13 @@ def read_category(category_id: uuid.UUID, db: Session = Depends(get_db)):
     return category
 
 
-@router.get("", response_model=list[CategoryRead])
+@router.get("", response_model=PaginatedResponse[CategoryRead])
 def list_categories(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    return (
-        db.query(Category)
-        .filter(Category.is_active == True)  # noqa: E712
-        .offset(skip)
-        .limit(limit)
-        .all()
+    query = db.query(Category).filter(Category.is_active == True)  # noqa: E712
+    total = query.count()
+    categories = query.offset(skip).limit(limit).all()
+    return PaginatedResponse[CategoryRead](
+        items=categories, pagination=build_pagination_meta(skip, limit, total)
     )
 
 

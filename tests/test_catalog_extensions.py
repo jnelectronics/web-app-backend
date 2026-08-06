@@ -7,7 +7,7 @@ import uuid
 import pytest
 
 from conftest import unwrap
-from models import Category, Product, ProductImage, ProductVariant, StaffRole, StaffUser, VariantAttribute
+from models import AuditLog, Category, Product, ProductDiscount, ProductImage, ProductVariant, StaffRole, StaffUser, VariantAttribute
 from security import create_access_token, hash_password
 
 
@@ -192,3 +192,159 @@ def test_product_image_lifecycle_and_primary_cap(client, product, inventory_mana
     assert response.status_code == 204
     # Deleting an image also deletes its Cloudinary asset
     assert len(mock_cloudinary) == 2
+
+
+def test_product_list_filtering_search_sort_and_pagination(client, db, inventory_manager_token):
+    headers = _auth(inventory_manager_token)
+    category = Category(name=f"Filter Test Category {uuid.uuid4().hex[:8]}")
+    other_category = Category(name=f"Filter Test Other Category {uuid.uuid4().hex[:8]}")
+    db.add_all([category, other_category])
+    db.commit()
+
+    try:
+        apple_response = client.post(
+            "/api/v1/products",
+            json={
+                "category_id": str(category.id),
+                "name": "Apple Widget",
+                "description": "A shiny gadget",
+                "is_featured": True,
+            },
+            headers=headers,
+        )
+        banana_response = client.post(
+            "/api/v1/products",
+            json={"category_id": str(category.id), "name": "Banana Widget"},
+            headers=headers,
+        )
+        other_category_response = client.post(
+            "/api/v1/products",
+            json={"category_id": str(other_category.id), "name": "Cherry Widget"},
+            headers=headers,
+        )
+        assert apple_response.status_code == 200
+        assert banana_response.status_code == 200
+        assert other_category_response.status_code == 200
+        apple_id = unwrap(apple_response)["id"]
+
+        # category filter
+        response = client.get(f"/api/v1/products?category={category.id}")
+        body = unwrap(response)
+        assert {p["name"] for p in body["items"]} == {"Apple Widget", "Banana Widget"}
+        assert body["pagination"]["total_records"] == 2
+
+        # search matches name OR description
+        response = client.get("/api/v1/products?search=shiny")
+        assert {p["name"] for p in unwrap(response)["items"]} == {"Apple Widget"}
+
+        # featured filter
+        response = client.get("/api/v1/products?featured=true")
+        names = {p["name"] for p in unwrap(response)["items"]}
+        assert "Apple Widget" in names
+        assert "Banana Widget" not in names
+
+        # sort=-name (descending)
+        response = client.get(f"/api/v1/products?category={category.id}&sort=-name")
+        names_in_order = [p["name"] for p in unwrap(response)["items"]]
+        assert names_in_order == ["Banana Widget", "Apple Widget"]
+
+        # pagination metadata
+        response = client.get(f"/api/v1/products?category={category.id}&limit=1&skip=0")
+        body = unwrap(response)
+        assert len(body["items"]) == 1
+        assert body["pagination"] == {"page": 1, "page_size": 1, "total_records": 2, "total_pages": 2}
+
+        # discounted filter - false until a discount actually exists
+        response = client.get(f"/api/v1/products?category={category.id}&discounted=true")
+        assert unwrap(response)["items"] == []
+
+        client.post(
+            f"/api/v1/products/{apple_id}/discounts",
+            json={"discount_type": "percentage", "discount_value": 10.0},
+            headers=headers,
+        )
+        response = client.get(f"/api/v1/products?category={category.id}&discounted=true")
+        assert [p["name"] for p in unwrap(response)["items"]] == ["Apple Widget"]
+    finally:
+        all_category_ids = [category.id, other_category.id]
+        product_ids = [p.id for p in db.query(Product).filter(Product.category_id.in_(all_category_ids)).all()]
+        db.query(AuditLog).filter(
+            AuditLog.resource_type == "product", AuditLog.resource_id.in_(product_ids)
+        ).delete(synchronize_session=False)
+        db.commit()
+        db.query(ProductDiscount).filter(ProductDiscount.product_id.in_(product_ids)).delete(synchronize_session=False)
+        db.commit()
+        db.query(Product).filter(Product.id.in_(product_ids)).delete(synchronize_session=False)
+        db.commit()
+        db.query(Category).filter(Category.id.in_(all_category_ids)).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_product_read_includes_new_fields_and_computed_discount(client, db, inventory_manager_token):
+    headers = _auth(inventory_manager_token)
+    category = Category(name=f"Field Test Category {uuid.uuid4().hex[:8]}")
+    db.add(category)
+    db.commit()
+
+    try:
+        response = client.post(
+            "/api/v1/products",
+            json={
+                "category_id": str(category.id),
+                "name": "Field Test Product",
+                "description": "A great product",
+                "is_featured": True,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200
+        product = unwrap(response)
+        assert product["description"] == "A great product"
+        assert product["is_featured"] is True
+        # Server-generated from the name, not client-supplied
+        assert product["slug"] == "field-test-product"
+        assert product["images"] == []
+        assert product["is_discounted"] is False
+
+        # A second product with the SAME name gets a disambiguated slug,
+        # not a duplicate (the column is unique) or a crash
+        response2 = client.post(
+            "/api/v1/products",
+            json={"category_id": str(category.id), "name": "Field Test Product"},
+            headers=headers,
+        )
+        assert response2.status_code == 200
+        assert unwrap(response2)["slug"] == "field-test-product-2"
+
+        # A currently-active discount flips is_discounted to True on a
+        # plain public GET, not just the staff-created response
+        discount_response = client.post(
+            f"/api/v1/products/{product['id']}/discounts",
+            json={"discount_type": "percentage", "discount_value": 15.0},
+            headers=headers,
+        )
+        assert discount_response.status_code == 200
+
+        response = client.get(f"/api/v1/products/{product['id']}")
+        assert unwrap(response)["is_discounted"] is True
+        # The second product has no discount - still False
+        response = client.get(f"/api/v1/products/{response2.json()['data']['id']}")
+        assert unwrap(response)["is_discounted"] is False
+    finally:
+        product_ids = [p.id for p in db.query(Product).filter(Product.category_id == category.id).all()]
+        # product.create writes an audit_logs row referencing the acting
+        # staff member (write_audit_log) - has to go before
+        # inventory_manager_token's OWN teardown tries to delete that
+        # StaffUser row, per the LIFO fixture-teardown-order gotcha in
+        # CLAUDE.md (this fixture's teardown runs AFTER this one, so it
+        # can't defend against a reference this test itself created).
+        db.query(AuditLog).filter(
+            AuditLog.resource_type == "product", AuditLog.resource_id.in_(product_ids)
+        ).delete(synchronize_session=False)
+        db.commit()
+        db.query(ProductDiscount).filter(ProductDiscount.product_id.in_(product_ids)).delete(synchronize_session=False)
+        db.commit()
+        db.query(Product).filter(Product.id.in_(product_ids)).delete(synchronize_session=False)
+        db.commit()
+        db.query(Category).filter(Category.id == category.id).delete()
+        db.commit()

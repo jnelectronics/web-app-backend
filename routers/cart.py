@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Cart, CartItem, CartStatus, ProductVariant
-from schemas import CartItemAdd, CartItemUpdate, CartRead
+from models import Cart, CartItem, CartStatus, Product, ProductImage, ProductVariant
+from schemas import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
 from security import decode_token_claims
 
 router = APIRouter(prefix="/cart", tags=["cart"], route_class=EnvelopeRoute)
@@ -70,12 +70,90 @@ def get_current_cart(
     )
 
 
+def merge_guest_cart_into_customer(db: Session, customer_id: uuid.UUID, guest_token: str) -> None:
+    # Called from routers/auth.py's login/register/google_sign_in (not in
+    # the original spec - added 2026-08-06) when a request carries BOTH a
+    # customer identity and an X-Guest-Token: a shopper who added items
+    # anonymously and only THEN logged in shouldn't lose them.
+    #
+    # Deliberately does NOT commit itself - the caller (auth.py) is already
+    # inside its own transaction issuing tokens; this just stages the
+    # changes into that same commit, so a merge failure can't leave tokens
+    # issued but the cart half-merged.
+    guest_cart = (
+        db.query(Cart).filter(Cart.guest_token == guest_token, Cart.status == CartStatus.ACTIVE).first()
+    )
+    if guest_cart is None:
+        return  # No active guest cart under this token - nothing to merge.
+
+    guest_items = db.query(CartItem).filter(CartItem.cart_id == guest_cart.id).all()
+    if not guest_items:
+        return
+
+    customer_cart = (
+        db.query(Cart).filter(Cart.customer_id == customer_id, Cart.status == CartStatus.ACTIVE).first()
+    )
+    if customer_cart is None:
+        customer_cart = Cart(customer_id=customer_id)
+        db.add(customer_cart)
+        db.flush()  # assigns customer_cart.id for the items below
+
+    for guest_item in guest_items:
+        existing = (
+            db.query(CartItem)
+            .filter(CartItem.cart_id == customer_cart.id, CartItem.variant_id == guest_item.variant_id)
+            .first()
+        )
+        if existing is not None:
+            # Same variant already in the customer's own cart - combine
+            # quantities rather than violate the UNIQUE(cart_id, variant_id)
+            # constraint with a second row for it.
+            existing.quantity += guest_item.quantity
+            db.delete(guest_item)
+        else:
+            # Move the row itself rather than delete-and-recreate - keeps
+            # its own id/created_at, and is simpler than copying every field.
+            guest_item.cart_id = customer_cart.id
+
+    # "Converted" already means "this cart's job is done, its contents now
+    # live on as something else" elsewhere in this codebase (checkout
+    # marks a cart CONVERTED once its items become an Order) - reused here
+    # for the same reason, rather than adding a new CartStatus value for
+    # one more way a cart's life can end.
+    guest_cart.status = CartStatus.CONVERTED
+
+
 def _build_cart_read(cart: Cart, db: Session) -> CartRead:
     # Shared by every route below - re-reads this cart's items fresh from
     # the database and shapes them into the response, so every endpoint
     # returns the same up-to-date view of the cart after whatever it did.
     items = db.query(CartItem).filter(CartItem.cart_id == cart.id).all()
-    return CartRead(id=cart.id, items=items)
+
+    item_reads = []
+    for item in items:
+        variant = db.get(ProductVariant, item.variant_id)
+        product = db.get(Product, variant.product_id) if variant is not None else None
+        primary_image = (
+            db.query(ProductImage)
+            .filter(ProductImage.product_id == product.id, ProductImage.is_primary == True)  # noqa: E712
+            .first()
+            if product is not None
+            else None
+        )
+        item_reads.append(
+            CartItemRead(
+                id=item.id,
+                variant_id=item.variant_id,
+                product_id=product.id if product is not None else None,
+                product_name=product.name if product is not None else None,
+                variant_label=variant.variant_label if variant is not None else None,
+                sku=variant.sku if variant is not None else None,
+                image_url=primary_image.image_url if primary_image is not None else None,
+                quantity=item.quantity,
+                unit_price_snapshot=item.unit_price_snapshot,
+            )
+        )
+    return CartRead(id=cart.id, items=item_reads)
 
 
 @router.get("", response_model=CartRead)

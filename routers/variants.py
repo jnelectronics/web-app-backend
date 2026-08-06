@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Product, ProductVariant, StaffRole, StaffUser, VariantAttribute
-from schemas import VariantCreate, VariantRead
+from models import InventoryRecord, Product, ProductVariant, StaffRole, StaffUser, VariantAttribute
+from pagination import build_pagination_meta
+from schemas import PaginatedResponse, VariantCreate, VariantRead
 from security import require_staff_role
 
 router = APIRouter(prefix="/variants", tags=["variants"], route_class=EnvelopeRoute)
@@ -23,6 +24,15 @@ def _build_variant_read(variant: ProductVariant, db: Session) -> VariantRead:
     # Shared by every route below - re-reads this variant's attributes
     # fresh from the database, same pattern as cart.py's _build_cart_read.
     attribute_rows = db.query(VariantAttribute).filter(VariantAttribute.variant_id == variant.id).all()
+    # ANY branch with stock > 0 makes this true - a plain existence check,
+    # not a sum, since a customer only needs to know "can I buy this
+    # somewhere", not the total quantity across every branch.
+    in_stock = (
+        db.query(InventoryRecord)
+        .filter(InventoryRecord.variant_id == variant.id, InventoryRecord.quantity_available > 0)
+        .first()
+        is not None
+    )
     return VariantRead(
         id=variant.id,
         product_id=variant.product_id,
@@ -33,6 +43,7 @@ def _build_variant_read(variant: ProductVariant, db: Session) -> VariantRead:
         created_at=variant.created_at,
         updated_at=variant.updated_at,
         attributes={row.attribute_name: row.attribute_value for row in attribute_rows},
+        in_stock=in_stock,
     )
 
 
@@ -54,7 +65,7 @@ def read_variant(variant_id: uuid.UUID, db: Session = Depends(get_db)):
     return _build_variant_read(variant, db)
 
 
-@router.get("", response_model=list[VariantRead])
+@router.get("", response_model=PaginatedResponse[VariantRead])
 def list_variants(
     product_id: uuid.UUID | None = None,
     skip: int = 0,
@@ -68,8 +79,12 @@ def list_variants(
     if product_id is not None:
         query = query.filter(ProductVariant.product_id == product_id)
 
+    total = query.count()
     variants = query.offset(skip).limit(limit).all()
-    return [_build_variant_read(v, db) for v in variants]
+    return PaginatedResponse[VariantRead](
+        items=[_build_variant_read(v, db) for v in variants],
+        pagination=build_pagination_meta(skip, limit, total),
+    )
 
 
 @router.post("", response_model=VariantRead)
