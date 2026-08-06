@@ -116,6 +116,14 @@ Collections additionally include a `pagination` object:
 }
 ```
 
+Deployed behavior note (2026-08-06): validation errors (`422`) carry FastAPI's
+own default shape instead of the `details: {field: ...}` sketch above -
+`{"success": false, "message": "Validation failed.", "error_code":
+"VALIDATION_ERROR", "errors": [{"type": "...", "loc": ["body", "email"],
+"msg": "...", "input": "..."}]}`. `errors` is a list (a request can fail
+validation on more than one field at once), and `loc` is the field path
+(e.g. `["body", "email"]`), not a bare field name.
+
 ## 2.5 HTTP Status Codes
 
 | Code | Meaning              |
@@ -134,18 +142,41 @@ Collections additionally include a `pagination` object:
 
 ## 2.6 Pagination
 
+Deployed behavior note (2026-08-06): the query params are `skip`/`limit`
+(offset-based), not `page`/`page_size` - `skip=20&limit=10` is "page 3" at a
+page size of 10. Every collection endpoint's response wraps its array as
+`{"items": [...], "pagination": {...}}` under `data`, not a bare array -
+`pagination` carries `page`/`page_size`/`total_records`/`total_pages`
+(computed from `skip`/`limit`/the real total, so the client gets human page
+numbers without having to do that arithmetic itself).
+
 ```
-GET /products?page=1&page_size=20
+GET /products?skip=0&limit=20
+```
+
+```json
+{
+  "success": true,
+  "message": "Request successful.",
+  "data": {
+    "items": [ /* ProductRead[] */ ],
+    "pagination": { "page": 1, "page_size": 20, "total_records": 143, "total_pages": 8 }
+  }
+}
 ```
 
 ## 2.7 Filtering & Sorting
 
 ```
-GET /products?category=headphones&search=oraimo&active=true
+GET /products?category=<category_uuid>&search=oraimo&featured=true&discounted=true
 GET /products?sort=-created_at
 ```
 
-A leading `-` denotes descending order. Supported filters are listed per-endpoint below.
+A leading `-` denotes descending order. Deployed behavior note: `sort` only
+supports `name`/`-name`/`created_at`/`-created_at` on `GET /products` - price
+lives on `ProductVariant`, not `Product` (a product can have several variants
+at different prices), so a price sort isn't answerable by this endpoint.
+Supported filters are listed per-endpoint below.
 
 ## 2.8 Authentication Header
 
@@ -316,10 +347,16 @@ Response `201`:
 
 **Example — `POST /auth/login`**
 
+Deployed behavior note (2026-08-06): the field is `email`, not `identifier` -
+login is email-only in the current implementation. A customer can still
+*register* with a phone number, but cannot currently log in with one; see the
+Frontend Integration Contract doc for the open question on whether phone
+login should be added.
+
 Request:
 ```json
 {
-  "identifier": "jane@example.com",
+  "email": "jane@example.com",
   "password": "S3cure!Pass"
 }
 ```
@@ -348,6 +385,14 @@ Error `401`:
 ---
 
 ## 5.2 Customers — `/api/v1/customers`
+
+Deployed behavior note (2026-08-06): `CustomerRead` identifies the account
+type via `customer_type: "guest" | "registered"` and account state via
+`status: "active" | "inactive"` (both real enum values on the `Customer`
+table), not a plain `is_guest` boolean. `PATCH /customers/{customer_uuid}/status`
+now takes a body, `{"status": "active" | "inactive"}` - it used to silently
+flip whatever the current value was (not idempotent, unsafe to retry); it now
+sets exactly the value the caller asks for.
 
 | Method | Path                             | Auth                          | Description                              |
 |--------|-----------------------------------|--------------------------------|---------------------------------------------|
@@ -379,28 +424,50 @@ Response `200`:
 
 ## 5.3 Categories — `/api/v1/categories`
 
+Deployed behavior note (2026-08-06): edit is `PUT`, not `PATCH`; deactivate is
+a real `DELETE` (still a soft delete under the hood - flips `is_active`, the
+row is never actually removed - a hard delete would break any order history
+referencing a category's products).
+
 | Method | Path                              | Auth              | Description                          |
 |--------|-------------------------------------|--------------------|-----------------------------------------|
 | GET    | `/categories`                        | Public              | List active categories (BR-CAT-002)     |
 | GET    | `/categories/{category_uuid}`        | Public              | Category detail                         |
 | POST   | `/categories`                         | Inventory Manager    | Create category (FR-PROD-006)           |
-| PATCH  | `/categories/{category_uuid}`        | Inventory Manager    | Edit category (FR-PROD-007)             |
-| PATCH  | `/categories/{category_uuid}/status` | Inventory Manager    | Deactivate/reactivate (FR-PROD-008)      |
+| PUT    | `/categories/{category_uuid}`        | Inventory Manager    | Edit category (FR-PROD-007)             |
+| DELETE | `/categories/{category_uuid}`        | Inventory Manager    | Deactivate (soft delete) (FR-PROD-008)  |
 
 ---
 
 ## 5.4 Products, Variants & Images — `/api/v1/products`
+
+Deployed behavior notes (2026-08-06):
+- Product/variant update is `PUT`, not `PATCH`; deactivate is a real `DELETE`
+  (still a soft delete - flips `is_active`).
+- Variants are NOT nested under `/products/{id}/variants` for read/update -
+  they live at the top level, `/api/v1/variants` (`GET /variants?product_id=`
+  to list one product's variants, `GET/PUT /variants/{variant_uuid}` for a
+  single one). `POST /products/{product_uuid}/variants` (create) is still
+  nested as shown below.
+- `ProductRead` now embeds `images` directly (an array, same shape as
+  `ProductImageRead`) - no separate `GET .../images` call needed to display a
+  product's photos.
+- `GET /products/{product_uuid}/discounts` now exists (added after this
+  table was first written) - returns every discount ever configured for that
+  product (past/current/future/deactivated), not just the current one.
 
 | Method | Path                                                   | Auth              | Description                                   |
 |--------|-----------------------------------------------------------|--------------------|--------------------------------------------------|
 | GET    | `/products`                                                 | Public              | Browse/search/filter products (FR-BROWSE-005/006) |
 | GET    | `/products/{product_uuid}`                                  | Public              | Product detail (FR-BROWSE-007)                  |
 | POST   | `/products`                                                  | Inventory Manager    | Create product (FR-PROD-001)                    |
-| PATCH  | `/products/{product_uuid}`                                   | Inventory Manager    | Update product (FR-PROD-002)                    |
-| PATCH  | `/products/{product_uuid}/status`                            | Inventory Manager    | Deactivate product (FR-PROD-003/004)             |
+| PUT    | `/products/{product_uuid}`                                   | Inventory Manager    | Update product (FR-PROD-002)                    |
+| DELETE | `/products/{product_uuid}`                                   | Inventory Manager    | Deactivate (soft delete) (FR-PROD-003/004)       |
 | POST   | `/products/{product_uuid}/variants`                          | Inventory Manager    | Add variant (FR-PROD-009)                        |
-| PATCH  | `/products/{product_uuid}/variants/{variant_uuid}`           | Inventory Manager    | Update variant / price / SKU (FR-PROD-011)       |
-| PATCH  | `/products/{product_uuid}/variants/{variant_uuid}/status`    | Inventory Manager    | Deactivate variant                               |
+| GET    | `/variants?product_id={product_uuid}`                        | Public              | List a product's variants                        |
+| PUT    | `/variants/{variant_uuid}`                                   | Inventory Manager    | Update variant / price / SKU (FR-PROD-011)       |
+| DELETE | `/variants/{variant_uuid}`                                   | Inventory Manager    | Deactivate variant (soft delete)                 |
+| GET    | `/products/{product_uuid}/discounts`                         | Public              | List a product's discounts (all, not just current) |
 | POST   | `/products/{product_uuid}/images`                            | Inventory Manager    | Upload image, max 5 (FR-PROD-012)                |
 | PUT    | `/products/{product_uuid}/images/{image_uuid}`               | Inventory Manager    | Replace image (FR-PROD-014)                      |
 | DELETE | `/products/{product_uuid}/images/{image_uuid}`               | Inventory Manager    | Remove image                                     |
@@ -410,14 +477,14 @@ Response `200`:
 
 | Param       | Example                | Notes                                  |
 |-------------|--------------------------|------------------------------------------|
-| `category`  | `?category=headphones`   | Filter by category slug/uuid            |
-| `search`    | `?search=oraimo`          | Keyword search on name (FR-PROD-020)    |
+| `category`  | `?category=<category_uuid>` | Filter by category UUID (not slug - categories don't have slugs) |
+| `search`    | `?search=oraimo`          | Matches name OR description (FR-PROD-020) |
 | `featured`  | `?featured=true`          | Homepage featured products               |
 | `discounted`| `?discounted=true`        | Promotional section (FR-BROWSE-003)     |
-| `sort`      | `?sort=-created_at`       | See §2.7                                |
-| `page`, `page_size` | `?page=2&page_size=20` | See §2.6                        |
+| `sort`      | `?sort=-created_at`       | See §2.7 - `name`/`created_at` only     |
+| `skip`, `limit` | `?skip=0&limit=20`    | See §2.6                                |
 
-Note: `quantity_available` and branch/inventory fields are **never** included in customer-facing product responses (FR-PROD-017/018). They are visible only through the `/inventory` endpoints below.
+Note: `quantity_available` and branch/inventory fields are **never** included in customer-facing product responses (FR-PROD-017/018). They are visible only through the `/inventory` endpoints below. `VariantRead` does include an aggregate `in_stock` boolean (added 2026-08-06) - true if ANY branch has stock, with no quantities or branch identities exposed.
 
 **Example — `POST /products`**
 
@@ -471,18 +538,28 @@ Branches are never exposed to the customer-facing storefront (FR-BRANCH-007).
 
 ## 5.6 Inventory — `/api/v1/inventory`
 
+Deployed behavior notes (2026-08-06): the adjust path has an `/adjust`
+suffix, and the body's quantity field is `quantity_change` (not
+`quantity_changed` - that name is what the resulting `InventoryMovement`
+log row calls it, not the request body). `GET /inventory/movements` (no
+`{inventory_record_uuid}`, added after this table was first written) lists
+movements branch-wide, filterable by `branch_id`/`variant_id`/
+`movement_type`/date range - the per-record endpoint below still exists for
+a single record's drill-down view.
+
 | Method | Path                                                | Auth                                | Description                              |
 |--------|--------------------------------------------------------|---------------------------------------|---------------------------------------------|
 | GET    | `/inventory`                                             | Sales Attendant, Inventory Manager     | List inventory records, filterable by `branch_id`, `variant_id` (FR-INV-008) |
 | GET    | `/inventory/{inventory_record_uuid}`                     | Sales Attendant, Inventory Manager     | Single inventory record detail             |
-| PATCH  | `/inventory/{inventory_record_uuid}`                     | Inventory Manager                      | Adjust stock quantity (FR-INV-007)          |
-| GET    | `/inventory/{inventory_record_uuid}/movements`           | Sales Attendant, Inventory Manager     | Movement history (FR-INV-010)               |
+| PATCH  | `/inventory/{inventory_record_uuid}/adjust`              | Inventory Manager                      | Adjust stock quantity (FR-INV-007)          |
+| GET    | `/inventory/movements`                                   | Sales Attendant, Inventory Manager     | Movement history, branch-wide, filterable   |
+| GET    | `/inventory/{inventory_record_uuid}/movements`           | Sales Attendant, Inventory Manager     | Movement history, one record (FR-INV-010)   |
 
-**Example — `PATCH /inventory/{inventory_record_uuid}`**
+**Example — `PATCH /inventory/{inventory_record_uuid}/adjust`**
 
 Request:
 ```json
-{ "movement_type": "adjustment", "quantity_changed": -3, "reason": "Damaged in storage" }
+{ "quantity_change": -3, "movement_type": "adjustment", "reason": "Damaged in storage" }
 ```
 
 Response `200`:
@@ -542,10 +619,26 @@ Response `200`:
 
 ## 5.8 Orders — `/api/v1/orders`
 
+Deployed behavior notes (2026-08-06):
+- `GET /orders` is customer-only ("my orders") regardless of caller, not the
+  overloaded by-caller-type behavior this table originally sketched. Staff
+  get a SEPARATE endpoint instead, `GET /orders/staff` (added after this
+  table was first written) - deliberately not the same path behaving two
+  different ways depending on who's asking, so what an endpoint returns
+  doesn't depend on hidden caller-type logic. Filterable by `status`,
+  `search` (order number or guest phone), `start_date`, `end_date`.
+- `PATCH /orders/{order_uuid}` now also accepts optional `guest_full_name`,
+  `guest_phone_number`, `guest_email` alongside `delivery_address` (FR-ORDER-010
+  covers contact details too, not just the address) - omitted fields are left
+  as they are, not cleared.
+- `POST /orders/{order_uuid}/payments` etc. (see §5.9) now also accept a
+  **guest** caller via `X-Guest-Token`, not just an owning Customer or Staff.
+
 | Method | Path                                | Auth                                     | Description                                      |
 |--------|---------------------------------------|---------------------------------------------|------------------------------------------------------|
 | POST   | `/orders`                              | Customer or Guest                            | Place order from cart (FR-ORDER-001/006)             |
-| GET    | `/orders`                              | Customer (own) / Sales Attendant / Inventory Manager (all) | List orders, filterable by `status`, `created_at` |
+| GET    | `/orders`                              | Customer (own only)                          | List own orders, filterable by `skip`, `limit`      |
+| GET    | `/orders/staff`                        | Sales Attendant, Inventory Manager           | List ALL orders, filterable by `status`, `search`, `start_date`, `end_date` |
 | GET    | `/orders/{order_uuid}`                 | Owning Customer or Staff                     | Order detail                                          |
 | PATCH  | `/orders/{order_uuid}`                 | Owning Customer                              | Edit order (only if not yet "Out for Delivery" — FR-ORDER-010) |
 | PATCH  | `/orders/{order_uuid}/cancel`          | Owning Customer or Staff                     | Cancel order (FR-ORDER-011)                           |
@@ -608,12 +701,40 @@ Error `409` (invalid transition, e.g. `delivered` → `pending`):
 
 ## 5.9 Payments — `/api/v1/payments`
 
-| Method | Path                                | Auth                     | Description                                       |
-|--------|---------------------------------------|----------------------------|--------------------------------------------------------|
-| POST   | `/orders/{order_uuid}/payments`        | Owning Customer or Staff    | Initiate a payment attempt for an order (FR-PAY-001/002) |
-| GET    | `/orders/{order_uuid}/payments`        | Owning Customer or Staff    | List payment attempts for an order                       |
-| GET    | `/payments/{payment_uuid}`             | Owning Customer or Staff    | Payment detail                                            |
-| POST   | `/payments/webhook`                    | Payment Gateway (signed)    | Gateway callback confirming/failing a payment (PAYINT-002/003) |
+Deployed behavior notes (2026-08-06):
+- Backed by the real PesaPal API 3.0, not a generic signed-callback gateway.
+  `POST /orders/{order_uuid}/payments` returns a `redirect_url` (PesaPal's own
+  hosted checkout page) alongside the payment record - the frontend must send
+  the customer's browser there, not build a card/mobile-money form itself.
+- The webhook is `GET /payments/webhook`, not `POST` - it's PesaPal's IPN
+  callback, which sends `OrderTrackingId`/`OrderMerchantReference`/
+  `OrderNotificationType` as query params, deliberately WITHOUT the actual
+  payment status (a PesaPal security measure). The handler calls PesaPal's
+  own `GetTransactionStatus` to learn the real outcome, then responds with
+  PesaPal's own required acknowledgment shape - NOT this API's usual
+  envelope, and NOT the updated `Payment` object.
+- "Owning Customer or Staff" now also includes **guests** (added 2026-08-06,
+  not in the original scope of this section) - a guest checkout has no
+  account/login, so ownership is proven via the same `X-Guest-Token` header
+  cart operations already use, checked against the order's own stored
+  `guest_token` (set at checkout time from the cart that created it).
+- `PaymentInitiate.provider` is now a validated enum (added 2026-08-06,
+  previously any free-form string was accepted): `mobile_money`, `card`, or
+  `cash_on_delivery`. `cash_on_delivery` skips PesaPal entirely - no
+  `redirect_url`, no gateway session, the `Payment` is created directly with
+  `status: "pending"`. `PATCH /payments/{payment_uuid}/mark-paid`
+  (Sales Attendant/Inventory Manager) is the staff-side counterpart - since
+  there's no gateway webhook for cash, a human confirms it was actually
+  collected. Fires the same payment-confirmed email a successful PesaPal
+  payment does.
+
+| Method | Path                                | Auth                              | Description                                       |
+|--------|---------------------------------------|--------------------------------------|--------------------------------------------------------|
+| POST   | `/orders/{order_uuid}/payments`        | Owning Customer, Guest, or Staff    | Initiate a payment attempt for an order (FR-PAY-001/002) |
+| GET    | `/orders/{order_uuid}/payments`        | Owning Customer, Guest, or Staff    | List payment attempts for an order                       |
+| GET    | `/payments/{payment_uuid}`             | Owning Customer, Guest, or Staff    | Payment detail                                            |
+| PATCH  | `/payments/{payment_uuid}/mark-paid`   | Sales Attendant, Inventory Manager  | Confirm a cash-on-delivery payment was collected           |
+| GET    | `/payments/webhook`                    | PesaPal (IPN callback)              | PesaPal's IPN confirming/failing a payment (PAYINT-002/003) |
 
 **Example — `POST /orders/{order_uuid}/payments`**
 
@@ -626,54 +747,89 @@ Response `201`:
 ```json
 {
   "success": true,
-  "message": "Payment initiated.",
-  "data": { "id": "p1...uuid", "status": "awaiting_payment", "provider": "mobile_money" }
+  "message": "Created successfully.",
+  "data": {
+    "id": "p1...uuid",
+    "status": "awaiting_payment",
+    "provider": "mobile_money",
+    "redirect_url": "https://pay.pesapal.com/v3/...",
+    "provider_reference": "<PesaPal's real order_tracking_id>"
+  }
 }
 ```
 
-**Example — `POST /payments/webhook`** (idempotent; PAYINT-005)
+**Example — `GET /payments/webhook?OrderTrackingId=...&OrderMerchantReference=...&OrderNotificationType=IPNCHANGE`**
+(idempotent by `provider_reference`; PAYINT-005)
 
-Request:
+Response `200` — PesaPal's own required acknowledgment shape, not this API's envelope:
 ```json
-{ "provider_reference": "MM-REF-88213", "status": "successful" }
-```
-
-Response `200` (first call):
-```json
-{ "success": true, "message": "Payment confirmed.", "data": { "id": "p1...uuid", "status": "paid" } }
-```
-
-Response `200` (duplicate callback — no-op, same result returned):
-```json
-{ "success": true, "message": "Payment already confirmed.", "data": { "id": "p1...uuid", "status": "paid" } }
+{
+  "orderNotificationType": "IPNCHANGE",
+  "orderTrackingId": "...",
+  "orderMerchantReference": "...",
+  "status": 200
+}
 ```
 
 ---
 
 ## 5.10 Promotions — Banners & Discounts
 
+Deployed behavior notes (2026-08-06):
+- Both edit endpoints are `PUT`, not `PATCH`.
+- Both `/status` endpoints now take a body (`{"is_active": bool}`) - set,
+  not toggle, same reasoning as the customer/staff status fixes above.
+- `GET /banners?include_inactive=true` (staff-only, added after this table
+  was first written) lists drafts/deactivated/future-scheduled banners too -
+  the plain `GET /banners` stays public and shows only currently-live ones.
+- `GET /products/{product_uuid}/discounts` (public, added after this table
+  was first written) lists every discount ever configured for a product.
+
 | Method | Path                                          | Auth              | Description                              |
 |--------|--------------------------------------------------|--------------------|---------------------------------------------|
 | GET    | `/banners`                                         | Public              | Active homepage banners (FR-BROWSE-002)     |
+| GET    | `/banners?include_inactive=true`                   | Inventory Manager    | ALL banners, including inactive/scheduled    |
 | POST   | `/banners`                                          | Inventory Manager    | Create banner (FR-PROMO-002)                 |
-| PATCH  | `/banners/{banner_uuid}`                           | Inventory Manager    | Edit banner                                   |
-| PATCH  | `/banners/{banner_uuid}/status`                    | Inventory Manager    | Activate/deactivate banner                    |
+| PUT    | `/banners/{banner_uuid}`                           | Inventory Manager    | Edit banner                                   |
+| PATCH  | `/banners/{banner_uuid}/status`                    | Inventory Manager    | Set banner active/inactive                    |
+| GET    | `/products/{product_uuid}/discounts`               | Public              | List a product's discounts (all, not just current) |
 | POST   | `/products/{product_uuid}/discounts`               | Inventory Manager    | Create discount window (FR-PROD-016)         |
-| PATCH  | `/products/{product_uuid}/discounts/{discount_uuid}` | Inventory Manager  | Edit discount                                 |
-| PATCH  | `/products/{product_uuid}/discounts/{discount_uuid}/status` | Inventory Manager | Deactivate discount (BR-PROMO-002)     |
+| PUT    | `/products/{product_uuid}/discounts/{discount_uuid}` | Inventory Manager  | Edit discount                                 |
+| PATCH  | `/products/{product_uuid}/discounts/{discount_uuid}/status` | Inventory Manager | Set discount active/inactive (BR-PROMO-002) |
 
 ---
 
 ## 5.11 Staff Users — `/api/v1/staff`
 
+Deployed behavior notes (2026-08-06):
+- `StaffRead` identifies account state via `is_active: bool`, not a `status`
+  string field.
+- `PATCH /staff/{staff_uuid}/status` now takes a body, `{"is_active": bool}` -
+  same "sets exactly what's asked, not a blind toggle" fix as the customer
+  status endpoint above.
+- `GET /staff/me` and `PATCH /staff/me/password` (both added after this
+  table was first written) are open to **every** staff role including Sales
+  Attendant - the one deliberate exception to BR-USER-003 below, since a
+  Sales Attendant still needs to see their own profile and be able to
+  recover from a bad password.
+- `GET /staff/{staff_uuid}` (single-record read) and
+  `POST /staff/{staff_uuid}/reset-password` (admin-initiated: generates a
+  random temporary password and returns it once, for a staff member who's
+  locked themselves out and doesn't know their current password) were also
+  added after this table was first written.
+
 | Method | Path                          | Auth                                | Description                                    |
 |--------|---------------------------------|----------------------------------------|----------------------------------------------------|
+| GET    | `/staff/me`                       | Any staff role                          | Get own profile                                     |
+| PATCH  | `/staff/me/password`              | Any staff role                          | Change own password                                 |
 | GET    | `/staff`                          | Inventory Manager, System Administrator | List staff accounts                                |
+| GET    | `/staff/{staff_uuid}`             | Inventory Manager, System Administrator | Single staff account detail                         |
 | POST   | `/staff`                          | Inventory Manager, System Administrator | Create Sales Attendant / Inventory Manager account (FR-AUTH-010, BR-USER-001/002) |
 | PATCH  | `/staff/{staff_uuid}`             | Inventory Manager, System Administrator | Update staff account                                |
-| PATCH  | `/staff/{staff_uuid}/status`      | Inventory Manager, System Administrator | Deactivate/reactivate staff account                 |
+| POST   | `/staff/{staff_uuid}/reset-password` | Inventory Manager, System Administrator | Admin-initiated password reset                   |
+| PATCH  | `/staff/{staff_uuid}/status`      | Inventory Manager, System Administrator | Set staff account active/inactive                   |
 
-Sales Attendants cannot call any endpoint in this module (BR-USER-003).
+Sales Attendants cannot call any OTHER endpoint in this module (BR-USER-003) - `/me` and `/me/password` above are the sole exceptions.
 
 ---
 
@@ -692,9 +848,15 @@ Sales Attendants only receive the modules they're authorized for (FR-ADMIN-003) 
 
 ## 5.13 Audit Logs — `/api/v1/audit-logs`
 
+Deployed behavior note (2026-08-06): also filterable by `action` (added
+after this table was first written), and each entry now embeds
+`staff_full_name`/`staff_email` directly (a LEFT JOIN against `staff_users`,
+resolved server-side) instead of just a bare `staff_user_id` a client would
+otherwise have to resolve itself.
+
 | Method | Path             | Auth              | Description                                          |
 |--------|--------------------|--------------------|----------------------------------------------------------|
-| GET    | `/audit-logs`        | Inventory Manager, System Administrator | List audit entries, filterable by `resource_type`, `resource_id`, `staff_user_id`, date range (FR-AUDIT-001–003) |
+| GET    | `/audit-logs`        | Inventory Manager, System Administrator | List audit entries, filterable by `resource_type`, `resource_id`, `staff_user_id`, `action`, date range (FR-AUDIT-001–003) |
 
 Audit logs have no `POST`/`PATCH`/`DELETE` endpoints — they are written internally by the backend, never via direct API calls (FR-AUDIT-004/005).
 
