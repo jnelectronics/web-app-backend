@@ -17,7 +17,7 @@ from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Customer, StaffUser
+from models import Customer, StaffRole, StaffUser
 
 load_dotenv()
 
@@ -175,7 +175,19 @@ def require_staff_role(*allowed_roles):
     # specific roles returns a dependency function tailored to that route.
     # e.g. Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)) only
     # lets Inventory Managers through; anyone else gets a 403.
+    #
+    # System Administrator is a deliberate exception to that per-route list:
+    # by product decision, admin is a true superset role that can reach
+    # EVERY staff-gated endpoint, not just the ones that name it explicitly.
+    # This is a departure from the API spec's literal per-endpoint role
+    # table (the spec scopes System Administrator to "seeded account,
+    # initial configuration only") - kept here as a single, centralized
+    # override so every route that uses require_staff_role() picks it up
+    # automatically, instead of having to list System Administrator by
+    # hand on every route.
     def check_role(staff: StaffUser = Depends(get_current_staff)) -> StaffUser:
+        if staff.role == StaffRole.SYSTEM_ADMINISTRATOR:
+            return staff
         if staff.role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

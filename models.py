@@ -425,6 +425,9 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     delivery_address: Mapped[str] = mapped_column(String(500))
 
+    district: Mapped[str] = mapped_column(String(100))
+
+
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
         default=OrderStatus.PENDING,

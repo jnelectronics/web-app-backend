@@ -81,15 +81,18 @@ def test_category_write_requires_inventory_manager(client, staff_tokens, db):
     )
     assert response.status_code == 403
 
-    # System Administrator isn't listed for this endpoint either - no
-    # implicit admin superset, per API spec §3.3 ("every endpoint lists the
-    # roles permitted to call it").
+    # System Administrator IS an implicit superset (product decision,
+    # 2026-08-08 - overrides the spec's literal per-endpoint role table,
+    # see security.py's require_staff_role) - gets through even though
+    # this endpoint's own allow-list only names Inventory Manager.
     response = client.post(
         "/api/v1/categories",
         json={"name": f"Cat {uuid.uuid4().hex[:8]}"},
         headers=_auth(staff_tokens[StaffRole.SYSTEM_ADMINISTRATOR]),
     )
-    assert response.status_code == 403
+    assert response.status_code == 200
+    db.query(Category).filter(Category.id == uuid.UUID(unwrap(response)["id"])).delete()
+    db.commit()
 
     # Right role
     response = client.post(
@@ -178,12 +181,13 @@ def test_inventory_view_allows_sales_attendant_and_inventory_manager(
         )
         assert response.status_code == 200
 
-    # System Administrator is NOT listed for inventory viewing per the docs
+    # System Administrator is a superset role - reaches this endpoint too,
+    # even though the docs' own table doesn't list it here.
     response = client.get(
         f"/api/v1/inventory/{inventory_record.id}",
         headers=_auth(staff_tokens[StaffRole.SYSTEM_ADMINISTRATOR]),
     )
-    assert response.status_code == 403
+    assert response.status_code == 200
 
 
 def test_inventory_adjust_requires_inventory_manager(client, staff_tokens, inventory_record):

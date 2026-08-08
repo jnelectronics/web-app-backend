@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from jobs import send_payment_confirmed_email
+from jobs import notify_staff_payment_received, send_payment_confirmed_email
 from models import Customer, Order, Payment, PaymentStatus, StaffRole, StaffUser
 from pesapal_client import PesaPalError, get_transaction_status, is_configured, submit_order_request
 from schemas import PaymentInitiate, PaymentProvider, PaymentRead
@@ -372,6 +372,19 @@ def mark_cash_payment_paid(
             payment.provider,
         )
 
+    active_staff_emails = [
+        email for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
+    ]
+    background_tasks.add_task(
+        notify_staff_payment_received,
+        active_staff_emails,
+        order.order_number,
+        order.guest_full_name,
+        order.guest_email,
+        payment.amount,
+        payment.provider,
+    )
+
     logger.info("Cash-on-delivery payment %s marked paid for order %s", payment.id, payment.order_id)
     return payment
 
@@ -480,5 +493,18 @@ def payment_webhook(
                 payment.amount,
                 payment.provider,
             )
+
+        active_staff_emails = [
+            email for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
+        ]
+        background_tasks.add_task(
+            notify_staff_payment_received,
+            active_staff_emails,
+            order.order_number,
+            order.guest_full_name,
+            order.guest_email,
+            payment.amount,
+            payment.provider,
+        )
 
     return ack(200)

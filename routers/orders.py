@@ -172,6 +172,7 @@ def _build_order_read(order: Order, db: Session) -> OrderRead:
         guest_phone_number=order.guest_phone_number,
         guest_email=order.guest_email,
         delivery_address=order.delivery_address,
+        district=order.district,
         status=order.status,
         requires_prepayment=order.requires_prepayment,
         subtotal=order.subtotal,
@@ -256,6 +257,7 @@ def checkout(
         guest_phone_number=request.guest_phone_number,
         guest_email=request.guest_email,
         delivery_address=request.delivery_address,
+        district=request.district,
         subtotal=subtotal,
         total=subtotal,  # no tax/delivery fee/discount logic yet
     )
@@ -330,7 +332,9 @@ def checkout(
         notify_staff_new_order,
         active_staff_emails,
         new_order.order_number,
-        branch.name,
+        request.guest_full_name,
+        request.guest_email,
+        request.district,
         new_order.total,
         request.delivery_address,
     )

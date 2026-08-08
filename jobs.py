@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # PESAPAL_CALLBACK_URL.
 PASSWORD_RESET_URL = os.getenv("PASSWORD_RESET_URL", "http://localhost:3000/reset-password")
 
+# Where the "Log in to the staff dashboard" link in staff-facing emails
+# points - same placeholder pattern as PASSWORD_RESET_URL above until
+# Nyson's staff dashboard has a real login page to link to.
+STAFF_DASHBOARD_URL = os.getenv("STAFF_DASHBOARD_URL", "http://localhost:3000/staff/login")
+
 # Built ONCE at import time, not re-created on every single email sent -
 # same "set up shared config once at module level" idea as this project's
 # other wrapper modules. os.path.dirname(__file__) gives the FOLDER this
@@ -44,7 +49,7 @@ def send_password_reset_email(email: str, reset_token: str, full_name: str | Non
     # The actual link the customer clicks - the frontend page reads the
     # `token` query param and calls POST /auth/password/reset with it.
     reset_link = f"{PASSWORD_RESET_URL}?token={reset_token}"
-    subject = "Reset your JN Electronics password"
+    subject = "Reset Your JN Electronics Password"
     # full_name is optional (a guest-turned-customer row might not have
     # one) - "there" reads naturally either way ("Hi there," vs "Hi Jane,").
     greeting_name = full_name or "there"
@@ -111,7 +116,7 @@ def send_order_confirmation_email(
     # session has already been closed, so it can't safely touch ORM
     # objects tied to that session - only plain Python values survive that
     # boundary safely.
-    subject = f"Your JN Electronics order {order_number} is confirmed"
+    subject = f"Your JN Electronics Order {order_number} Is Confirmed"
 
     item_lines = "\n".join(
         f"- {item['name']}"
@@ -158,7 +163,9 @@ def send_order_confirmation_email(
 def notify_staff_new_order(
     staff_emails: list[str],
     order_number: str,
-    branch_name: str,
+    customer_name: str,
+    customer_email: str | None,
+    district: str,
     total: float,
     delivery_address: str,
 ) -> None:
@@ -174,20 +181,25 @@ def notify_staff_new_order(
         # alone would normally make this non-empty).
         return
 
-    subject = f"New order {order_number} placed"
+    subject = f"New Order {order_number} Placed"
     body = (
         "A new order has been placed.\n\n"
         f"Order: {order_number}\n"
-        f"Branch: {branch_name}\n"
+        f"Customer: {customer_name}\n"
+        f"Email: {customer_email or 'N/A'}\n"
+        f"District: {district}\n"
         f"Total: UGX {total:,.2f}\n"
         f"Delivering to: {delivery_address}\n\n"
         "Log in to the staff dashboard to process it."
     )
     html = _template_env.get_template("staff_new_order.html").render(
         order_number=order_number,
-        branch_name=branch_name,
+        customer_name=customer_name,
+        customer_email=customer_email or "N/A",
+        district=district,
         total=f"{total:,.2f}",
         delivery_address=delivery_address,
+        dashboard_url=STAFF_DASHBOARD_URL,
     )
 
     if not email_client.is_configured():
@@ -210,6 +222,55 @@ def notify_staff_new_order(
     logger.info("New-order notification sent to %d/%d staff for order %s", sent_count, len(staff_emails), order_number)
 
 
+def notify_staff_payment_received(
+    staff_emails: list[str],
+    order_number: str,
+    customer_name: str,
+    customer_email: str | None,
+    amount: float,
+    provider: str,
+) -> None:
+    # Staff-facing counterpart to send_payment_confirmed_email (which goes
+    # to the CUSTOMER) - fires to every active staff member once a payment
+    # actually resolves to PAID, same "everyone sees it" reasoning as
+    # notify_staff_new_order above.
+    if not staff_emails:
+        return
+
+    subject = f"Payment Received for Order {order_number}"
+    body = (
+        "A payment has been received.\n\n"
+        f"Order: {order_number}\n"
+        f"Customer: {customer_name}\n"
+        f"Email: {customer_email or 'N/A'}\n"
+        f"Amount: UGX {amount:,.2f}\n"
+        f"Payment method: {provider}\n\n"
+        "Log in to the staff dashboard to process this order."
+    )
+    html = _template_env.get_template("staff_payment_received.html").render(
+        order_number=order_number,
+        customer_name=customer_name,
+        customer_email=customer_email,
+        amount=f"{amount:,.2f}",
+        provider=provider,
+        dashboard_url=STAFF_DASHBOARD_URL,
+    )
+
+    if not email_client.is_configured():
+        logger.info("Resend not configured - staff payment notification for order %s not sent", order_number)
+        return
+
+    sent_count = 0
+    for staff_email in staff_emails:
+        try:
+            email_client.send_email(staff_email, subject, body, html=html)
+            sent_count += 1
+        except email_client.EmailError:
+            logger.exception("Failed to send payment notification to %s for order %s", staff_email, order_number)
+
+    logger.info("Payment notification sent to %d/%d staff for order %s", sent_count, len(staff_emails), order_number)
+
+
 def send_payment_confirmed_email(
     email: str,
     full_name: str,
@@ -224,7 +285,7 @@ def send_payment_confirmed_email(
     # different events or a customer, worth its own confirmation. Fires
     # from routers/payments.py's payment_webhook, only when a payment
     # attempt actually resolves to PaymentStatus.PAID.
-    subject = f"Payment received for order {order_number}"
+    subject = f"Payment Received for Order {order_number}"
     body = (
         f"Hi {full_name},\n\n"
         f"We've received your payment for order {order_number}. Your order is confirmed "

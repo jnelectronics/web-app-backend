@@ -1,9 +1,9 @@
 <!--
-  Rendered by jobs.py's notify_staff_new_order using Jinja2 - internal
-  facing (staff only), so kept simpler than order_confirmation.html, but
-  still uses the same branding/comment rules (see that file for why
-  everything is inline-styled and why literal curly braces must never
-  appear as plain example text in this file).
+  Rendered by jobs.py's notify_staff_payment_received using Jinja2 - staff-
+  facing counterpart to payment_confirmed.html (which goes to the customer).
+  See templates/password_reset.html's comment for how this rendering works
+  and why literal curly braces must never appear as plain example text
+  anywhere in this file.
 -->
 <div style="background-color: #f4f4f4; padding: 32px 16px; font-family: Arial, Helvetica, sans-serif;">
   <div style="max-width: 480px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; padding: 32px;">
@@ -17,14 +17,14 @@
       />
     </div>
 
-    <h1 style="color: #1a1a1a; font-size: 18px; margin: 0 0 16px 0; text-align: center;">New Order Placed</h1>
+    <h1 style="color: #1a1a1a; font-size: 18px; margin: 0 0 16px 0; text-align: center;">Payment Received</h1>
 
     <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin-bottom: 24px;">
       <tr>
         <td style="font-size: 14px; color: #888888; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">Order</td>
         <td align="right" style="font-size: 14px; color: #1a1a1a; font-weight: bold; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">{{ order_number }}</td>
       </tr>
-            <tr>
+      <tr>
         <td style="font-size: 14px; color: #888888; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">Customer</td>
         <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">{{ customer_name }}</td>
       </tr>
@@ -33,17 +33,12 @@
         <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">{{ customer_email or 'N/A' }}</td>
       </tr>
       <tr>
-        <td style="font-size: 14px; color: #888888; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">District</td>
-        <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">{{ district }}</td>
-      </tr>
-
-      <tr>
-        <td style="font-size: 14px; color: #888888; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">Total</td>
-        <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">UGX {{ total }}</td>
+        <td style="font-size: 14px; color: #888888; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">Amount</td>
+        <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0; border-bottom: 1px solid #f4f4f4;">UGX {{ amount }}</td>
       </tr>
       <tr>
-        <td style="font-size: 14px; color: #888888; padding: 6px 0;">Delivering to</td>
-        <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0;">{{ delivery_address }}</td>
+        <td style="font-size: 14px; color: #888888; padding: 6px 0;">Payment method</td>
+        <td align="right" style="font-size: 14px; color: #1a1a1a; padding: 6px 0;">{{ provider }}</td>
       </tr>
     </table>
 

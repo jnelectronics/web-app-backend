@@ -116,6 +116,7 @@ def customer_order(db, customer):
         guest_full_name=customer.full_name,
         guest_phone_number="+256700000000",
         delivery_address="Test Address",
+        district="Test District",
         subtotal=1000.0,
         total=1000.0,
     )

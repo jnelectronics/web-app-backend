@@ -37,12 +37,18 @@ def read_dashboard_summary(
     pending_orders = db.query(Order).filter(Order.status == OrderStatus.PENDING).count()
     total_customers = db.query(Customer).count()
 
-    is_inventory_manager = current_staff.role == StaffRole.INVENTORY_MANAGER
+    # System Administrator sees everything Inventory Manager sees here too -
+    # it's a true superset role (see security.py's require_staff_role),
+    # not just another name that has to be listed explicitly.
+    can_see_revenue = current_staff.role in (
+        StaffRole.INVENTORY_MANAGER,
+        StaffRole.SYSTEM_ADMINISTRATOR,
+    )
     return DashboardSummary(
         total_orders=total_orders,
         pending_orders=pending_orders,
         total_customers=total_customers,
-        total_revenue=_total_revenue(db) if is_inventory_manager else None,
+        total_revenue=_total_revenue(db) if can_see_revenue else None,
     )
 
 

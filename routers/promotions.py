@@ -72,7 +72,10 @@ def list_active_banners(
     staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
     if staff is None or not staff.is_active:
         raise invalid_token
-    if staff.role != StaffRole.INVENTORY_MANAGER:
+    # System Administrator bypasses this check the same way it bypasses
+    # require_staff_role() in security.py - it's a true superset role,
+    # not just another name on this specific allow-list.
+    if staff.role not in (StaffRole.INVENTORY_MANAGER, StaffRole.SYSTEM_ADMINISTRATOR):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
 
     return db.query(Banner).order_by(Banner.display_order).all()

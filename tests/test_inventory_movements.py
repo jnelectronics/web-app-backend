@@ -130,12 +130,12 @@ def test_adjust_logs_custom_movement_type_and_reason(client, db, variant_and_bra
     assert movements[0]["movement_type"] == "stock_out"
     assert movements[0]["reason"] == "Damaged in storage"
 
-    # System Administrator isn't allowed to view movements either (same
-    # role set as viewing inventory itself)
+    # System Administrator is a superset role - allowed to view movements
+    # too, even though this endpoint's own allow-list doesn't name it.
     response = client.get(
         f"/api/v1/inventory/{record.id}/movements", headers=_auth(staff_tokens[StaffRole.SYSTEM_ADMINISTRATOR])
     )
-    assert response.status_code == 403
+    assert response.status_code == 200
 
     db.query(InventoryMovement).filter(InventoryMovement.inventory_record_id == record.id).delete()
     db.commit()
@@ -171,6 +171,7 @@ def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, variant_
             "guest_full_name": "Movement Customer",
             "guest_phone_number": "+256700000000",
             "delivery_address": "Test Address",
+            "district": "Test District",
         },
         headers=_auth(customer_token),
     )

@@ -111,6 +111,7 @@ def order_setup(db):
         guest_full_name=owner.full_name,
         guest_phone_number="+256700000000",
         delivery_address="Test Address",
+        district="Test District",
         subtotal=50000.0,
         total=50000.0,
     )
@@ -496,6 +497,7 @@ def guest_order_setup(db):
         guest_full_name="Guest Payer",
         guest_phone_number="+256700000099",
         delivery_address="Test Address",
+        district="Test District",
         subtotal=50000.0,
         total=50000.0,
     )

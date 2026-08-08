@@ -57,6 +57,7 @@ def order_setup(db):
         guest_full_name=owner.full_name,
         guest_phone_number="+256700000000",
         delivery_address="Test Address",
+        district="Test District",
         subtotal=1000.0,
         total=1000.0,
     )
@@ -132,22 +133,25 @@ def _auth(token):
 def test_advance_status_requires_sales_attendant_or_inventory_manager(client, order_setup, staff_tokens):
     order = order_setup["order"]
 
-    # System Administrator is not listed for this endpoint (docs: Sales
-    # Attendant, Inventory Manager only)
+    # System Administrator isn't listed for this endpoint (docs: Sales
+    # Attendant, Inventory Manager only) but is a superset role, so it
+    # still gets through - pending -> confirmed.
     response = client.patch(
         f"/api/v1/orders/{order.id}/status",
         json={"to_status": "confirmed"},
         headers=_auth(staff_tokens[StaffRole.SYSTEM_ADMINISTRATOR]),
     )
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert unwrap(response)["status"] == "confirmed"
 
+    # Sales Attendant can advance it further - confirmed -> packed.
     response = client.patch(
         f"/api/v1/orders/{order.id}/status",
-        json={"to_status": "confirmed", "notes": "Stock verified"},
+        json={"to_status": "packed", "notes": "Stock verified"},
         headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT]),
     )
     assert response.status_code == 200
-    assert unwrap(response)["status"] == "confirmed"
+    assert unwrap(response)["status"] == "packed"
 
 
 def test_invalid_transition_is_rejected(client, order_setup, staff_tokens):

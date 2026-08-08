@@ -398,6 +398,7 @@ class CheckoutRequest(BaseModel):
     guest_phone_number: str
     guest_email: str | None = None
     delivery_address: str
+    district: str
 
 
 class OrderItemRead(BaseModel):
@@ -421,6 +422,7 @@ class OrderRead(BaseModel):
     guest_phone_number: str
     guest_email: str | None
     delivery_address: str
+    district: str
     status: OrderStatus
     requires_prepayment: bool
     subtotal: float

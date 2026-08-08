@@ -155,6 +155,7 @@ def test_checkout_409_reports_which_items_are_short(client, checkout_setup, acti
             "guest_full_name": "Notify Test Customer",
             "guest_phone_number": "+256700000004",
             "delivery_address": "1 Test Way, Kampala",
+            "district": "Test District",
         },
         headers=_auth(checkout_setup["token"]),
     )
@@ -176,6 +177,7 @@ def test_checkout_sends_order_confirmation_when_email_given(client, checkout_set
             "guest_phone_number": "+256700000001",
             "guest_email": "customer-inbox@example.com",
             "delivery_address": "1 Test Way, Kampala",
+            "district": "Test District",
         },
         headers=_auth(checkout_setup["token"]),
     )
@@ -198,6 +200,7 @@ def test_checkout_skips_confirmation_when_no_email_given(client, checkout_setup,
             "guest_full_name": "Notify Test Customer",
             "guest_phone_number": "+256700000002",
             "delivery_address": "1 Test Way, Kampala",
+            "district": "Test District",
         },
         headers=_auth(checkout_setup["token"]),
     )
@@ -205,7 +208,7 @@ def test_checkout_skips_confirmation_when_no_email_given(client, checkout_setup,
 
     # No guest_email given - nothing addressed to a customer inbox, only
     # the staff notification (active_staff's address) should be present.
-    assert not any(e["subject"].startswith("Your JN Electronics order") for e in mock_email)
+    assert not any(e["subject"].startswith("Your JN Electronics Order") for e in mock_email)
 
 
 def test_checkout_notifies_only_active_staff(client, checkout_setup, active_staff, inactive_staff, mock_email):
@@ -217,12 +220,13 @@ def test_checkout_notifies_only_active_staff(client, checkout_setup, active_staf
             "guest_full_name": "Notify Test Customer",
             "guest_phone_number": "+256700000003",
             "delivery_address": "1 Test Way, Kampala",
+            "district": "Test District",
         },
         headers=_auth(checkout_setup["token"]),
     )
     assert response.status_code == 200
     order = unwrap(response)
 
-    notified_emails = {e["to_email"] for e in mock_email if e["subject"] == f"New order {order['order_number']} placed"}
+    notified_emails = {e["to_email"] for e in mock_email if e["subject"] == f"New Order {order['order_number']} Placed"}
     assert active_staff.email in notified_emails
     assert inactive_staff.email not in notified_emails
