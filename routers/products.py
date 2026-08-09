@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -13,10 +14,10 @@ from audit import write_audit_log
 from cloudinary_client import CloudinaryError, delete_image, is_configured, upload_image
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Category, Product, ProductDiscount, ProductImage, StaffRole, StaffUser
+from models import Category, Product, ProductDiscount, ProductImage, Promotion, StaffRole, StaffUser
 from pagination import build_pagination_meta
 from schemas import PaginatedResponse, ProductCreate, ProductImageRead, ProductRead
-from security import require_staff_role
+from security import decode_token_claims, require_staff_role
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,31 @@ def _is_product_discounted(db: Session, product_id: uuid.UUID) -> bool:
     )
 
 
+def _on_sale_product_ids(db: Session):
+    # is_on_sale=true on the PRODUCT row only reflects what was true the
+    # last time someone wrote to it - a promotion's own starts_at/ends_at
+    # window can lapse later with no follow-up write ever flipping the
+    # flag back off (nothing re-checks it on a schedule). So "really on
+    # sale right now" - for filtering/section resolution, as opposed to
+    # just displaying the flag on a single product - has to mean the flag
+    # AND a currently-active-and-in-window Promotion, same "can't trust a
+    # stored boolean alone" reasoning as _is_product_discounted above.
+    # Shared with routers/homepage_sections.py's ON_SALE section
+    # resolution, so this one rule can't drift between the two call sites.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return (
+        db.query(Product.id)
+        .join(Promotion, Product.applied_promotion_id == Promotion.id)
+        .filter(
+            Product.is_on_sale == True,  # noqa: E712
+            Promotion.is_active == True,  # noqa: E712
+            or_(Promotion.starts_at.is_(None), Promotion.starts_at <= now),
+            or_(Promotion.ends_at.is_(None), Promotion.ends_at >= now),
+        )
+        .scalar_subquery()
+    )
+
+
 def _build_product_read(product: Product, db: Session) -> ProductRead:
     images = (
         db.query(ProductImage)
@@ -86,6 +112,9 @@ def _build_product_read(product: Product, db: Session) -> ProductRead:
         name=product.name,
         description=product.description,
         is_featured=product.is_featured,
+        is_new_arrival=product.is_new_arrival,
+        is_on_sale=product.is_on_sale,
+        applied_promotion_id=product.applied_promotion_id,
         slug=product.slug,
         is_discounted=_is_product_discounted(db, product.id),
         images=[ProductImageRead.model_validate(i) for i in images],
@@ -102,6 +131,59 @@ class ImageUploadUnavailableError(Exception):
     # registered in main.py, instead of every upload attempt failing deep
     # inside a Cloudinary auth error.
     pass
+
+
+class OnSaleRequiresPromotionError(Exception):
+    # BR (frontend-requested, §5): is_on_sale=true is only allowed while a
+    # real, currently-active library Promotion is applied - see
+    # _assert_on_sale_has_promotion below. A plain Exception (not raised as
+    # an inline HTTPException) so main.py's @app.exception_handler can turn
+    # it into one consistent 422 response, same pattern as every other
+    # domain-rule exception in this project.
+    pass
+
+
+def _assert_on_sale_has_promotion(db: Session, product: Product) -> None:
+    if not product.is_on_sale:
+        return
+
+    if product.applied_promotion_id is None:
+        raise OnSaleRequiresPromotionError(
+            "is_on_sale requires a promotion to be applied first - "
+            "see POST /products/{id}/apply-promotion"
+        )
+
+    promotion = db.get(Promotion, product.applied_promotion_id)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    currently_active = (
+        promotion is not None
+        and promotion.is_active
+        and (promotion.starts_at is None or promotion.starts_at <= now)
+        and (promotion.ends_at is None or promotion.ends_at >= now)
+    )
+    if not currently_active:
+        raise OnSaleRequiresPromotionError(
+            "The applied promotion is not currently active - apply a different one before enabling On Sale"
+        )
+
+
+# Same "optional auth" trick as routers/variants.py's GET routes - the
+# public storefront calls list_products/read_product with no token at all,
+# but the admin catalogue view needs to see archived (is_active=false)
+# products too, which is staff-only information.
+_optional_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _current_staff_or_none(credentials: HTTPAuthorizationCredentials | None, db: Session) -> StaffUser | None:
+    if credentials is None:
+        return None
+    claims = decode_token_claims(credentials.credentials)
+    if claims is None or claims.get("type") != "staff":
+        return None
+    staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
+    if staff is None or not staff.is_active:
+        return None
+    return staff
 
 # APIRouter is like a mini FastAPI app - we define routes on it here, then
 # "plug it into" the real app in main.py with app.include_router().
@@ -131,18 +213,33 @@ def list_products(
     search: str | None = None,
     featured: bool | None = None,
     discounted: bool | None = None,
+    on_sale: bool | None = None,
+    new_arrival: bool | None = None,
+    # None (the default) = today's existing behavior: active products
+    # only. Explicit True/False overrides that - False is the "show me
+    # archived products" admin view (§5's ?archived=true is the same
+    # request under a different name, so this one query param covers
+    # both), and is staff-only since which products got soft-deleted isn't
+    # public information.
+    active: bool | None = None,
     # "-created_at" (a leading dash = descending) mirrors the frontend's
     # own requested syntax. Only Product's OWN columns are sortable here -
     # price lives on ProductVariant, not Product (a product can have
     # several variants at different prices), so a price sort on this
     # endpoint isn't something a single column can answer; not attempted.
     sort: str | None = None,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer_scheme),
     db: Session = Depends(get_db),
 ):
-    # .filter(Product.is_active == True) excludes soft-deleted products from
-    # the normal browsing list - they still exist in the database, just hidden
-    # from this query. This is why we can't simply .query(Product) anymore.
-    query = db.query(Product).filter(Product.is_active == True)  # noqa: E712
+    if active is None:
+        # .filter(Product.is_active == True) excludes soft-deleted products
+        # from the normal browsing list - they still exist in the
+        # database, just hidden from this query.
+        query = db.query(Product).filter(Product.is_active == True)  # noqa: E712
+    else:
+        if active is False and _current_staff_or_none(credentials, db) is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
+        query = db.query(Product).filter(Product.is_active == active)
 
     if category is not None:
         query = query.filter(Product.category_id == category)
@@ -155,6 +252,14 @@ def list_products(
         )
     if featured is not None:
         query = query.filter(Product.is_featured == featured)
+    if new_arrival is not None:
+        query = query.filter(Product.is_new_arrival == new_arrival)
+    if on_sale is not None:
+        on_sale_product_ids = _on_sale_product_ids(db)
+        if on_sale:
+            query = query.filter(Product.id.in_(on_sale_product_ids))
+        else:
+            query = query.filter(Product.id.notin_(on_sale_product_ids))
     if discounted is not None:
         # Same "currently active" window _is_product_discounted checks per
         # product, expressed here as a set membership test so it can
@@ -208,11 +313,18 @@ def create_product(
         name=product.name,
         description=product.description,
         is_featured=product.is_featured,
+        is_new_arrival=product.is_new_arrival,
+        is_on_sale=product.is_on_sale,
         # Generated once, here, and never touched again - see the model's
         # comment on why (existing links/SEO shouldn't break if the name
         # is edited later).
         slug=_generate_unique_slug(db, product.name),
     )
+    # A brand-new product can never already have a promotion applied (that
+    # needs a real product id to target), so this only ever passes when
+    # is_on_sale is False - see the field's own comment on ProductCreate.
+    _assert_on_sale_has_promotion(db, new_product)
+
     db.add(new_product)       # stage it for saving
     db.flush()                # assigns new_product.id for the audit log entry below
     write_audit_log(
@@ -247,6 +359,14 @@ def update_product(
     existing.name = product.name
     existing.description = product.description
     existing.is_featured = product.is_featured
+    existing.is_new_arrival = product.is_new_arrival
+    existing.is_on_sale = product.is_on_sale
+    # existing.applied_promotion_id is deliberately NOT touched here - it
+    # only ever changes via POST/DELETE /products/{id}/apply-promotion
+    # (routers/promotions.py), so a plain product-details save can't
+    # accidentally clear or fake a promotion link. This check uses
+    # whatever applied_promotion_id already sits on the row.
+    _assert_on_sale_has_promotion(db, existing)
     # existing.slug is deliberately NOT touched here - see the model's comment.
     write_audit_log(
         db,
@@ -285,6 +405,36 @@ def delete_product(
         new_value={"is_active": False},
     )
     db.commit()
+
+
+# The other half of DELETE above - archiving a product was always
+# reversible in principle (is_active is just a flag), but until now there
+# was no route that flipped it back. PATCH (not PUT) because this changes
+# exactly one thing, the same reasoning routers/staff.py's set_staff_status
+# and every other *StatusUpdate endpoint in this project already follows.
+@router.patch("/{product_id}/reactivate", response_model=ProductRead)
+def reactivate_product(
+    product_id: uuid.UUID,
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    db: Session = Depends(get_db),
+):
+    existing = db.get(Product, product_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    existing.is_active = True
+    write_audit_log(
+        db,
+        staff_user_id=current_staff.id,
+        action="product.status_change",
+        resource_type="product",
+        resource_id=existing.id,
+        previous_value={"is_active": False},
+        new_value={"is_active": True},
+    )
+    db.commit()
+    db.refresh(existing)
+    return _build_product_read(existing, db)
 
 
 @router.post("/{product_id}/images", response_model=ProductImageRead)

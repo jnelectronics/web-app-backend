@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import AuditLog, Category, Product, StaffRole, StaffUser
 from security import create_access_token, hash_password
 
@@ -58,7 +58,7 @@ def test_creating_a_product_writes_an_audit_entry(client, db, staff_tokens):
     manager_token = tokens[StaffRole.INVENTORY_MANAGER]
     manager = created[StaffRole.INVENTORY_MANAGER]
 
-    category = Category(name=f"Audit Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Audit Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.commit()
 

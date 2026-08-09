@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import (
     Branch,
     Cart,
@@ -38,7 +38,7 @@ def _auth(token):
 
 @pytest.fixture
 def checkout_setup(db):
-    category = Category(name=f"Notify Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Notify Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
 

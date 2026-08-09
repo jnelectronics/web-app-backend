@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import (
     AuditLog,
     Branch,
@@ -68,15 +68,19 @@ def test_category_read_stays_public(client):
 
 
 def test_category_write_requires_inventory_manager(client, staff_tokens, db):
+    group_id = str(uncategorized_group_id(db))
+
     # No token at all - HTTPBearer itself rejects this before our role
     # check ever runs.
-    response = client.post("/api/v1/categories", json={"name": f"Cat {uuid.uuid4().hex[:8]}"})
+    response = client.post(
+        "/api/v1/categories", json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id}
+    )
     assert response.status_code in (401, 403)
 
     # Wrong role
     response = client.post(
         "/api/v1/categories",
-        json={"name": f"Cat {uuid.uuid4().hex[:8]}"},
+        json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id},
         headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT]),
     )
     assert response.status_code == 403
@@ -87,7 +91,7 @@ def test_category_write_requires_inventory_manager(client, staff_tokens, db):
     # this endpoint's own allow-list only names Inventory Manager.
     response = client.post(
         "/api/v1/categories",
-        json={"name": f"Cat {uuid.uuid4().hex[:8]}"},
+        json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id},
         headers=_auth(staff_tokens[StaffRole.SYSTEM_ADMINISTRATOR]),
     )
     assert response.status_code == 200
@@ -97,7 +101,7 @@ def test_category_write_requires_inventory_manager(client, staff_tokens, db):
     # Right role
     response = client.post(
         "/api/v1/categories",
-        json={"name": f"Cat {uuid.uuid4().hex[:8]}"},
+        json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id},
         headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER]),
     )
     assert response.status_code == 200
@@ -136,7 +140,7 @@ def test_branch_write_requires_inventory_manager(client, staff_tokens, db):
 
 @pytest.fixture
 def inventory_record(db):
-    category = Category(name=f"Inv Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Inv Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
     product = Product(category_id=category.id, name="Inv Test Product")

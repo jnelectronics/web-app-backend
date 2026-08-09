@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import AuditLog, Category, Product, ProductDiscount, ProductImage, ProductVariant, StaffRole, StaffUser, VariantAttribute
 from security import create_access_token, hash_password
 
@@ -72,7 +72,7 @@ def mock_cloudinary(monkeypatch):
 
 @pytest.fixture
 def product(db):
-    category = Category(name=f"Ext Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Ext Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
     product = Product(category_id=category.id, name="Ext Test Product")
@@ -196,8 +196,9 @@ def test_product_image_lifecycle_and_primary_cap(client, product, inventory_mana
 
 def test_product_list_filtering_search_sort_and_pagination(client, db, inventory_manager_token):
     headers = _auth(inventory_manager_token)
-    category = Category(name=f"Filter Test Category {uuid.uuid4().hex[:8]}")
-    other_category = Category(name=f"Filter Test Other Category {uuid.uuid4().hex[:8]}")
+    group_id = uncategorized_group_id(db)
+    category = Category(name=f"Filter Test Category {uuid.uuid4().hex[:8]}", category_group_id=group_id)
+    other_category = Category(name=f"Filter Test Other Category {uuid.uuid4().hex[:8]}", category_group_id=group_id)
     db.add_all([category, other_category])
     db.commit()
 
@@ -282,7 +283,7 @@ def test_product_list_filtering_search_sort_and_pagination(client, db, inventory
 
 def test_product_read_includes_new_fields_and_computed_discount(client, db, inventory_manager_token):
     headers = _auth(inventory_manager_token)
-    category = Category(name=f"Field Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Field Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.commit()
 

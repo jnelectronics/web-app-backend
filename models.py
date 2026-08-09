@@ -26,6 +26,60 @@ from sqlalchemy.orm import Mapped, mapped_column
 from database import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
+class CategoryGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # A CategoryGroup is a "folder" that categories live under, e.g. a
+    # "Phones & Tablets" group containing the "Mobile Phones" and
+    # "Tablets" categories. This table didn't exist before - it's new,
+    # added specifically so the storefront frontend has something to show
+    # in the header bar / mobile nav that's coarser-grained than every
+    # individual category.
+    __tablename__ = "category_groups"
+
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+
+    # A short string like "smartphone" that the frontend maps to a real
+    # icon component from its icon library. The backend never validates
+    # this against a real list of valid icon names - same as how
+    # Banner.image_url below is just trusted as a plain string - so a typo
+    # here just means the frontend falls back to a default icon, not a
+    # broken API response.
+    icon: Mapped[str | None] = mapped_column(String(50))
+
+    # Which slot (1 through 5) this group occupies in the desktop header
+    # bar below the site header. NULL means "not shown in the desktop
+    # header bar at all" - the group still exists and is still shown on
+    # mobile nav / the catalogue sidebar, just not that one prime-position
+    # row that can only fit 5 groups on desktop.
+    #
+    # unique=True here relies on a Postgres-specific behavior: a UNIQUE
+    # constraint on a nullable column allows MANY rows to be NULL at once
+    # (NULL is never considered equal to another NULL), while still
+    # rejecting two DIFFERENT rows that both try to use e.g. header_rank=1.
+    # That's exactly the rule we want - "at most one group per rank, but
+    # any number of groups can have no rank."
+    header_rank: Mapped[int | None] = mapped_column(Integer, unique=True)
+
+    # Sort order for places that show EVERY group, not just the 5 in the
+    # header bar - the mobile nav menu and the catalogue sidebar's
+    # "group mode" both use this instead of header_rank.
+    display_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    __table_args__ = (
+        # A CHECK constraint - Postgres itself will refuse to insert or
+        # update a row where this condition is false, so "header_rank must
+        # be 1-5 or nothing" can never be violated even by a bug elsewhere
+        # in the app. The `header_rank IS NULL OR ...` half is required -
+        # without it, NULL would fail the BETWEEN check and every
+        # ungrouped row would be rejected.
+        CheckConstraint(
+            "header_rank IS NULL OR header_rank BETWEEN 1 AND 5",
+            name="ck_category_groups_header_rank_range",
+        ),
+    )
+
+
 class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # The actual table name that will exist in Postgres.
     __tablename__ = "categories"
@@ -36,6 +90,14 @@ class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # `str | None` (instead of just `str`) means this column is optional/nullable.
     description: Mapped[str | None] = mapped_column(Text)
+
+    # Every category must belong to exactly one group (Nyson's frontend
+    # requirement) - NOT NULL, no default. The migration that adds this
+    # column handles the existing rows in the DB (which predate category
+    # groups entirely) by backfilling them all into one auto-created
+    # "Uncategorized" group before this constraint gets turned on, so nothing
+    # already in the database is left in a state that violates its own schema.
+    category_group_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("category_groups.id"))
 
     # Soft-delete flag: per the docs, categories/products are never actually
     # removed from the database, just deactivated. default=True means new
@@ -56,6 +118,28 @@ class Branch(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # Which branch the product-form "quantity" field (no branch picker -
+    # see routers/variants.py's stock endpoint) reads/writes against. Added
+    # because the storefront's admin product form was simplified to not
+    # collect a branch at all, but this project's inventory is genuinely
+    # per-branch - something still has to decide WHICH branch a plain
+    # "quantity" means.
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    __table_args__ = (
+        # Partial unique index, same technique as product_images'
+        # "uq_product_images_one_primary" below - only rows where
+        # is_default is true are checked against each other, so any number
+        # of branches can have is_default=False, but Postgres itself
+        # refuses a second branch ever being flagged default at the same time.
+        Index(
+            "uq_branches_single_default",
+            "is_default",
+            unique=True,
+            postgresql_where=text("is_default = true"),
+        ),
+    )
+
 
 class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "products"
@@ -74,6 +158,28 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # For the homepage's featured-products rail - a plain manual flag, not
     # derived from anything else.
     is_featured: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Same idea as is_featured - a plain manual marketing flag for the
+    # homepage's "New Arrivals" rail, independent of is_featured/is_on_sale
+    # (a product can be any combination of the three, or none).
+    is_new_arrival: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # UNLIKE is_featured/is_new_arrival, this one has a real business rule
+    # attached (see routers/products.py's _assert_on_sale_has_promotion):
+    # is_on_sale=true is only allowed while applied_promotion_id points at
+    # a real, currently-active library Promotion. It's still its own
+    # column rather than something computed purely from applied_promotion_id
+    # being non-null, because staff can un-toggle "On Sale" on the product
+    # form without necessarily clearing the promotion link underneath it.
+    is_on_sale: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Links back to the promotion LIBRARY entry (Promotion, below) this
+    # product's current discount was applied from - nullable, since most
+    # products have no promotion at all. Applying/clearing a promotion
+    # (routers/promotions.py's apply_promotion_to_product) keeps this AND
+    # the actual product_discounts row it creates in sync, rather than
+    # letting the two drift apart.
+    applied_promotion_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("promotions.id"))
 
     # URL-friendly identifier for product detail pages (/products/{slug}
     # instead of /products/{uuid}) - server-generated once at creation time
@@ -609,6 +715,34 @@ class DiscountType(str, enum.Enum):
     FIXED_AMOUNT = "fixed_amount"
 
 
+class Promotion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # The promotion LIBRARY - a reusable, named discount template staff
+    # configure once (e.g. "Eid 20% off") and apply to any number of
+    # products from the product form, instead of typing the same
+    # percentage/amount into a fresh ProductDiscount every time. Applying
+    # one (routers/promotions.py's apply_promotion_to_product) creates/
+    # updates a real ProductDiscount row FROM this template - cart/checkout
+    # price resolution keeps reading ProductDiscount exactly like before,
+    # completely unaware a library even exists.
+    __tablename__ = "promotions"
+
+    # Staff-facing label, e.g. "Eid 20% off" - what shows up in the
+    # promotion picker on the product form.
+    name: Mapped[str] = mapped_column(String(150))
+
+    discount_type: Mapped[DiscountType] = mapped_column(
+        Enum(DiscountType, name="promotion_discount_type", values_callable=lambda e: [x.value for x in e])
+    )
+    discount_value: Mapped[float]
+
+    # Optional scheduling window, same idea as Banner's - a promotion with
+    # neither is just "active until turned off manually".
+    starts_at: Mapped[datetime | None]
+    ends_at: Mapped[datetime | None]
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
 class ProductDiscount(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Its own table rather than columns on Product (per the docs) - so a
     # product can have a history of discount windows over time, and a
@@ -616,6 +750,14 @@ class ProductDiscount(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "product_discounts"
 
     product_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("products.id"))
+
+    # Which library Promotion this row was applied from, if any. Nullable
+    # on purpose: ProductDiscount rows created directly via
+    # POST /products/{id}/discounts (before the promotion library existed,
+    # or still today via that same endpoint) have no library entry behind
+    # them at all - they're grandfathered as valid discounts in their own
+    # right, not required to retroactively gain a promotion_id.
+    promotion_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("promotions.id"))
 
     discount_type: Mapped[DiscountType] = mapped_column(
         Enum(DiscountType, name="discount_type", values_callable=lambda e: [x.value for x in e])
@@ -628,6 +770,77 @@ class ProductDiscount(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     starts_at: Mapped[datetime | None]
     ends_at: Mapped[datetime | None]
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class CatalogueFilterMode(str, enum.Enum):
+    CATEGORIES = "categories"
+    CATEGORY_GROUPS = "category_groups"
+
+
+class StoreSettings(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # A SINGLETON table - exactly one row ever exists (seeded by the
+    # migration that creates this table), never created or deleted through
+    # the API, only ever read/updated. Modeled as a real table (not just
+    # hardcoded config) because catalogue_filter_mode is something staff
+    # change through the admin UI, not something that needs a deploy to
+    # change.
+    __tablename__ = "store_settings"
+
+    # Controls whether the storefront's catalogue sidebar (and homepage
+    # browse section) renders a flat category list or collapsible
+    # category groups - see routers/categories.py's CategoryGroupWithCategories
+    # for the group-mode shape. Deliberately just ONE field for now; the
+    # docs already anticipate more settings sharing this same table later
+    # (e.g. a default homepage hero source) rather than each getting its
+    # own single-row table.
+    catalogue_filter_mode: Mapped[CatalogueFilterMode] = mapped_column(
+        Enum(CatalogueFilterMode, name="catalogue_filter_mode", values_callable=lambda e: [x.value for x in e]),
+        default=CatalogueFilterMode.CATEGORIES,
+    )
+
+
+class HomepageSectionType(str, enum.Enum):
+    ALL_PRODUCTS = "all_products"
+    FEATURED = "featured"
+    ON_SALE = "on_sale"
+    NEW_ARRIVAL = "new_arrival"
+    BY_CATEGORY = "by_category"
+
+
+class HomepageSection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # A configurable row of products on the homepage, e.g. "Featured
+    # products" or "New Arrivals". section_type picks which PRESET rule
+    # resolves the actual product list at read time (routers/homepage_sections.py) -
+    # v1 deliberately doesn't support free-form manual product curation,
+    # matching the frontend's own "preset type, not free-form" scope call.
+    __tablename__ = "homepage_sections"
+
+    title: Mapped[str] = mapped_column(String(150))
+    description: Mapped[str | None] = mapped_column(String(500))
+
+    section_type: Mapped[HomepageSectionType] = mapped_column(
+        Enum(HomepageSectionType, name="homepage_section_type", values_callable=lambda e: [x.value for x in e])
+    )
+
+    # Only meaningful (and required, enforced at the application layer -
+    # see schemas.HomepageSectionCreate) when section_type=by_category.
+    # Single category only in v1, per the frontend's own stated assumption -
+    # not category GROUPS, which would need to resolve every category
+    # under the group and is a bigger feature than this table needs yet.
+    category_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("categories.id"))
+
+    display_order: Mapped[int] = mapped_column(Integer, default=0)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # NULL = frontend's own default (8) applies - kept optional rather
+    # than defaulting to 8 here too, so the frontend's default can change
+    # without a migration.
+    max_products: Mapped[int | None] = mapped_column(Integer)
+
+    # Optional override for the section's "View all" link - NULL means the
+    # frontend derives it from section_type itself (e.g. on_sale ->
+    # /products?on_sale=true).
+    view_all_href: Mapped[str | None] = mapped_column(String(255))
 
 
 class StaffRole(str, enum.Enum):

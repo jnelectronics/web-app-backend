@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import Branch, Cart, CartItem, Category, Customer, InventoryRecord, Product, ProductImage, ProductVariant
 from security import create_access_token, hash_password
 
@@ -19,7 +19,7 @@ def _auth(token):
 
 @pytest.fixture
 def cart_setup(db):
-    category = Category(name=f"Cart Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Cart Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
 

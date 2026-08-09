@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import (
     AuditLog,
     Branch,
@@ -61,7 +61,7 @@ def _auth(token):
 
 @pytest.fixture
 def variant_and_branch(db):
-    category = Category(name=f"Mv Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Mv Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
     product = Product(category_id=category.id, name="Mv Test Product")

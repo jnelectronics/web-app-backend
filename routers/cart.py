@@ -5,17 +5,46 @@
 # down to a single real Cart row, creating one the first time it's needed.
 
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Cart, CartItem, CartStatus, Product, ProductImage, ProductVariant
+from models import Cart, CartItem, CartStatus, DiscountType, Product, ProductDiscount, ProductImage, ProductVariant
 from schemas import CartItemAdd, CartItemRead, CartItemUpdate, CartRead
 from security import decode_token_claims
 
 router = APIRouter(prefix="/cart", tags=["cart"], route_class=EnvelopeRoute)
+
+
+def _resolve_discounted_price(db: Session, product_id: uuid.UUID | None, original_price: float) -> float | None:
+    # Same "currently active" window check as routers/products.py's
+    # _is_product_discounted, duplicated rather than imported - it's three
+    # lines of a query, not a business rule complex enough to be worth a
+    # cross-router import for (see CLAUDE.md on this project's general
+    # preference for small, domain-scoped duplication over that kind of
+    # coupling). None means "no discount applies right now."
+    if product_id is None:
+        return None
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    discount = (
+        db.query(ProductDiscount)
+        .filter(
+            ProductDiscount.product_id == product_id,
+            ProductDiscount.is_active == True,  # noqa: E712
+            or_(ProductDiscount.starts_at.is_(None), ProductDiscount.starts_at <= now),
+            or_(ProductDiscount.ends_at.is_(None), ProductDiscount.ends_at >= now),
+        )
+        .first()
+    )
+    if discount is None:
+        return None
+    if discount.discount_type == DiscountType.PERCENTAGE:
+        return round(original_price * (1 - discount.discount_value / 100), 2)
+    return max(0.0, round(original_price - discount.discount_value, 2))
 
 
 def get_current_cart(
@@ -151,6 +180,10 @@ def _build_cart_read(cart: Cart, db: Session) -> CartRead:
                 image_url=primary_image.image_url if primary_image is not None else None,
                 quantity=item.quantity,
                 unit_price_snapshot=item.unit_price_snapshot,
+                original_price=item.unit_price_snapshot,
+                discounted_price=_resolve_discounted_price(
+                    db, product.id if product is not None else None, item.unit_price_snapshot
+                ),
             )
         )
     return CartRead(id=cart.id, items=item_reads)

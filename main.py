@@ -10,12 +10,30 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from observability import setup_observability
 from rate_limit import RateLimitedError
-from routers import audit, auth, branches, cart, categories, customers, dashboard, inventory, orders, payments, products, promotions, staff, variants
+from routers import (
+    audit,
+    auth,
+    branches,
+    cart,
+    categories,
+    customers,
+    dashboard,
+    homepage_sections,
+    inventory,
+    orders,
+    payments,
+    products,
+    promotions,
+    staff,
+    store_settings,
+    variants,
+)
 from routers.auth import GoogleSignInUnavailableError
+from routers.categories import CategoryGroupHasCategoriesError, DuplicateHeaderRankError
 from routers.inventory import InsufficientInventoryError
 from routers.orders import InvalidStateTransitionError
 from routers.payments import DuplicatePaymentError, PaymentInProgressError, PaymentsUnavailableError
-from routers.products import ImageUploadUnavailableError
+from routers.products import ImageUploadUnavailableError, OnSaleRequiresPromotionError
 
 load_dotenv()
 
@@ -157,6 +175,36 @@ def invalid_state_transition_handler(request: Request, exc: InvalidStateTransiti
     )
 
 
+# Same pattern again, for category groups' "at most one group per
+# header_rank 1-5" rule (routers/categories.py's _assert_header_rank_free).
+@app.exception_handler(DuplicateHeaderRankError)
+def duplicate_header_rank_handler(request: Request, exc: DuplicateHeaderRankError):
+    return JSONResponse(
+        status_code=409,
+        content={"success": False, "message": str(exc), "error_code": "DUPLICATE_HEADER_RANK"},
+    )
+
+
+# Same pattern again, for category groups' "can't delete a group that
+# still has categories in it" rule.
+@app.exception_handler(CategoryGroupHasCategoriesError)
+def category_group_has_categories_handler(request: Request, exc: CategoryGroupHasCategoriesError):
+    return JSONResponse(
+        status_code=409,
+        content={"success": False, "message": str(exc), "error_code": "CATEGORY_GROUP_HAS_CATEGORIES"},
+    )
+
+
+# Same pattern again, for the "On Sale requires a currently-active applied
+# promotion" rule (routers/products.py's _assert_on_sale_has_promotion).
+@app.exception_handler(OnSaleRequiresPromotionError)
+def on_sale_requires_promotion_handler(request: Request, exc: OnSaleRequiresPromotionError):
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "message": str(exc), "error_code": "ON_SALE_REQUIRES_PROMOTION"},
+    )
+
+
 # Catches every HTTPException raised anywhere (all the plain
 # `raise HTTPException(status_code=404, detail=...)` calls scattered across
 # the routers) and reshapes FastAPI's default {"detail": ...} body into the
@@ -209,6 +257,7 @@ def validation_exception_handler(request: Request, exc: RequestValidationError):
 # same way, without needing to know about versioning itself.
 app.include_router(products.router, prefix="/api/v1")
 app.include_router(categories.router, prefix="/api/v1")
+app.include_router(categories.group_router, prefix="/api/v1")
 app.include_router(branches.router, prefix="/api/v1")
 app.include_router(variants.router, prefix="/api/v1")
 app.include_router(inventory.router, prefix="/api/v1")
@@ -232,8 +281,16 @@ app.include_router(payments.router, prefix="/api/v1")
 app.include_router(customers.router, prefix="/api/v1")
 app.include_router(promotions.banner_router, prefix="/api/v1")
 app.include_router(promotions.discount_router, prefix="/api/v1")
+app.include_router(promotions.promotion_router, prefix="/api/v1")
 app.include_router(dashboard.router, prefix="/api/v1")
 app.include_router(audit.router, prefix="/api/v1")
+app.include_router(store_settings.public_router, prefix="/api/v1")
+app.include_router(store_settings.admin_router, prefix="/api/v1")
+# admin_router's fixed "/reorder" path is registered on the SAME router as
+# its own "/{section_id}" routes, so ordering within homepage_sections.py
+# itself (not here) is what protects it - see that file's own comment.
+app.include_router(homepage_sections.public_router, prefix="/api/v1")
+app.include_router(homepage_sections.admin_router, prefix="/api/v1")
 
 
 @app.get("/")

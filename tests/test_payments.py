@@ -14,7 +14,7 @@ from datetime import timedelta
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import (
     Branch,
     Category,
@@ -72,7 +72,7 @@ def order_setup(db):
     # cart/checkout API - checkout itself is already covered by the Orders
     # phase's own testing, so this only needs a valid order to attach
     # payments to, not to re-prove checkout works.
-    category = Category(name=f"Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
 
@@ -469,7 +469,7 @@ def guest_order_setup(db):
     # that path is already covered elsewhere, e.g. test_order_notifications.py)
     # with a known guest_token, so payments' guest-authorization logic can
     # be tested in isolation.
-    category = Category(name=f"Guest Pay Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Guest Pay Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
 

@@ -10,7 +10,17 @@ from typing import Annotated, Generic, TypeVar
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, computed_field
 
-from models import CustomerStatus, CustomerType, DiscountType, MovementType, OrderStatus, PaymentStatus, StaffRole
+from models import (
+    CatalogueFilterMode,
+    CustomerStatus,
+    CustomerType,
+    DiscountType,
+    HomepageSectionType,
+    MovementType,
+    OrderStatus,
+    PaymentStatus,
+    StaffRole,
+)
 
 # Generic wrapper for every collection response - see pagination.py for the
 # actual page/total_pages math. `T` stands in for whatever *Read schema a
@@ -55,9 +65,48 @@ def _validate_password_strength(password: str) -> str:
 PasswordStr = Annotated[str, AfterValidator(_validate_password_strength)]
 
 
+class CategoryGroupCreate(BaseModel):
+    name: str
+    icon: str | None = None
+    # 1-5, or None to leave this group out of the desktop header bar
+    # entirely. The model's own CheckConstraint is the REAL enforcement of
+    # the 1-5 range (Postgres will reject anything else no matter what);
+    # this is just here so a bad value fails fast, before a query even
+    # reaches the database.
+    header_rank: int | None = None
+    display_order: int = 0
+
+
+class CategoryGroupRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    icon: str | None
+    header_rank: int | None
+    display_order: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class CategoryGroupStatusUpdate(BaseModel):
+    # Same "sets, not toggles" reasoning as StaffStatusUpdate above.
+    is_active: bool
+
+
+class CategoryGroupWithCategories(CategoryGroupRead):
+    # The storefront view (GET /category-groups) embeds each group's own
+    # categories directly in the same response, so the frontend doesn't
+    # have to make a second request per group just to render a header
+    # bar / nav menu - see routers/categories.py.
+    categories: list["CategoryRead"]
+
+
 class CategoryCreate(BaseModel):
     name: str
     description: str | None = None
+    category_group_id: uuid.UUID
 
 
 class CategoryRead(BaseModel):
@@ -68,6 +117,7 @@ class CategoryRead(BaseModel):
     id: uuid.UUID
     name: str
     description: str | None
+    category_group_id: uuid.UUID
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -89,6 +139,10 @@ class BranchRead(BaseModel):
     phone_number: str | None
     email: str | None
     is_active: bool
+    # Which branch the branch-less product-form "quantity" field reads/
+    # writes against - see routers/variants.py's stock endpoint and
+    # routers/branches.py's set_default_branch.
+    is_default: bool
     created_at: datetime
     updated_at: datetime
 
@@ -100,6 +154,14 @@ class ProductCreate(BaseModel):
     name: str
     description: str | None = None
     is_featured: bool = False
+    is_new_arrival: bool = False
+    # is_on_sale=True is only accepted when the product already has an
+    # active promotion applied (routers/products.py's
+    # _assert_on_sale_has_promotion) - which for a brand-new product (this
+    # schema, on POST) is never true yet, since apply-promotion needs a
+    # real product id to target. Practically: create with this False, then
+    # POST /products/{id}/apply-promotion, which flips it on for you.
+    is_on_sale: bool = False
 
 
 class ProductRead(BaseModel):
@@ -110,6 +172,9 @@ class ProductRead(BaseModel):
     name: str
     description: str | None
     is_featured: bool
+    is_new_arrival: bool
+    is_on_sale: bool
+    applied_promotion_id: uuid.UUID | None
     # NOT from_attributes-mapped off the Product row directly - both are
     # assembled by routers/products.py's _build_product_read (images come
     # from a separate table; is_discounted is computed from
@@ -158,6 +223,23 @@ class VariantRead(BaseModel):
     # (how few units counts as "low"?) that's a product decision, not
     # something to invent a number for here.
     in_stock: bool
+    # The DEFAULT branch's actual quantity_available - unlike in_stock
+    # above, this IS a real number, so it's only ever populated for a
+    # staff-authenticated caller (routers/variants.py's read routes accept
+    # an OPTIONAL staff token for exactly this reason). A public/customer
+    # request always gets None here, never a real figure - per FR-PROD-017/018,
+    # actual stock counts are staff-only information, same reasoning
+    # in_stock is a plain boolean instead of a number.
+    quantity_available: int | None = None
+
+
+class VariantStockUpdate(BaseModel):
+    # An ABSOLUTE quantity to set, not a +/- delta like InventoryAdjust -
+    # matches how the admin product form actually works (staff type "10
+    # in stock", not "add 3 more"). See routers/variants.py's
+    # set_variant_stock for how this gets translated into a signed
+    # InventoryMovement under the hood.
+    quantity_available: int
 
 
 # No ProductImageCreate here anymore - POST/PUT .../images now take a real
@@ -367,6 +449,19 @@ class CartItemRead(BaseModel):
     image_url: str | None
     quantity: int
     unit_price_snapshot: float
+
+    # DISPLAY ONLY - resolved fresh at read time by routers/cart.py's
+    # _resolve_discounted_price, so the frontend doesn't have to
+    # reimplement percentage/fixed discount math itself (api-concerns.md
+    # §10). original_price always equals unit_price_snapshot (the actual
+    # price this line is billed at - see that field's own comment on why
+    # it's frozen); discounted_price is None when no discount currently
+    # applies, or the lower price if one does. Deliberately does NOT change
+    # what line_total/subtotal below actually charge - this project's
+    # checkout/PesaPal flow is verified live with real money, and isn't
+    # touched by this addition.
+    original_price: float
+    discounted_price: float | None
 
     # Not a real database column - computed on the way out so a client
     # doesn't have to multiply quantity * unit_price_snapshot itself.
@@ -625,6 +720,40 @@ class BannerStatusUpdate(BaseModel):
     is_active: bool
 
 
+class PromotionCreate(BaseModel):
+    name: str
+    discount_type: DiscountType
+    discount_value: float
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+
+
+class PromotionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    discount_type: DiscountType
+    discount_value: float
+    starts_at: datetime | None
+    ends_at: datetime | None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class PromotionStatusUpdate(BaseModel):
+    # Sets is_active to exactly this value - same "not a toggle" reasoning
+    # as StaffStatusUpdate above.
+    is_active: bool
+
+
+class ApplyPromotionRequest(BaseModel):
+    # See routers/promotions.py's apply_promotion_to_product - which
+    # library Promotion to apply to the product in the URL.
+    promotion_id: uuid.UUID
+
+
 class ProductDiscountCreate(BaseModel):
     discount_type: DiscountType
     discount_value: float
@@ -637,6 +766,10 @@ class ProductDiscountRead(BaseModel):
 
     id: uuid.UUID
     product_id: uuid.UUID
+    # Which library Promotion (if any) this row came from - see the
+    # model's own comment on why this is nullable (pre-library discounts
+    # are grandfathered in with no link at all).
+    promotion_id: uuid.UUID | None
     discount_type: DiscountType
     discount_value: float
     starts_at: datetime | None
@@ -650,3 +783,63 @@ class ProductDiscountStatusUpdate(BaseModel):
     # Sets is_active to exactly this value - same "not a toggle" reasoning
     # as StaffStatusUpdate above.
     is_active: bool
+
+
+class StoreSettingsUpdate(BaseModel):
+    catalogue_filter_mode: CatalogueFilterMode
+
+
+class StoreSettingsRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    catalogue_filter_mode: CatalogueFilterMode
+    updated_at: datetime
+
+
+class HomepageSectionCreate(BaseModel):
+    title: str
+    description: str | None = None
+    section_type: HomepageSectionType
+    # Required when section_type=by_category, ignored otherwise - enforced
+    # in routers/homepage_sections.py (a Pydantic model-level validator
+    # would work too, but this project's established pattern is
+    # cross-field business rules live in the router, not the schema - see
+    # e.g. products' on-sale/promotion check).
+    category_id: uuid.UUID | None = None
+    display_order: int = 0
+    is_enabled: bool = True
+    max_products: int | None = None
+    view_all_href: str | None = None
+
+
+class HomepageSectionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    title: str
+    description: str | None
+    section_type: HomepageSectionType
+    category_id: uuid.UUID | None
+    display_order: int
+    is_enabled: bool
+    max_products: int | None
+    view_all_href: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class HomepageSectionWithProducts(HomepageSectionRead):
+    # Only populated when the public read endpoint is called with
+    # include_products=true - see routers/homepage_sections.py. Reuses the
+    # full ProductRead shape rather than inventing a slimmer "product
+    # summary" schema, matching how this project generally favors one
+    # consistent product shape over several narrower ones.
+    products: list["ProductRead"]
+
+
+class HomepageSectionReorder(BaseModel):
+    # The full new order, front to back - routers/homepage_sections.py
+    # assigns display_order 0, 1, 2... by this list's position, same
+    # "caller states the end result" reasoning as the *StatusUpdate
+    # schemas above (not a series of individual move-up/move-down calls).
+    ordered_ids: list[uuid.UUID]

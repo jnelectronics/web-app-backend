@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import (
     AuditLog,
     Branch,
@@ -24,7 +24,7 @@ from security import create_access_token, hash_password
 
 @pytest.fixture
 def order_setup(db):
-    category = Category(name=f"OS Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"OS Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
     product = Product(category_id=category.id, name="OS Test Product")

@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import Branch, Category, Customer, Order, Product, ProductVariant, StaffRole, StaffUser
 from security import create_access_token, hash_password
 
@@ -96,7 +96,7 @@ def test_change_my_password(client, customer):
 
 @pytest.fixture
 def customer_order(db, customer):
-    category = Category(name=f"Cust Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Cust Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
     product = Product(category_id=category.id, name="Cust Test Product")

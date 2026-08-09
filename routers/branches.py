@@ -99,3 +99,30 @@ def delete_branch(
 
     existing.is_active = False
     db.commit()
+
+
+@router.patch("/{branch_id}/set-default", response_model=BranchRead)
+def set_default_branch(
+    branch_id: uuid.UUID,
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    db: Session = Depends(get_db),
+):
+    # Same "clear the old one first, then set the new one" shape as
+    # routers/products.py's set_primary_product_image - the model's own
+    # partial unique index (models.py's uq_branches_single_default) is
+    # what actually enforces "at most one default branch," but it checks on
+    # every write, so both rows being true at once - even for an instant
+    # within this same transaction - would still fail.
+    target = db.get(Branch, branch_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Branch not found")
+
+    current_default = db.query(Branch).filter(Branch.is_default == True).first()  # noqa: E712
+    if current_default is not None and current_default.id != target.id:
+        current_default.is_default = False
+        db.flush()
+
+    target.is_default = True
+    db.commit()
+    db.refresh(target)
+    return target

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from database import SessionLocal
 from main import app
+from models import CategoryGroup
 
 
 @pytest.fixture
@@ -32,6 +33,18 @@ def unwrap(response):
     # need to reach into "data" to get the actual resource instead of
     # reading the top level directly.
     return response.json()["data"]
+
+
+def uncategorized_group_id(db):
+    # Category.category_group_id became required once category groups
+    # were added (migration 9efc87f6f25a) - tests that only need SOME
+    # valid category (not testing grouping itself) point at the same
+    # "Uncategorized" group that migration seeds for real data, rather
+    # than every test fixture spinning up (and tearing down) a throwaway
+    # group of its own just to satisfy the NOT NULL constraint.
+    group = db.query(CategoryGroup).filter(CategoryGroup.name == "Uncategorized").first()
+    assert group is not None, "Uncategorized category group is missing - has the migration been run?"
+    return group.id
 
 
 @pytest.fixture

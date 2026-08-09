@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from conftest import unwrap
+from conftest import uncategorized_group_id, unwrap
 from models import Banner, Category, Product, ProductDiscount, StaffRole, StaffUser
 from security import create_access_token, hash_password
 
@@ -117,7 +117,7 @@ def test_banner_write_requires_inventory_manager(client, inventory_manager_token
 
 @pytest.fixture
 def product(db):
-    category = Category(name=f"Promo Test Category {uuid.uuid4().hex[:8]}")
+    category = Category(name=f"Promo Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
     product = Product(category_id=category.id, name="Promo Test Product")
