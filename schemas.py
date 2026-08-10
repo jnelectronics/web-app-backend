@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Generic, TypeVar
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, computed_field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, computed_field
 
 from models import (
     CatalogueFilterMode,
@@ -152,7 +152,18 @@ class ProductCreate(BaseModel):
     # matches the NOT NULL foreign key on the real products table.
     category_id: uuid.UUID
     name: str
-    description: str | None = None
+    # max_length=2000 matches models.py's Product.description column
+    # (String(2000)) exactly. Without this, Pydantic would accept a
+    # description of any length and pass it straight through to Postgres -
+    # which then rejects anything over 2000 characters with a raw database
+    # error. That error isn't one of the custom exceptions this project
+    # catches (see main.py's @app.exception_handler list), so FastAPI's
+    # default handler takes over instead: a bare-text "Internal Server
+    # Error", not our usual {"success": false, ...} JSON envelope. Setting
+    # the limit here means Pydantic catches it first and returns a normal,
+    # clean 422 through the SAME validation-error handling every other bad
+    # request already goes through - one boundary, not two.
+    description: str | None = Field(default=None, max_length=2000)
     is_featured: bool = False
     is_new_arrival: bool = False
     # is_on_sale=True is only accepted when the product already has an
