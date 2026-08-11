@@ -79,7 +79,12 @@ def _validate_category_for_section_type(db: Session, payload: HomepageSectionCre
         return None
     if payload.category_id is None:
         raise HTTPException(status_code=422, detail="category_id is required when section_type is by_category")
-    if db.get(Category, payload.category_id) is None:
+    category = db.get(Category, payload.category_id)
+    # Treat an inactive category the same as a missing one - a homepage
+    # section pointing at a soft-deleted category would otherwise silently
+    # resolve to an empty product list forever, with no obvious signal to
+    # the admin who configured it.
+    if category is None or not category.is_active:
         raise HTTPException(status_code=404, detail="Category not found")
     return payload.category_id
 
@@ -93,15 +98,27 @@ def reorder_homepage_sections(
     _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
     db: Session = Depends(get_db),
 ):
-    # Caller states the full end result (front to back), same "not a
+    # Caller must state the full end result (front to back), same "not a
     # series of individual moves" reasoning as schemas.HomepageSectionReorder's
-    # own comment - assigns display_order by position in the list. Any id
-    # that doesn't match a real section is silently skipped rather than
-    # erroring the whole reorder over one stale id.
-    for index, section_id in enumerate(reorder.ordered_ids):
-        section = db.get(HomepageSection, section_id)
-        if section is not None:
-            section.display_order = index
+    # own comment - assigns display_order by position in the list. The
+    # submitted set of ids must exactly match every section that currently
+    # exists: a stale/unknown id, a duplicate, or a partial list (missing
+    # some existing section) is rejected outright rather than partially
+    # applied - a partial apply would leave whichever sections were left out
+    # holding their old display_order, which can collide with the newly
+    # assigned ranks and break the "contiguous ranks" guarantee silently.
+    existing_sections = db.query(HomepageSection).all()
+    existing_ids = {section.id for section in existing_sections}
+    submitted_ids = reorder.ordered_ids
+    if len(submitted_ids) != len(set(submitted_ids)) or set(submitted_ids) != existing_ids:
+        raise HTTPException(
+            status_code=422,
+            detail="ordered_ids must contain every existing homepage section id exactly once, with no unknown ids.",
+        )
+
+    sections_by_id = {section.id: section for section in existing_sections}
+    for index, section_id in enumerate(submitted_ids):
+        sections_by_id[section_id].display_order = index
     db.commit()
     return db.query(HomepageSection).order_by(HomepageSection.display_order).all()
 

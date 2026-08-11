@@ -808,8 +808,13 @@ class StoreSettingsRead(BaseModel):
 
 
 class HomepageSectionCreate(BaseModel):
-    title: str
-    description: str | None = None
+    # max_length values mirror models.HomepageSection's String(150)/String(500)
+    # columns exactly - same reasoning as ProductCreate.description above:
+    # without these, an over-length value would pass Pydantic, then crash at
+    # the database insert with a raw, uncaught error (a bare-text 500 instead
+    # of our usual JSON envelope).
+    title: str = Field(max_length=150)
+    description: str | None = Field(default=None, max_length=500)
     section_type: HomepageSectionType
     # Required when section_type=by_category, ignored otherwise - enforced
     # in routers/homepage_sections.py (a Pydantic model-level validator
