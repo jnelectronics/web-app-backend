@@ -32,7 +32,7 @@ from routers.auth import GoogleSignInUnavailableError
 from routers.categories import CategoryGroupHasCategoriesError, DuplicateHeaderRankError
 from routers.inventory import InsufficientInventoryError
 from routers.orders import InvalidStateTransitionError
-from routers.payments import DuplicatePaymentError, PaymentInProgressError, PaymentsUnavailableError
+from routers.payments import DuplicatePaymentError, PaymentGatewayError, PaymentInProgressError, PaymentsUnavailableError
 from routers.products import ImageUploadUnavailableError, OnSaleRequiresPromotionError
 
 load_dotenv()
@@ -127,6 +127,18 @@ def payments_unavailable_handler(request: Request, exc: PaymentsUnavailableError
     return JSONResponse(
         status_code=503,
         content={"success": False, "message": str(exc), "error_code": "PAYMENTS_UNAVAILABLE"},
+    )
+
+
+# Same pattern again, for when PesaPal itself rejects/fails a real request
+# (SubmitOrderRequest, etc.) - a genuine gateway failure, distinct from a
+# generic INTERNAL_ERROR so the frontend can show "the payment provider is
+# having trouble" copy instead of a generic server-error message.
+@app.exception_handler(PaymentGatewayError)
+def payment_gateway_error_handler(request: Request, exc: PaymentGatewayError):
+    return JSONResponse(
+        status_code=502,
+        content={"success": False, "message": str(exc), "error_code": "PAYMENT_GATEWAY_ERROR"},
     )
 
 

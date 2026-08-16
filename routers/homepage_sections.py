@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Category, HomepageSection, HomepageSectionType, Product, StaffRole, StaffUser
+from models import Category, HomepageSection, HomepageSectionType, Product, ProductHomepageSection, StaffRole, StaffUser
 from schemas import HomepageSectionCreate, HomepageSectionReorder, HomepageSectionRead, HomepageSectionWithProducts
 from security import require_staff_role
 
@@ -40,12 +40,21 @@ def _resolve_products(db: Session, section: HomepageSection) -> list[Product]:
         if section.category_id is None:
             return []
         query = query.filter(Product.category_id == section.category_id)
+    elif section.section_type == HomepageSectionType.CURATED:
+        # Membership comes from the join table, not any flag/category on
+        # Product itself - a subquery of product_ids linked to THIS
+        # section, same shape as ON_SALE's _on_sale_product_ids above.
+        member_ids = (
+            db.query(ProductHomepageSection.product_id)
+            .filter(ProductHomepageSection.homepage_section_id == section.id)
+        )
+        query = query.filter(Product.id.in_(member_ids))
     # ALL_PRODUCTS: no extra filter - every active product qualifies.
 
     query = query.order_by(Product.created_at.desc())
-    # NULL max_products = uncapped here - the frontend's own default (8)
-    # applies when it's null, per the docs; this endpoint just returns
-    # whatever was actually asked for.
+    # NULL max_products = uncapped here - the frontend's own default (12)
+    # applies when it's null, per Nyson's 2026-08-13 doc; this endpoint
+    # just returns whatever was actually asked for.
     if section.max_products is not None:
         query = query.limit(section.max_products)
     return query.all()
@@ -61,6 +70,7 @@ def _build_section_with_products(db: Session, section: HomepageSection, *, resol
         description=section.description,
         section_type=section.section_type,
         category_id=section.category_id,
+        slug=section.slug,
         display_order=section.display_order,
         is_enabled=section.is_enabled,
         max_products=section.max_products,
@@ -87,6 +97,26 @@ def _validate_category_for_section_type(db: Session, payload: HomepageSectionCre
     if category is None or not category.is_active:
         raise HTTPException(status_code=404, detail="Category not found")
     return payload.category_id
+
+
+def _validate_slug_for_section_type(
+    db: Session, payload: HomepageSectionCreate, *, exclude_section_id: uuid.UUID | None = None
+) -> str | None:
+    if payload.section_type != HomepageSectionType.CURATED:
+        # slug is only meaningful for curated - same "silently dropped for
+        # every other type" reasoning as category_id above.
+        return None
+    if not payload.slug:
+        raise HTTPException(status_code=422, detail="slug is required when section_type is curated")
+
+    query = db.query(HomepageSection).filter(HomepageSection.slug == payload.slug)
+    if exclude_section_id is not None:
+        # On an update, a section is always allowed to keep its OWN slug -
+        # only a DIFFERENT section already holding it is a real conflict.
+        query = query.filter(HomepageSection.id != exclude_section_id)
+    if query.first() is not None:
+        raise HTTPException(status_code=422, detail=f"slug '{payload.slug}' is already in use by another homepage section")
+    return payload.slug
 
 
 # Fixed-path route registered BEFORE "/{section_id}" below - same
@@ -154,11 +184,13 @@ def create_homepage_section(
     db: Session = Depends(get_db),
 ):
     category_id = _validate_category_for_section_type(db, section)
+    slug = _validate_slug_for_section_type(db, section)
     new_section = HomepageSection(
         title=section.title,
         description=section.description,
         section_type=section.section_type,
         category_id=category_id,
+        slug=slug,
         display_order=section.display_order,
         is_enabled=section.is_enabled,
         max_products=section.max_products,
@@ -182,10 +214,12 @@ def update_homepage_section(
         raise HTTPException(status_code=404, detail="Homepage section not found")
 
     category_id = _validate_category_for_section_type(db, section)
+    slug = _validate_slug_for_section_type(db, section, exclude_section_id=section_id)
     existing.title = section.title
     existing.description = section.description
     existing.section_type = section.section_type
     existing.category_id = category_id
+    existing.slug = slug
     existing.display_order = section.display_order
     existing.is_enabled = section.is_enabled
     existing.max_products = section.max_products
@@ -208,5 +242,12 @@ def delete_homepage_section(
     if existing is None:
         raise HTTPException(status_code=404, detail="Homepage section not found")
 
+    # This project doesn't use SQLAlchemy relationship()/ORM cascade
+    # anywhere (see CLAUDE.md) - the FK from product_homepage_sections has
+    # no ON DELETE CASCADE either, so any membership rows have to be
+    # cleared explicitly first, in the same transaction, or the delete
+    # below would fail with a foreign key violation the instant a curated
+    # section with at least one product actually has members.
+    db.query(ProductHomepageSection).filter(ProductHomepageSection.homepage_section_id == section_id).delete()
     db.delete(existing)
     db.commit()

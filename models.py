@@ -805,6 +805,12 @@ class HomepageSectionType(str, enum.Enum):
     ON_SALE = "on_sale"
     NEW_ARRIVAL = "new_arrival"
     BY_CATEGORY = "by_category"
+    # Staff manually opt individual products in via the product form (see
+    # ProductHomepageSection below) - the only type that isn't a PRESET
+    # rule resolved from existing product flags/category, so it's the one
+    # place this table's "v1 doesn't support free-form curation" comment
+    # (below) no longer fully applies.
+    CURATED = "curated"
 
 
 class HomepageSection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -841,6 +847,40 @@ class HomepageSection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # frontend derives it from section_type itself (e.g. on_sale ->
     # /products?on_sale=true).
     view_all_href: Mapped[str | None] = mapped_column(String(255))
+
+    # Only meaningful (and required, enforced at the application layer -
+    # see routers/homepage_sections.py) when section_type=curated - a
+    # URL-safe key the storefront uses for this section's own page (e.g.
+    # /products?homepage_section={id}, but a human-readable slug is nicer
+    # in a URL than a raw UUID). NULL for every other section_type, same
+    # "only meaningful for one type" shape category_id already has for
+    # by_category. Unique across ALL sections (not just curated ones) -
+    # simpler than a partial unique index, and no other section_type ever
+    # sets it anyway.
+    slug: Mapped[str | None] = mapped_column(String(150), unique=True)
+
+
+class ProductHomepageSection(UUIDPrimaryKeyMixin, Base):
+    # The actual many-to-many membership behind HomepageSectionType.CURATED -
+    # one row = "this product is opted into this curated section". Skips
+    # TimestampMixin (only a manual created_at, no updated_at) - same
+    # append-only-audit-style reasoning as RefreshToken/OrderStatusHistory/
+    # InventoryMovement/AuditLog (see CLAUDE.md): a membership row is never
+    # edited in place, only inserted or deleted, so there's nothing an
+    # updated_at would ever record.
+    __tablename__ = "product_homepage_sections"
+
+    product_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("products.id"))
+    homepage_section_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("homepage_sections.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        # A product can only be linked to a given section once - the
+        # membership-sync endpoint (routers/products.py) relies on this to
+        # make "replace all memberships" idempotent rather than silently
+        # accumulating duplicate rows on repeated syncs.
+        UniqueConstraint("product_id", "homepage_section_id", name="uq_product_homepage_sections_product_id_homepage_section_id"),
+    )
 
 
 class StaffRole(str, enum.Enum):

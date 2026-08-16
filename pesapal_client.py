@@ -30,7 +30,7 @@ PESAPAL_IPN_ID = os.getenv("PESAPAL_IPN_ID")
 # on the real storefront frontend, not this API. Defaults to a placeholder
 # so local testing doesn't crash, but must be a real frontend URL before
 # this project goes anywhere near real users.
-PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL", "http://localhost:3000/order-confirmation")
+PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL", "http://localhost:4321/confirm-payment")
 
 
 def is_configured() -> bool:
@@ -110,10 +110,19 @@ def submit_order_request(
     billing_phone: str,
     billing_first_name: str,
     billing_last_name: str,
+    callback_url: str | None = None,
 ) -> dict:
     # Returns {"order_tracking_id": ..., "redirect_url": ...} - order_tracking_id
     # is what we store as Payment.provider_reference; redirect_url is
     # PesaPal's hosted checkout page the customer's browser needs to visit.
+    #
+    # callback_url: optional per-call override. This backend serves more
+    # than one real frontend origin (production + a separate QA/test
+    # domain), so a single fixed PESAPAL_CALLBACK_URL can't be correct for
+    # both - the caller (routers/payments.py) works out which origin the
+    # customer's browser is actually on and passes it in. Falls back to the
+    # module-level env var when no override is given, so nothing else
+    # (local dev, any other caller) needs to change.
     token = _get_access_token()
     response = httpx.post(
         f"{PESAPAL_BASE_URL}/api/Transactions/SubmitOrderRequest",
@@ -122,7 +131,7 @@ def submit_order_request(
             "currency": currency,
             "amount": amount,
             "description": description,
-            "callback_url": PESAPAL_CALLBACK_URL,
+            "callback_url": callback_url or PESAPAL_CALLBACK_URL,
             "notification_id": PESAPAL_IPN_ID,
             "billing_address": {
                 "email_address": billing_email,

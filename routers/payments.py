@@ -10,10 +10,11 @@
 # envelope. Wrapping it would break PesaPal's ability to read it.
 
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -48,6 +49,33 @@ logger = logging.getLogger(__name__)
 # (closed the tab, connection dropped) isn't locked out of retrying forever.
 PENDING_PAYMENT_WINDOW_MINUTES = 15
 
+# Same env var main.py's CORSMiddleware already reads - re-read here rather
+# than imported from main.py, since main.py imports this router (importing
+# back from main.py would be a circular import). This backend serves more
+# than one real frontend origin at once (production + a separate QA/test
+# domain) from a single deployment, so PesaPal's callback_url can't be one
+# fixed value - see _resolve_callback_url below.
+_ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+}
+
+
+def _resolve_callback_url(http_request: Request) -> str | None:
+    # The browser sends its own Origin header on the fetch/XHR call that
+    # hits this endpoint - that's the ONE reliable signal for "which real
+    # frontend site is this customer actually on". Only trusted when it's a
+    # known origin (the same whitelist CORS already enforces) - a spoofed
+    # Origin header can't be used to redirect a PesaPal payment somewhere
+    # arbitrary, since PesaPal's callback_url would otherwise be a classic
+    # open-redirect target. Returns None (pesapal_client's own env-var
+    # default takes over) when the header is missing or unrecognized - e.g.
+    # a direct server-to-server call, curl, or the test suite.
+    origin = http_request.headers.get("origin")
+    if origin is not None and origin in _ALLOWED_ORIGINS:
+        return f"{origin}/confirm-payment"
+    return None
+
 
 class DuplicatePaymentError(Exception):
     # Raised when an order already has a successful payment - mirrors
@@ -77,6 +105,16 @@ class PaymentsUnavailableError(Exception):
     # business verification. Turned into a clean 503 with a friendly
     # customer-facing message by the handler in main.py, instead of every
     # checkout attempt failing deep inside a PesaPal HTTP error.
+    pass
+
+
+class PaymentGatewayError(Exception):
+    # Raised when PesaPal itself rejects or fails a real request (e.g.
+    # SubmitOrderRequest) - a genuine gateway failure, not this API being
+    # broken. Turned into a 502 with error_code PAYMENT_GATEWAY_ERROR by the
+    # handler in main.py, distinct from the generic INTERNAL_ERROR a plain
+    # HTTPException(502, ...) would have produced - lets the frontend show
+    # "the payment provider is having trouble" instead of a generic error.
     pass
 
 
@@ -175,6 +213,7 @@ def _map_pesapal_status(payment_status_description: str) -> tuple[PaymentStatus,
 def initiate_payment(
     order_id: uuid.UUID,
     request: PaymentInitiate,
+    http_request: Request,
     actor=Depends(_resolve_actor),
     db: Session = Depends(get_db),
 ):
@@ -261,6 +300,7 @@ def initiate_payment(
             billing_phone=order.guest_phone_number,
             billing_first_name=first_name,
             billing_last_name=last_name or first_name,
+            callback_url=_resolve_callback_url(http_request),
         )
     except PesaPalError as exc:
         # logger.exception (not .info/.warning) - this is a genuine
@@ -272,7 +312,7 @@ def initiate_payment(
         # Rolls back the Payment row too - if PesaPal never accepted the
         # order, there's nothing real for this row to represent.
         db.rollback()
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Payment gateway error: {exc}")
+        raise PaymentGatewayError(f"Payment gateway error: {exc}")
 
     new_payment.provider_reference = pesapal_result["order_tracking_id"]
     new_payment.redirect_url = pesapal_result["redirect_url"]

@@ -14,9 +14,9 @@ from audit import write_audit_log
 from cloudinary_client import CloudinaryError, delete_image, is_configured, upload_image
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Category, Product, ProductDiscount, ProductImage, Promotion, StaffRole, StaffUser
+from models import Category, HomepageSection, HomepageSectionType, Product, ProductDiscount, ProductHomepageSection, ProductImage, Promotion, StaffRole, StaffUser
 from pagination import build_pagination_meta
-from schemas import PaginatedResponse, ProductCreate, ProductImageRead, ProductRead
+from schemas import PaginatedResponse, ProductCreate, ProductHomepageSectionsSync, ProductImageRead, ProductRead
 from security import decode_token_claims, require_staff_role
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,18 @@ def _on_sale_product_ids(db: Session):
     )
 
 
+def _homepage_section_ids_for_product(db: Session, product_id: uuid.UUID) -> list[uuid.UUID]:
+    # Which CURATED homepage sections this product currently belongs to -
+    # see schemas.ProductRead.homepage_section_ids' own comment for why
+    # this is assembled here rather than being an ORM attribute.
+    rows = (
+        db.query(ProductHomepageSection.homepage_section_id)
+        .filter(ProductHomepageSection.product_id == product_id)
+        .all()
+    )
+    return [row[0] for row in rows]
+
+
 def _build_product_read(product: Product, db: Session) -> ProductRead:
     images = (
         db.query(ProductImage)
@@ -121,6 +133,7 @@ def _build_product_read(product: Product, db: Session) -> ProductRead:
         is_active=product.is_active,
         created_at=product.created_at,
         updated_at=product.updated_at,
+        homepage_section_ids=_homepage_section_ids_for_product(db, product.id),
     )
 
 
@@ -210,6 +223,10 @@ def list_products(
     skip: int = 0,
     limit: int = 10,
     category: uuid.UUID | None = None,
+    # Active products linked to this CURATED homepage section via
+    # ProductHomepageSection - the "View all" link on the storefront for a
+    # curated section (see routers/homepage_sections.py) lands here.
+    homepage_section: uuid.UUID | None = None,
     search: str | None = None,
     featured: bool | None = None,
     discounted: bool | None = None,
@@ -243,6 +260,12 @@ def list_products(
 
     if category is not None:
         query = query.filter(Product.category_id == category)
+    if homepage_section is not None:
+        member_ids = (
+            db.query(ProductHomepageSection.product_id)
+            .filter(ProductHomepageSection.homepage_section_id == homepage_section)
+        )
+        query = query.filter(Product.id.in_(member_ids))
     if search:
         # Matches name OR description, per the request - ILIKE is
         # Postgres's case-insensitive LIKE, so "phone" matches "iPhone".
@@ -380,6 +403,57 @@ def update_product(
     db.commit()
     db.refresh(existing)
     return _build_product_read(existing, db)
+
+
+# Nyson's 2026-08-13 doc calls this PUT /admin/products/{product_id}/homepage-sections -
+# but this project has no separate "/admin/products" prefix anywhere (unlike
+# routers/homepage_sections.py's public_router/admin_router split, EVERY
+# product route lives under plain "/products" and is staff-gated by a
+# Depends(require_staff_role(...)) check instead of a URL namespace - see
+# create_product/update_product/delete_product above). Placed here, at
+# "/products/{product_id}/homepage-sections", to match how every other
+# product write endpoint in this file already works, rather than inventing
+# a one-off "/admin" prefix that would exist nowhere else in the API.
+@router.put("/{product_id}/homepage-sections", response_model=ProductRead)
+def sync_product_homepage_sections(
+    product_id: uuid.UUID,
+    sync: ProductHomepageSectionsSync,
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # De-duplicate up front - the request is "the full end result", same
+    # "caller states the end result" shape as HomepageSectionReorder, so a
+    # repeated id in the list isn't an error, just redundant.
+    requested_ids = set(sync.homepage_section_ids)
+
+    if requested_ids:
+        sections = db.query(HomepageSection).filter(HomepageSection.id.in_(requested_ids)).all()
+        found_ids = {section.id for section in sections}
+        missing_ids = requested_ids - found_ids
+        if missing_ids:
+            raise HTTPException(status_code=404, detail=f"Homepage section(s) not found: {sorted(str(i) for i in missing_ids)}")
+
+        invalid_sections = [
+            str(section.id) for section in sections if section.section_type != HomepageSectionType.CURATED or not section.is_enabled
+        ]
+        if invalid_sections:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Homepage section(s) are not enabled curated sections: {sorted(invalid_sections)}",
+            )
+
+    # Replace all - delete removed, insert new - same atomic "full sync,
+    # not incremental add/remove" semantics the doc asks for.
+    db.query(ProductHomepageSection).filter(ProductHomepageSection.product_id == product_id).delete()
+    for section_id in requested_ids:
+        db.add(ProductHomepageSection(product_id=product_id, homepage_section_id=section_id))
+    db.commit()
+    db.refresh(product)
+    return _build_product_read(product, db)
 
 
 # DELETE no longer removes the row - per the docs, products are

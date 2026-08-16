@@ -198,6 +198,14 @@ class ProductRead(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+    # Which CURATED homepage sections this product currently belongs to -
+    # assembled by routers/products.py's _build_product_read from
+    # ProductHomepageSection rows, same "not from_attributes, built
+    # explicitly" reasoning as images/is_discounted above (a raw Product row
+    # has no such attribute - it's a separate join table, no ORM
+    # relationship wiring in this project). Empty list, never omitted, when
+    # the product belongs to none.
+    homepage_section_ids: list[uuid.UUID] = []
 
 
 class VariantCreate(BaseModel):
@@ -822,6 +830,10 @@ class HomepageSectionCreate(BaseModel):
     # cross-field business rules live in the router, not the schema - see
     # e.g. products' on-sale/promotion check).
     category_id: uuid.UUID | None = None
+    # Required (and must be unique) when section_type=curated, ignored
+    # otherwise - same "only meaningful for one type" shape as category_id
+    # above, enforced in routers/homepage_sections.py for the same reason.
+    slug: str | None = Field(default=None, max_length=150)
     display_order: int = 0
     is_enabled: bool = True
     max_products: int | None = None
@@ -836,6 +848,7 @@ class HomepageSectionRead(BaseModel):
     description: str | None
     section_type: HomepageSectionType
     category_id: uuid.UUID | None
+    slug: str | None
     display_order: int
     is_enabled: bool
     max_products: int | None
@@ -859,3 +872,12 @@ class HomepageSectionReorder(BaseModel):
     # "caller states the end result" reasoning as the *StatusUpdate
     # schemas above (not a series of individual move-up/move-down calls).
     ordered_ids: list[uuid.UUID]
+
+
+class ProductHomepageSectionsSync(BaseModel):
+    # The full new set of curated-section memberships for ONE product -
+    # PUT /admin/products/{product_id}/homepage-sections (routers/products.py)
+    # replaces every existing membership with exactly this list (delete
+    # removed, insert new), same "caller states the end result" reasoning as
+    # HomepageSectionReorder above rather than incremental add/remove calls.
+    homepage_section_ids: list[uuid.UUID]

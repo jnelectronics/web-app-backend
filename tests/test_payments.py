@@ -45,7 +45,7 @@ def mock_pesapal(monkeypatch):
     # to FAILED for anything a test didn't explicitly set.
     status_responses = {}
 
-    def fake_submit_order_request(merchant_reference, amount, currency, description, billing_email, billing_phone, billing_first_name, billing_last_name):
+    def fake_submit_order_request(merchant_reference, amount, currency, description, billing_email, billing_phone, billing_first_name, billing_last_name, callback_url=None):
         return {
             "order_tracking_id": f"PESAPAL-{merchant_reference}",
             "redirect_url": f"https://cybqa.pesapal.com/pesapalv3/mock-checkout/{merchant_reference}",
