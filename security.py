@@ -196,3 +196,46 @@ def require_staff_role(*allowed_roles):
         return staff
 
     return check_role
+
+
+def get_current_customer_or_admin(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    # Like get_current_customer, but ALSO accepts a System Administrator
+    # staff token - admin is the one role with universal access everywhere
+    # (see require_staff_role's docstring above for why). Every other
+    # staff role is still rejected here, exactly like get_current_customer
+    # today - this isn't the broader "any staff" pattern some other routes
+    # use (e.g. orders.py's _resolve_order_actor), it's specifically for
+    # routes where only the resource's owner OR the super admin should get
+    # in, nobody else.
+    #
+    # Returns a tuple, (actor_type, actor), instead of just one account
+    # type, since the caller genuinely got one of two different kinds of
+    # row back: ("customer", Customer) or ("admin", StaffUser). The route
+    # itself decides what "admin" means for its own ownership check -
+    # usually "skip the owner check entirely".
+    invalid_token = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    claims = decode_token_claims(credentials.credentials)
+    if claims is None:
+        raise invalid_token
+
+    if claims.get("type") == "customer":
+        customer = db.get(Customer, uuid.UUID(claims["sub"]))
+        if customer is None:
+            raise invalid_token
+        return "customer", customer
+
+    if claims.get("type") == "staff":
+        staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
+        if staff is None or not staff.is_active or staff.role != StaffRole.SYSTEM_ADMINISTRATOR:
+            raise invalid_token
+        return "admin", staff
+
+    raise invalid_token

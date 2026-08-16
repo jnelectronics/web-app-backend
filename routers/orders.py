@@ -36,7 +36,13 @@ from pagination import build_pagination_meta
 from routers.cart import get_current_cart
 from routers.inventory import InsufficientInventoryError
 from schemas import CheckoutRequest, OrderAddressUpdate, OrderItemRead, OrderRead, OrderStatusHistoryRead, OrderStatusUpdate, PaginatedResponse
-from security import bearer_scheme, decode_token_claims, get_current_customer, require_staff_role
+from security import (
+    bearer_scheme,
+    decode_token_claims,
+    get_current_customer,
+    get_current_customer_or_admin,
+    require_staff_role,
+)
 
 router = APIRouter(prefix="/orders", tags=["orders"], route_class=EnvelopeRoute)
 
@@ -406,14 +412,21 @@ def list_all_orders_staff(
 @router.get("/{order_id}", response_model=OrderRead)
 def read_order(
     order_id: uuid.UUID,
-    current_customer=Depends(get_current_customer),
+    # get_current_customer_or_admin (security.py) accepts EITHER a
+    # customer JWT or a System Administrator staff JWT specifically - NOT
+    # the broader "any staff role" pattern this file's own status-history
+    # endpoint uses (_resolve_order_actor below). get_current_customer
+    # alone would reject a staff token before any role check even ran.
+    actor=Depends(get_current_customer_or_admin),
     db: Session = Depends(get_db),
 ):
+    actor_type, actor_account = actor
     order = db.get(Order, order_id)
     # Same 404 whether the order truly doesn't exist or just isn't the
     # caller's - confirming "it exists but isn't yours" would leak
-    # information a non-owner shouldn't get.
-    if order is None or order.customer_id != current_customer.id:
+    # information a non-owner shouldn't get. The admin actor skips this
+    # check entirely - that's the whole point of the bypass.
+    if order is None or (actor_type == "customer" and order.customer_id != actor_account.id):
         raise HTTPException(status_code=404, detail="Order not found")
     return _build_order_read(order, db)
 
@@ -422,11 +435,14 @@ def read_order(
 def update_order_address(
     order_id: uuid.UUID,
     update: OrderAddressUpdate,
-    current_customer=Depends(get_current_customer),
+    # Owning customer, or System Administrator specifically - see
+    # get_current_customer_or_admin's docstring in security.py.
+    actor=Depends(get_current_customer_or_admin),
     db: Session = Depends(get_db),
 ):
+    actor_type, actor_account = actor
     order = db.get(Order, order_id)
-    if order is None or order.customer_id != current_customer.id:
+    if order is None or (actor_type == "customer" and order.customer_id != actor_account.id):
         raise HTTPException(status_code=404, detail="Order not found")
 
     if order.status not in EDITABLE_STATUSES:
@@ -453,11 +469,14 @@ def update_order_address(
 @router.patch("/{order_id}/cancel", response_model=OrderRead)
 def cancel_order(
     order_id: uuid.UUID,
-    current_customer=Depends(get_current_customer),
+    # Owning customer, or System Administrator specifically - see
+    # get_current_customer_or_admin's docstring in security.py.
+    actor=Depends(get_current_customer_or_admin),
     db: Session = Depends(get_db),
 ):
+    actor_type, actor_account = actor
     order = db.get(Order, order_id)
-    if order is None or order.customer_id != current_customer.id:
+    if order is None or (actor_type == "customer" and order.customer_id != actor_account.id):
         raise HTTPException(status_code=404, detail="Order not found")
 
     if order.status not in EDITABLE_STATUSES:
@@ -482,15 +501,17 @@ def cancel_order(
             record.quantity_available += item.quantity
             # Closest fit among the docs' fixed movement_type set for "an
             # order was cancelled, its reserved stock is coming back" -
-            # staff_user_id=None since this endpoint is customer-initiated,
-            # not a staff action (see routers/orders.py's cancel_order auth).
+            # staff_user_id records the admin when THEY cancelled it on the
+            # customer's behalf, None when the customer cancelled their own
+            # order directly (matches every other audit-trail row in this
+            # project: the actor who actually did it, not left blank).
             db.add(
                 InventoryMovement(
                     inventory_record_id=record.id,
                     movement_type=MovementType.ADJUSTMENT,
                     quantity_changed=item.quantity,
                     reason="Order cancelled - stock restored",
-                    staff_user_id=None,
+                    staff_user_id=actor_account.id if actor_type == "admin" else None,
                     order_id=order.id,
                 )
             )
