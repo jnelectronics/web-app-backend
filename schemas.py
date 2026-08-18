@@ -722,14 +722,18 @@ class StaffUpdate(BaseModel):
 class StaffProfileUpdate(BaseModel):
     # Self-service counterpart to StaffUpdate above, for PATCH /staff/me -
     # deliberately only these two fields, unlike StaffUpdate's full set.
-    # There's no way to submit role/email/is_active through this schema at
-    # all (not even to reject them) - the exact same reasoning
-    # CustomerProfileUpdate already uses for a customer's own PATCH
-    # /customers/me. Both optional, for a partial update - but unlike
-    # CustomerProfileUpdate, the router treats phone_number's None
-    # specially: OMITTING it means "leave this alone", but explicitly
-    # sending null means "clear it" (frontend handoff doc, 2026-08-17 -
-    # "phone_number accepts null when cleared"). full_name can't be
+    # extra="forbid" (unlike CustomerProfileUpdate, which stays lenient)
+    # is what makes role/email/is_active a hard 422 instead of a silently
+    # ignored field - the frontend handoff doc (2026-08-17) explicitly
+    # requires role/email be REJECTED here, not just have no effect, so a
+    # client-side bug that accidentally sends its own `role` field along
+    # with a profile save fails loudly instead of quietly doing nothing.
+    model_config = ConfigDict(extra="forbid")
+
+    # Both optional, for a partial update - but phone_number's None is
+    # handled specially by the router: OMITTING the field means "leave
+    # this alone", but explicitly sending null means "clear it" (same
+    # doc - "phone_number accepts null when cleared"). full_name can't be
     # cleared this way since StaffUser.full_name is NOT NULL in the DB.
     full_name: str | None = None
     phone_number: str | None = None

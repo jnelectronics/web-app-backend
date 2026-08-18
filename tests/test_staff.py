@@ -118,18 +118,23 @@ def test_update_my_staff_profile_only_touches_name_and_phone(client, sales_atten
     assert response.status_code == 200
     assert unwrap(response)["phone_number"] is None
 
-    # role/email are silently ignored, not rejected outright, since
-    # StaffProfileUpdate doesn't even define those fields - the request
-    # still succeeds, but nothing about role/email changes.
+    # role/email are hard-rejected (422), not silently ignored -
+    # StaffProfileUpdate's extra="forbid" makes an unknown field a
+    # validation error instead of a no-op, per the frontend handoff doc.
     response = client.patch(
         "/api/v1/staff/me",
         json={"full_name": "Still Me", "role": "system_administrator", "email": "hijacked@example.com"},
         headers=_auth(token),
     )
-    assert response.status_code == 200
-    body = unwrap(response)
+    assert response.status_code == 422
+
+    # And the attempted escalation really did nothing - full_name from
+    # that rejected request never got applied either.
+    me_response = client.get("/api/v1/staff/me", headers=_auth(token))
+    body = unwrap(me_response)
     assert body["role"] == "sales_attendant"
     assert body["email"] != "hijacked@example.com"
+    assert body["full_name"] == "New Name"
 
 
 def test_new_staff_must_change_password_until_they_set_their_own(client, db, manager, mock_email):
