@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from envelope import EnvelopeRoute
 from jobs import notify_staff_payment_received, send_payment_confirmed_email
-from models import Customer, Order, Payment, PaymentStatus, StaffRole, StaffUser
+from models import Customer, Order, OrderStatus, Payment, PaymentStatus, StaffRole, StaffUser
 from pesapal_client import PesaPalError, get_transaction_status, is_configured, submit_order_request
 from schemas import PaymentInitiate, PaymentProvider, PaymentRead
 from security import decode_token_claims, require_staff_role
@@ -365,7 +365,7 @@ def read_payment(
 # (routers/orders.py's STATUS_ADVANCE_ROLES) - whoever's handling the
 # order at collection/delivery time is who'd actually be confirming cash
 # changed hands, not a separate permission concept.
-MARK_CASH_PAID_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER)
+MARK_CASH_PAID_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.OWNER)
 
 
 @router.patch("/payments/{payment_id}/mark-paid", response_model=PaymentRead)
@@ -524,6 +524,22 @@ def payment_webhook(
         # enqueued when there's an email to send to, same optional-email
         # reasoning as checkout()'s order confirmation job.
         order = db.get(Order, payment.order_id)
+
+        if order.status == OrderStatus.PENDING:
+            # Prepaid order: payment came back PAID before any staff member
+            # got a chance to manually confirm it - skip that step instead
+            # of leaving a paid order sitting in "pending" until someone
+            # notices. Deliberately NOT logged to order_status_history -
+            # that table's changed_by_staff_id is NOT NULL (see its own
+            # comment in models.py) because it only ever records
+            # STAFF-driven transitions through the one PATCH /status
+            # endpoint. This is a system-driven transition, same category
+            # as a customer's own self-service cancel, which already skips
+            # that table for the identical reason.
+            order.status = OrderStatus.CONFIRMED
+            db.commit()
+            logger.info("Order %s auto-confirmed on payment %s", order.id, payment.id)
+
         if order.guest_email:
             background_tasks.add_task(
                 send_payment_confirmed_email,

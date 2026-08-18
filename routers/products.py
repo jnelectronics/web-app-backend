@@ -322,7 +322,7 @@ def list_products(
 @router.post("", response_model=ProductRead)
 def create_product(
     product: ProductCreate,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Check the referenced category is real BEFORE inserting - otherwise
@@ -367,7 +367,7 @@ def create_product(
 def update_product(
     product_id: uuid.UUID,
     product: ProductCreate,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Product, product_id)
@@ -418,7 +418,7 @@ def update_product(
 def sync_product_homepage_sections(
     product_id: uuid.UUID,
     sync: ProductHomepageSectionsSync,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     product = db.get(Product, product_id)
@@ -461,7 +461,7 @@ def sync_product_homepage_sections(
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_product(
     product_id: uuid.UUID,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Product, product_id)
@@ -489,7 +489,7 @@ def delete_product(
 @router.patch("/{product_id}/reactivate", response_model=ProductRead)
 def reactivate_product(
     product_id: uuid.UUID,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Product, product_id)
@@ -522,7 +522,7 @@ def add_product_image(
     # hold the whole file in memory just to receive it.
     file: UploadFile = File(...),
     display_order: int = Form(0),
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     if db.get(Product, product_id) is None:
@@ -582,7 +582,7 @@ def replace_product_image(
     image_id: uuid.UUID,
     file: UploadFile = File(...),
     display_order: int = Form(0),
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = (
@@ -635,7 +635,7 @@ def replace_product_image(
 def delete_product_image(
     product_id: uuid.UUID,
     image_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # A real delete (not soft) - unlike products/categories/variants, an
@@ -667,7 +667,7 @@ def delete_product_image(
 def set_primary_product_image(
     product_id: uuid.UUID,
     image_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     target = (

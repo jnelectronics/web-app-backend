@@ -47,38 +47,33 @@ def test_summary_hides_revenue_from_sales_attendant(client, staff_tokens):
     assert "total_orders" in body
 
     response = client.get(
-        "/api/v1/admin/dashboard/summary", headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER])
+        "/api/v1/admin/dashboard/summary", headers=_auth(staff_tokens[StaffRole.OWNER])
     )
     assert response.status_code == 200
     assert unwrap(response)["total_revenue"] is not None
 
 
 def test_recent_orders_open_to_both_roles(client, staff_tokens):
-    for role in (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER):
+    for role in (StaffRole.SALES_ATTENDANT, StaffRole.OWNER):
         response = client.get("/api/v1/admin/dashboard/recent-orders", headers=_auth(staff_tokens[role]))
         assert response.status_code == 200
 
 
-def test_low_inventory_and_sales_summary_require_inventory_manager(client, staff_tokens):
-    response = client.get(
-        "/api/v1/admin/dashboard/low-inventory", headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT])
-    )
-    assert response.status_code == 403
+def test_low_inventory_and_sales_summary_allow_any_staff_role(client, staff_tokens):
+    # As of the 2026-08-18 RBAC widening, Sales Attendant gained access to
+    # every admin section except Staff and Audit Logs - these two
+    # endpoints are open to all three staff roles now.
+    for role in StaffRole:
+        response = client.get(
+            "/api/v1/admin/dashboard/low-inventory", headers=_auth(staff_tokens[role])
+        )
+        assert response.status_code == 200
 
-    response = client.get(
-        "/api/v1/admin/dashboard/low-inventory", headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER])
-    )
-    assert response.status_code == 200
-
-    response = client.get(
-        "/api/v1/admin/dashboard/sales-summary", headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT])
-    )
-    assert response.status_code == 403
-
-    response = client.get(
-        "/api/v1/admin/dashboard/sales-summary", headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER])
-    )
-    assert response.status_code == 200
-    body = unwrap(response)
-    assert "total_revenue" in body
-    assert "average_order_value" in body
+    for role in StaffRole:
+        response = client.get(
+            "/api/v1/admin/dashboard/sales-summary", headers=_auth(staff_tokens[role])
+        )
+        assert response.status_code == 200
+        body = unwrap(response)
+        assert "total_revenue" in body
+        assert "average_order_value" in body

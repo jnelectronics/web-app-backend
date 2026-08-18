@@ -125,7 +125,7 @@ def _validate_slug_for_section_type(
 @admin_router.patch("/reorder", response_model=list[HomepageSectionRead])
 def reorder_homepage_sections(
     reorder: HomepageSectionReorder,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Caller must state the full end result (front to back), same "not a
@@ -170,7 +170,7 @@ def list_public_homepage_sections(
 @admin_router.get("", response_model=list[HomepageSectionWithProducts])
 def list_admin_homepage_sections(
     include_products: bool = False,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     sections = db.query(HomepageSection).order_by(HomepageSection.display_order).all()
@@ -180,7 +180,7 @@ def list_admin_homepage_sections(
 @admin_router.post("", response_model=HomepageSectionRead)
 def create_homepage_section(
     section: HomepageSectionCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     category_id = _validate_category_for_section_type(db, section)
@@ -206,7 +206,7 @@ def create_homepage_section(
 def update_homepage_section(
     section_id: uuid.UUID,
     section: HomepageSectionCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(HomepageSection, section_id)
@@ -232,7 +232,7 @@ def update_homepage_section(
 @admin_router.delete("/{section_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_homepage_section(
     section_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # A REAL delete, not soft - unlike products/categories, a homepage

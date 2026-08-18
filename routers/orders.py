@@ -56,20 +56,25 @@ class InvalidStateTransitionError(Exception):
     pass
 
 
-# Mirrors the order_status lifecycle from the DB design doc §6.1 exactly:
-# pending -> confirmed -> packed -> out_for_delivery -> delivered, with
-# cancellation only possible from pending/confirmed. Delivered/cancelled
-# are terminal - no further transition is ever valid from either.
+# Mirrors the order_status lifecycle from the DB design doc §6.1:
+# pending -> confirmed -> packed -> out_for_delivery -> delivered.
+# CANCELLED is deliberately absent from every set here, even
+# pending/confirmed's - cancelling ALWAYS goes through
+# PATCH /orders/{id}/cancel instead (the only route that also restores
+# reserved inventory), never through this forward-progress endpoint. See
+# advance_order_status's explicit to_status==CANCELLED check below for
+# the friendlier error that points callers there. Delivered/cancelled are
+# terminal either way - no further transition is ever valid from either.
 VALID_STATUS_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
-    OrderStatus.PENDING: {OrderStatus.CONFIRMED, OrderStatus.CANCELLED},
-    OrderStatus.CONFIRMED: {OrderStatus.PACKED, OrderStatus.CANCELLED},
+    OrderStatus.PENDING: {OrderStatus.CONFIRMED},
+    OrderStatus.CONFIRMED: {OrderStatus.PACKED},
     OrderStatus.PACKED: {OrderStatus.OUT_FOR_DELIVERY},
     OrderStatus.OUT_FOR_DELIVERY: {OrderStatus.DELIVERED},
     OrderStatus.DELIVERED: set(),
     OrderStatus.CANCELLED: set(),
 }
 
-STATUS_ADVANCE_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER)
+STATUS_ADVANCE_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.OWNER)
 
 
 def _resolve_order_actor(
@@ -412,12 +417,14 @@ def list_all_orders_staff(
 @router.get("/{order_id}", response_model=OrderRead)
 def read_order(
     order_id: uuid.UUID,
-    # get_current_customer_or_admin (security.py) accepts EITHER a
-    # customer JWT or a System Administrator staff JWT specifically - NOT
-    # the broader "any staff role" pattern this file's own status-history
-    # endpoint uses (_resolve_order_actor below). get_current_customer
-    # alone would reject a staff token before any role check even ran.
-    actor=Depends(get_current_customer_or_admin),
+    # _resolve_order_actor (defined above) accepts EITHER a customer JWT
+    # or a staff JWT of ANY role - same "Owning Customer or Staff" rule
+    # this file's own status-history endpoint already uses. Widened from
+    # admin-only (which used get_current_customer_or_admin) to match:
+    # Sales Attendant/Owner need to load an order's detail to
+    # work status transitions on it, the same way they can already list
+    # every order (GET /orders/staff) and read its history.
+    actor=Depends(_resolve_order_actor),
     db: Session = Depends(get_db),
 ):
     actor_type, actor_account = actor
@@ -535,6 +542,15 @@ def advance_order_status(
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    # Cancelling never goes through this endpoint, regardless of the
+    # order's current status - a clearer, purpose-built message than the
+    # generic "invalid transition" one below, since this is a real caller
+    # mistake (wrong endpoint), not an out-of-order lifecycle attempt.
+    if update.to_status == OrderStatus.CANCELLED:
+        raise InvalidStateTransitionError(
+            "Cannot cancel an order through this endpoint - use PATCH /orders/{order_id}/cancel instead"
+        )
+
     if update.to_status not in VALID_STATUS_TRANSITIONS[order.status]:
         raise InvalidStateTransitionError(
             f"Cannot transition order from '{order.status.value}' to '{update.to_status.value}'"
@@ -578,9 +594,28 @@ def read_order_status_history(
     if order is None or (actor_type == "customer" and order.customer_id != actor_account.id):
         raise HTTPException(status_code=404, detail="Order not found")
 
-    return (
-        db.query(OrderStatusHistory)
+    # LEFT (outer) join, not an inner one - changed_by_staff_id is NOT NULL
+    # on this table today (see the model's own comment: only staff-driven
+    # transitions get logged here at all), but an outer join is what keeps
+    # this query correct even if that ever changes, rather than silently
+    # dropping a row whose staff account no longer joins cleanly.
+    rows = (
+        db.query(OrderStatusHistory, StaffUser.full_name)
+        .outerjoin(StaffUser, OrderStatusHistory.changed_by_staff_id == StaffUser.id)
         .filter(OrderStatusHistory.order_id == order.id)
         .order_by(OrderStatusHistory.created_at)
         .all()
     )
+    return [
+        OrderStatusHistoryRead(
+            id=history.id,
+            order_id=history.order_id,
+            from_status=history.from_status,
+            to_status=history.to_status,
+            changed_by_staff_id=history.changed_by_staff_id,
+            changed_by_staff_name=staff_name,
+            notes=history.notes,
+            created_at=history.created_at,
+        )
+        for history, staff_name in rows
+    ]

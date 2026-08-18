@@ -271,6 +271,56 @@ def notify_staff_payment_received(
     logger.info("Payment notification sent to %d/%d staff for order %s", sent_count, len(staff_emails), order_number)
 
 
+def send_staff_welcome_email(
+    email: str,
+    full_name: str,
+    temporary_password: str,
+    role: str,
+) -> None:
+    # Fires from routers/staff.py's create_staff, once a Owner/System
+    # Administrator successfully creates a new staff account (frontend
+    # handoff doc, 2026-08-18 - "Account created. An email with login
+    # details was sent to {email}."). temporary_password is the PLAINTEXT
+    # password the creator typed into the create-staff form - the only
+    # place in this codebase a raw password is ever handed to a job like
+    # this, since the whole point is the new hire needs to actually read
+    # it once, in this one email, before it's gone (only the hash is kept
+    # in the DB after this).
+    subject = "Your JN Electronics Staff Account"
+    body = (
+        f"Hi {full_name},\n\n"
+        "An account has been created for you on the JN Electronics admin dashboard.\n\n"
+        f"Login email: {email}\n"
+        f"Temporary password: {temporary_password}\n"
+        f"Role: {role}\n\n"
+        f"Log in here: {STAFF_DASHBOARD_URL}\n\n"
+        "You'll be asked to choose a new password the first time you sign in - "
+        "the temporary one above only works for that first login."
+    )
+    html = _template_env.get_template("staff_welcome.html").render(
+        full_name=full_name,
+        email=email,
+        temporary_password=temporary_password,
+        role=role,
+        login_url=STAFF_DASHBOARD_URL,
+    )
+
+    if not email_client.is_configured():
+        logger.info("Resend not configured - welcome email for new staff %s not sent", email)
+        return
+
+    try:
+        email_client.send_email(email, subject, body, html=html)
+    except email_client.EmailError:
+        # logger.exception, not .info - a new hire silently never
+        # receiving their login details is a real problem someone should
+        # see, not just an expected business outcome.
+        logger.exception("Failed to send welcome email to new staff %s", email)
+        return
+
+    logger.info("Welcome email sent to new staff %s", email)
+
+
 def send_payment_confirmed_email(
     email: str,
     full_name: str,

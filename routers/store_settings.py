@@ -38,7 +38,7 @@ def read_public_store_settings(db: Session = Depends(get_db)):
 
 @admin_router.get("", response_model=StoreSettingsRead)
 def read_admin_store_settings(
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     return _get_settings_row(db)
@@ -47,7 +47,7 @@ def read_admin_store_settings(
 @admin_router.put("", response_model=StoreSettingsRead)
 def update_store_settings(
     update: StoreSettingsUpdate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     settings = _get_settings_row(db)

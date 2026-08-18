@@ -20,7 +20,7 @@ from security import require_staff_role
 
 # Both roles allowed to just VIEW inventory, per the docs - only Inventory
 # Manager can create records or adjust quantities (see routes below).
-VIEW_INVENTORY_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER)
+VIEW_INVENTORY_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.OWNER)
 
 
 # A custom exception for the one inventory-specific business rule: stock can
@@ -123,10 +123,10 @@ def list_inventory_records(
 @router.post("", response_model=InventoryRead)
 def create_inventory_record(
     record: InventoryCreate,
-    # Not listed in the docs' endpoint table at all - Inventory Manager
-    # required as the safest reading, since it's clearly a stock-management
-    # action, same tier as the adjust endpoint below.
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    # Not listed in the docs' endpoint table at all - Owner (and, since the
+    # 2026-08-18 RBAC widening, Sales Attendant too) required, same tier as
+    # the adjust endpoint below.
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     if db.get(ProductVariant, record.variant_id) is None:
@@ -176,7 +176,7 @@ def create_inventory_record(
 def adjust_inventory_quantity(
     inventory_id: uuid.UUID,
     adjustment: InventoryAdjust,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     record = db.get(InventoryRecord, inventory_id)

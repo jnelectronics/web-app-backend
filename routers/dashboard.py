@@ -9,21 +9,30 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Customer, InventoryRecord, Order, OrderStatus, StaffRole, StaffUser
+from models import Customer, InventoryRecord, Order, OrderStatus, Payment, PaymentStatus, StaffRole, StaffUser
 from routers.orders import _build_order_read
 from schemas import DashboardSummary, InventoryRead, OrderRead, SalesSummary
 from security import require_staff_role
 
 router = APIRouter(prefix="/admin/dashboard", tags=["dashboard"], route_class=EnvelopeRoute)
 
-VIEW_SUMMARY_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER)
+VIEW_SUMMARY_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.OWNER)
 
 
 def _total_revenue(db: Session) -> float:
-    # Cancelled orders never happened financially - excluded from every
-    # revenue figure on this dashboard.
+    # "Revenue" means money actually received, not money invoiced - an
+    # order sitting unpaid (or one whose only payment attempt FAILED)
+    # hasn't earned anything yet, even though it's a real, non-cancelled
+    # order. So this only sums orders that have at least one PAID payment
+    # row, found via a subquery of order_ids from the payments table.
+    # Cancelled orders are excluded too, mostly as a belt-and-braces check -
+    # in practice a cancelled order should never have a PAID payment
+    # anyway, but there's no DB constraint enforcing that today.
+    paid_order_ids = db.query(Payment.order_id).filter(Payment.status == PaymentStatus.PAID)
     total = (
-        db.query(func.sum(Order.total)).filter(Order.status != OrderStatus.CANCELLED).scalar()
+        db.query(func.sum(Order.total))
+        .filter(Order.status != OrderStatus.CANCELLED, Order.id.in_(paid_order_ids))
+        .scalar()
     )
     return float(total or 0)
 
@@ -37,11 +46,14 @@ def read_dashboard_summary(
     pending_orders = db.query(Order).filter(Order.status == OrderStatus.PENDING).count()
     total_customers = db.query(Customer).count()
 
-    # System Administrator sees everything Inventory Manager sees here too -
-    # it's a true superset role (see security.py's require_staff_role),
-    # not just another name that has to be listed explicitly.
+    # System Administrator sees everything Owner sees here too - it's a
+    # true superset role (see security.py's require_staff_role), not just
+    # another name that has to be listed explicitly. Revenue visibility
+    # stays narrower than the rest of the RBAC widening below (FR-ADMIN-003,
+    # unaffected by the 2026-08-18 Sales Attendant access expansion) -
+    # Sales Attendant is deliberately still excluded here.
     can_see_revenue = current_staff.role in (
-        StaffRole.INVENTORY_MANAGER,
+        StaffRole.OWNER,
         StaffRole.SYSTEM_ADMINISTRATOR,
     )
     return DashboardSummary(
@@ -65,7 +77,7 @@ def read_recent_orders(
 @router.get("/low-inventory", response_model=list[InventoryRead])
 def read_low_inventory(
     threshold: int = 10,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     return (
@@ -78,7 +90,7 @@ def read_low_inventory(
 
 @router.get("/sales-summary", response_model=SalesSummary)
 def read_sales_summary(
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     total_orders = db.query(Order).filter(Order.status != OrderStatus.CANCELLED).count()

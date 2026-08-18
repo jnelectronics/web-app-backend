@@ -17,7 +17,7 @@ def manager(db):
         full_name="Staff Test Manager",
         email=f"staffmgr-{uuid.uuid4().hex[:8]}@example.com",
         password_hash=hash_password("Password123"),
-        role=StaffRole.INVENTORY_MANAGER,
+        role=StaffRole.OWNER,
     )
     db.add(staff)
     db.commit()
@@ -94,5 +94,106 @@ def test_admin_reset_staff_password(client, db, manager, sales_attendant):
     # delete those StaffUser rows (see CLAUDE.md's LIFO fixture-teardown
     # gotcha - the fixtures' own teardown can't defend against a reference
     # THIS test created).
+    db.query(AuditLog).filter(AuditLog.resource_id == sales_attendant.id).delete()
+    db.commit()
+
+
+def test_update_my_staff_profile_only_touches_name_and_phone(client, sales_attendant):
+    token = create_access_token(subject=str(sales_attendant.id), account_type="staff")
+
+    response = client.patch(
+        "/api/v1/staff/me",
+        json={"full_name": "New Name", "phone_number": "+256700000099"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 200
+    body = unwrap(response)
+    assert body["full_name"] == "New Name"
+    assert body["phone_number"] == "+256700000099"
+    # Untouched - role/email aren't even accepted fields on this schema.
+    assert body["role"] == "sales_attendant"
+
+    # phone_number can be explicitly cleared back to null.
+    response = client.patch("/api/v1/staff/me", json={"phone_number": None}, headers=_auth(token))
+    assert response.status_code == 200
+    assert unwrap(response)["phone_number"] is None
+
+    # role/email are silently ignored, not rejected outright, since
+    # StaffProfileUpdate doesn't even define those fields - the request
+    # still succeeds, but nothing about role/email changes.
+    response = client.patch(
+        "/api/v1/staff/me",
+        json={"full_name": "Still Me", "role": "system_administrator", "email": "hijacked@example.com"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 200
+    body = unwrap(response)
+    assert body["role"] == "sales_attendant"
+    assert body["email"] != "hijacked@example.com"
+
+
+def test_new_staff_must_change_password_until_they_set_their_own(client, db, manager, mock_email):
+    manager_token = create_access_token(subject=str(manager.id), account_type="staff")
+    email = f"newhire-{uuid.uuid4().hex[:8]}@example.com"
+    response = client.post(
+        "/api/v1/staff",
+        json={
+            "full_name": "New Hire",
+            "email": email,
+            "password": "TempPass123",
+            "role": "sales_attendant",
+        },
+        headers=_auth(manager_token),
+    )
+    assert response.status_code == 200
+    new_staff = unwrap(response)
+    assert new_staff["must_change_password"] is True
+
+    # A real (mocked) welcome email went out with the temporary password.
+    assert len(mock_email) == 1
+    assert mock_email[0]["to_email"] == email
+    assert "TempPass123" in mock_email[0]["body"]
+
+    login_response = client.post(
+        "/api/v1/auth/staff/login", json={"email": email, "password": "TempPass123"}
+    )
+    assert login_response.status_code == 200
+    token = unwrap(login_response)["access_token"]
+
+    me_response = client.get("/api/v1/staff/me", headers=_auth(token))
+    assert unwrap(me_response)["must_change_password"] is True
+
+    # Setting a real password clears the flag.
+    change_response = client.patch(
+        "/api/v1/staff/me/password",
+        json={"current_password": "TempPass123", "new_password": "RealPassword123"},
+        headers=_auth(token),
+    )
+    assert change_response.status_code == 200
+
+    me_response = client.get("/api/v1/staff/me", headers=_auth(token))
+    assert unwrap(me_response)["must_change_password"] is False
+
+    db.query(AuditLog).filter(AuditLog.resource_id == uuid.UUID(new_staff["id"])).delete()
+    db.commit()
+    db.query(StaffUser).filter(StaffUser.id == uuid.UUID(new_staff["id"])).delete()
+    db.commit()
+
+
+def test_reset_staff_password_sets_must_change_password(client, db, manager, sales_attendant):
+    manager_token = create_access_token(subject=str(manager.id), account_type="staff")
+
+    # sales_attendant fixture starts with must_change_password=False
+    # (created directly in the DB, not through POST /staff).
+    assert sales_attendant.must_change_password is False
+
+    response = client.post(
+        f"/api/v1/staff/{sales_attendant.id}/reset-password", headers=_auth(manager_token)
+    )
+    assert response.status_code == 200
+
+    db.refresh(sales_attendant)
+    assert sales_attendant.must_change_password is True
+
     db.query(AuditLog).filter(AuditLog.resource_id == sales_attendant.id).delete()
     db.commit()

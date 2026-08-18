@@ -173,8 +173,8 @@ def get_current_staff(
 def require_staff_role(*allowed_roles):
     # A dependency FACTORY, not a dependency itself - calling it with
     # specific roles returns a dependency function tailored to that route.
-    # e.g. Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)) only
-    # lets Inventory Managers through; anyone else gets a 403.
+    # e.g. Depends(require_staff_role(StaffRole.OWNER)) only lets Owners
+    # through; anyone else gets a 403.
     #
     # System Administrator is a deliberate exception to that per-route list:
     # by product decision, admin is a true superset role that can reach

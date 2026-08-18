@@ -50,12 +50,12 @@ def test_register_accepts_a_strong_password(client, db):
 
 
 @pytest.fixture
-def inventory_manager_token(db):
+def owner_token(db):
     staff = StaffUser(
         full_name="Password Rule Manager",
         email=f"pwrule-{uuid.uuid4().hex[:8]}@example.com",
         password_hash=hash_password("Password123"),
-        role=StaffRole.INVENTORY_MANAGER,
+        role=StaffRole.OWNER,
     )
     db.add(staff)
     db.commit()
@@ -66,7 +66,7 @@ def inventory_manager_token(db):
     db.commit()
 
 
-def test_staff_create_rejects_weak_password(client, inventory_manager_token):
+def test_staff_create_rejects_weak_password(client, owner_token):
     response = client.post(
         "/api/v1/staff",
         json={
@@ -75,7 +75,7 @@ def test_staff_create_rejects_weak_password(client, inventory_manager_token):
             "password": "weak",
             "role": "sales_attendant",
         },
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 422
 

@@ -130,11 +130,11 @@ def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_advance_status_requires_sales_attendant_or_inventory_manager(client, order_setup, staff_tokens):
+def test_advance_status_requires_sales_attendant_or_owner(client, order_setup, staff_tokens):
     order = order_setup["order"]
 
     # System Administrator isn't listed for this endpoint (docs: Sales
-    # Attendant, Inventory Manager only) but is a superset role, so it
+    # Attendant, Owner only) but is a superset role, so it
     # still gets through - pending -> confirmed.
     response = client.patch(
         f"/api/v1/orders/{order.id}/status",
@@ -161,7 +161,7 @@ def test_invalid_transition_is_rejected(client, order_setup, staff_tokens):
     response = client.patch(
         f"/api/v1/orders/{order.id}/status",
         json={"to_status": "delivered"},
-        headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER]),
+        headers=_auth(staff_tokens[StaffRole.OWNER]),
     )
     assert response.status_code == 409
     assert response.json()["error_code"] == "INVALID_STATE_TRANSITION"
@@ -174,7 +174,7 @@ def test_status_history_visible_to_owner_and_staff_not_others(client, order_setu
     client.patch(
         f"/api/v1/orders/{order.id}/status",
         json={"to_status": "confirmed", "notes": "Stock verified"},
-        headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER]),
+        headers=_auth(staff_tokens[StaffRole.OWNER]),
     )
 
     response = client.get(f"/api/v1/orders/{order.id}/status-history", headers=_auth(tokens["owner"]))

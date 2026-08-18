@@ -111,7 +111,7 @@ def list_category_groups(
     staff = db.get(StaffUser, uuid.UUID(claims["sub"]))
     if staff is None or not staff.is_active:
         raise invalid_token
-    if staff.role not in (StaffRole.INVENTORY_MANAGER, StaffRole.SYSTEM_ADMINISTRATOR):
+    if staff.role not in (StaffRole.OWNER, StaffRole.SALES_ATTENDANT, StaffRole.SYSTEM_ADMINISTRATOR):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
 
     groups = db.query(CategoryGroup).order_by(CategoryGroup.display_order).all()
@@ -129,7 +129,7 @@ def read_category_group(group_id: uuid.UUID, db: Session = Depends(get_db)):
 @group_router.post("", response_model=CategoryGroupRead)
 def create_category_group(
     group: CategoryGroupCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     _assert_header_rank_free(db, group.header_rank)
@@ -149,7 +149,7 @@ def create_category_group(
 def update_category_group(
     group_id: uuid.UUID,
     group: CategoryGroupCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(CategoryGroup, group_id)
@@ -170,7 +170,7 @@ def update_category_group(
 def set_category_group_status(
     group_id: uuid.UUID,
     update: CategoryGroupStatusUpdate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Sets rather than toggles - same reasoning as routers/staff.py's
@@ -188,7 +188,7 @@ def set_category_group_status(
 @group_router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_category_group(
     group_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # A REAL delete, not soft - unlike Category/Product below. Only allowed
@@ -235,7 +235,7 @@ def list_categories(
 @router.post("", response_model=CategoryRead)
 def create_category(
     category: CategoryCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     if db.get(CategoryGroup, category.category_group_id) is None:
@@ -256,7 +256,7 @@ def create_category(
 def update_category(
     category_id: uuid.UUID,
     category: CategoryCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Category, category_id)
@@ -278,7 +278,7 @@ def update_category(
 @router.delete("/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_category(
     category_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Category, category_id)

@@ -85,7 +85,7 @@ def list_active_banners(
     # System Administrator bypasses this check the same way it bypasses
     # require_staff_role() in security.py - it's a true superset role,
     # not just another name on this specific allow-list.
-    if staff.role not in (StaffRole.INVENTORY_MANAGER, StaffRole.SYSTEM_ADMINISTRATOR):
+    if staff.role not in (StaffRole.OWNER, StaffRole.SALES_ATTENDANT, StaffRole.SYSTEM_ADMINISTRATOR):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
 
     return db.query(Banner).order_by(Banner.display_order).all()
@@ -94,7 +94,7 @@ def list_active_banners(
 @banner_router.post("", response_model=BannerRead)
 def create_banner(
     banner: BannerCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     new_banner = Banner(
@@ -114,7 +114,7 @@ def create_banner(
 def update_banner(
     banner_id: uuid.UUID,
     banner: BannerCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Banner, banner_id)
@@ -135,7 +135,7 @@ def update_banner(
 def set_banner_status(
     banner_id: uuid.UUID,
     update: BannerStatusUpdate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Sets rather than toggles - see routers/staff.py's set_staff_status
@@ -173,7 +173,7 @@ def list_product_discounts(product_id: uuid.UUID, db: Session = Depends(get_db))
 def create_product_discount(
     product_id: uuid.UUID,
     discount: ProductDiscountCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     if db.get(Product, product_id) is None:
@@ -197,7 +197,7 @@ def update_product_discount(
     product_id: uuid.UUID,
     discount_id: uuid.UUID,
     discount: ProductDiscountCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = (
@@ -222,7 +222,7 @@ def set_product_discount_status(
     product_id: uuid.UUID,
     discount_id: uuid.UUID,
     update: ProductDiscountStatusUpdate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Sets rather than toggles - see routers/staff.py's set_staff_status
@@ -245,7 +245,7 @@ def set_product_discount_status(
 def apply_promotion_to_product(
     product_id: uuid.UUID,
     request: ApplyPromotionRequest,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Imported here (not at module level) to avoid a circular import -
@@ -314,7 +314,7 @@ def apply_promotion_to_product(
 @discount_router.delete("/{product_id}/apply-promotion", response_model=ProductRead)
 def clear_promotion_from_product(
     product_id: uuid.UUID,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     from routers.products import _build_product_read
@@ -359,7 +359,7 @@ def clear_promotion_from_product(
 
 @promotion_router.get("", response_model=list[PromotionRead])
 def list_promotions(
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # No public view at all - unlike banners, the promotion library is
@@ -372,7 +372,7 @@ def list_promotions(
 @promotion_router.get("/{promotion_id}", response_model=PromotionRead)
 def read_promotion(
     promotion_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     promotion = db.get(Promotion, promotion_id)
@@ -384,7 +384,7 @@ def read_promotion(
 @promotion_router.post("", response_model=PromotionRead)
 def create_promotion(
     promotion: PromotionCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     new_promotion = Promotion(
@@ -404,7 +404,7 @@ def create_promotion(
 def update_promotion(
     promotion_id: uuid.UUID,
     promotion: PromotionCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Promotion, promotion_id)
@@ -425,7 +425,7 @@ def update_promotion(
 def set_promotion_status(
     promotion_id: uuid.UUID,
     update: PromotionStatusUpdate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Sets rather than toggles - see routers/staff.py's set_staff_status

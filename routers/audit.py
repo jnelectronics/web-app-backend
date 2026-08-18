@@ -21,7 +21,7 @@ router = APIRouter(prefix="/audit-logs", tags=["audit"], route_class=EnvelopeRou
 # A different pair than most staff-gated endpoints in this project - System
 # Administrator IS included here (unlike inventory/catalog), Sales
 # Attendant is NOT. Matches the docs' table for this endpoint exactly.
-READ_AUDIT_ROLES = (StaffRole.INVENTORY_MANAGER, StaffRole.SYSTEM_ADMINISTRATOR)
+READ_AUDIT_ROLES = (StaffRole.OWNER, StaffRole.SYSTEM_ADMINISTRATOR)
 
 
 @router.get("", response_model=PaginatedResponse[AuditLogRead])

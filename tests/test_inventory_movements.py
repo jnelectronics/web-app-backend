@@ -88,7 +88,7 @@ def variant_and_branch(db):
 
 def test_creating_record_with_stock_logs_stock_in(client, db, variant_and_branch, staff_tokens):
     variant, branch = variant_and_branch
-    headers = _auth(staff_tokens[StaffRole.INVENTORY_MANAGER])
+    headers = _auth(staff_tokens[StaffRole.OWNER])
 
     response = client.post(
         "/api/v1/inventory",
@@ -116,7 +116,7 @@ def test_adjust_logs_custom_movement_type_and_reason(client, db, variant_and_bra
     record = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
     db.add(record)
     db.commit()
-    headers = _auth(staff_tokens[StaffRole.INVENTORY_MANAGER])
+    headers = _auth(staff_tokens[StaffRole.OWNER])
 
     response = client.patch(
         f"/api/v1/inventory/{record.id}/adjust",
@@ -178,7 +178,7 @@ def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, variant_
     assert checkout_response.status_code == 200
     order = unwrap(checkout_response)
 
-    staff_headers = _auth(staff_tokens[StaffRole.INVENTORY_MANAGER])
+    staff_headers = _auth(staff_tokens[StaffRole.OWNER])
     response = client.get(f"/api/v1/inventory/{record.id}/movements", headers=staff_headers)
     movements = unwrap(response)["items"]
     assert any(m["movement_type"] == "sold" and m["quantity_changed"] == -2 for m in movements)

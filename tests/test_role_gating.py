@@ -1,10 +1,15 @@
-# Verifies the Inventory Manager / Sales Attendant role gates just added to
-# categories, products, variants, branches, and inventory - the "existing
-# catalog/branches/inventory endpoints are wide open" gap called out in
-# CLAUDE.md's "Current status" section. Only covers categories + branches +
-# inventory directly (products/variants use the exact same
-# require_staff_role(StaffRole.INVENTORY_MANAGER) pattern, already proven
-# here) to avoid five near-identical copies of the same test.
+# Verifies the staff role gates on categories, products, variants,
+# branches, and inventory. Only covers categories + branches + inventory
+# directly (products/variants use the exact same require_staff_role(...)
+# pattern, already proven here) to avoid five near-identical copies of the
+# same test.
+#
+# As of the 2026-08-18 RBAC widening, Sales Attendant gained access to
+# every admin section except Staff and Audit Logs - so for these three
+# endpoints specifically, all three staff roles now pass (Owner and Sales
+# Attendant are both explicitly listed; System Administrator is always a
+# superset, per security.py's require_staff_role). There's no "wrong
+# role" left to prove 403 for here - only "no token at all" still is.
 
 import uuid
 
@@ -47,7 +52,7 @@ def staff_tokens(db):
     }
     yield tokens
 
-    # Adjusting inventory (test_inventory_adjust_requires_inventory_manager)
+    # Adjusting inventory (test_inventory_adjust_allows_any_staff_role)
     # now also writes an audit_logs row - must go before deleting the staff
     # it's attributed to.
     staff_ids = [s.id for s in created.values()]
@@ -67,7 +72,7 @@ def test_category_read_stays_public(client):
     assert response.status_code == 200
 
 
-def test_category_write_requires_inventory_manager(client, staff_tokens, db):
+def test_category_write_allows_any_staff_role(client, staff_tokens, db):
     group_id = str(uncategorized_group_id(db))
 
     # No token at all - HTTPBearer itself rejects this before our role
@@ -77,36 +82,18 @@ def test_category_write_requires_inventory_manager(client, staff_tokens, db):
     )
     assert response.status_code in (401, 403)
 
-    # Wrong role
-    response = client.post(
-        "/api/v1/categories",
-        json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id},
-        headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT]),
-    )
-    assert response.status_code == 403
-
-    # System Administrator IS an implicit superset (product decision,
-    # 2026-08-08 - overrides the spec's literal per-endpoint role table,
-    # see security.py's require_staff_role) - gets through even though
-    # this endpoint's own allow-list only names Inventory Manager.
-    response = client.post(
-        "/api/v1/categories",
-        json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id},
-        headers=_auth(staff_tokens[StaffRole.SYSTEM_ADMINISTRATOR]),
-    )
-    assert response.status_code == 200
-    db.query(Category).filter(Category.id == uuid.UUID(unwrap(response)["id"])).delete()
-    db.commit()
-
-    # Right role
-    response = client.post(
-        "/api/v1/categories",
-        json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id},
-        headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER]),
-    )
-    assert response.status_code == 200
-    db.query(Category).filter(Category.id == uuid.UUID(unwrap(response)["id"])).delete()
-    db.commit()
+    # Every staff role reaches this now - Owner and Sales Attendant are
+    # both explicitly listed, System Administrator gets through as the
+    # usual superset role.
+    for role in StaffRole:
+        response = client.post(
+            "/api/v1/categories",
+            json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id},
+            headers=_auth(staff_tokens[role]),
+        )
+        assert response.status_code == 200
+        db.query(Category).filter(Category.id == uuid.UUID(unwrap(response)["id"])).delete()
+        db.commit()
 
 
 def test_branch_read_requires_any_staff_role(client, staff_tokens):
@@ -120,22 +107,16 @@ def test_branch_read_requires_any_staff_role(client, staff_tokens):
         assert response.status_code == 200
 
 
-def test_branch_write_requires_inventory_manager(client, staff_tokens, db):
-    response = client.post(
-        "/api/v1/branches",
-        json={"name": "Test Branch", "address": "123 Test Street"},
-        headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT]),
-    )
-    assert response.status_code == 403
-
-    response = client.post(
-        "/api/v1/branches",
-        json={"name": "Test Branch", "address": "123 Test Street"},
-        headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER]),
-    )
-    assert response.status_code == 200
-    db.query(Branch).filter(Branch.id == uuid.UUID(unwrap(response)["id"])).delete()
-    db.commit()
+def test_branch_write_allows_any_staff_role(client, staff_tokens, db):
+    for role in StaffRole:
+        response = client.post(
+            "/api/v1/branches",
+            json={"name": f"Test Branch {uuid.uuid4().hex[:8]}", "address": "123 Test Street"},
+            headers=_auth(staff_tokens[role]),
+        )
+        assert response.status_code == 200
+        db.query(Branch).filter(Branch.id == uuid.UUID(unwrap(response)["id"])).delete()
+        db.commit()
 
 
 @pytest.fixture
@@ -158,7 +139,7 @@ def inventory_record(db):
 
     yield record
 
-    # Adjusting inventory (test_inventory_adjust_requires_inventory_manager)
+    # Adjusting inventory (test_inventory_adjust_allows_any_staff_role)
     # now also writes an inventory_movements row referencing this record -
     # must go first, or deleting the record below hits a foreign key
     # violation.
@@ -176,10 +157,10 @@ def inventory_record(db):
     db.commit()
 
 
-def test_inventory_view_allows_sales_attendant_and_inventory_manager(
+def test_inventory_view_allows_sales_attendant_and_owner(
     client, staff_tokens, inventory_record
 ):
-    for role in (StaffRole.SALES_ATTENDANT, StaffRole.INVENTORY_MANAGER):
+    for role in (StaffRole.SALES_ATTENDANT, StaffRole.OWNER):
         response = client.get(
             f"/api/v1/inventory/{inventory_record.id}", headers=_auth(staff_tokens[role])
         )
@@ -194,17 +175,11 @@ def test_inventory_view_allows_sales_attendant_and_inventory_manager(
     assert response.status_code == 200
 
 
-def test_inventory_adjust_requires_inventory_manager(client, staff_tokens, inventory_record):
-    response = client.patch(
-        f"/api/v1/inventory/{inventory_record.id}/adjust",
-        json={"quantity_change": 1},
-        headers=_auth(staff_tokens[StaffRole.SALES_ATTENDANT]),
-    )
-    assert response.status_code == 403
-
-    response = client.patch(
-        f"/api/v1/inventory/{inventory_record.id}/adjust",
-        json={"quantity_change": 1},
-        headers=_auth(staff_tokens[StaffRole.INVENTORY_MANAGER]),
-    )
-    assert response.status_code == 200
+def test_inventory_adjust_allows_any_staff_role(client, staff_tokens, inventory_record):
+    for role in StaffRole:
+        response = client.patch(
+            f"/api/v1/inventory/{inventory_record.id}/adjust",
+            json={"quantity_change": 1},
+            headers=_auth(staff_tokens[role]),
+        )
+        assert response.status_code == 200

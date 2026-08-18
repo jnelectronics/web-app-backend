@@ -341,8 +341,46 @@ class CustomerProfileUpdate(BaseModel):
 class CustomerStatusUpdate(BaseModel):
     # Sets status to exactly this value - same "not a toggle" reasoning as
     # StaffStatusUpdate above, using this resource's own enum rather than
-    # a plain bool since that's what Customer.status actually is.
+    # a plain bool since that's what Customer.status actually is. Reused
+    # by BOTH the staff-only PATCH /customers/{id}/status below AND the
+    # customer's own self-service PATCH /customers/me/status - the router
+    # is what restricts the self-service route to only ever accepting
+    # "inactive", not this schema.
     status: CustomerStatus
+
+
+class CustomerAddressCreate(BaseModel):
+    label: str
+    recipient_name: str
+    phone_number: str
+    address_line: str
+    # Defaults to False, not required on every request - most saves won't
+    # be marking a NEW address as the default one.
+    is_default: bool = False
+
+
+class CustomerAddressUpdate(BaseModel):
+    # Every field optional, for a partial update (PATCH) - matches
+    # CustomerProfileUpdate/StaffProfileUpdate's "None means leave this
+    # alone" convention above.
+    label: str | None = None
+    recipient_name: str | None = None
+    phone_number: str | None = None
+    address_line: str | None = None
+    is_default: bool | None = None
+
+
+class CustomerAddressRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    label: str
+    recipient_name: str
+    phone_number: str
+    address_line: str
+    is_default: bool
+    created_at: datetime
+    updated_at: datetime
 
 
 class CustomerPasswordChange(BaseModel):
@@ -570,6 +608,11 @@ class OrderStatusHistoryRead(BaseModel):
     from_status: str | None
     to_status: str
     changed_by_staff_id: uuid.UUID
+    # Not on the OrderStatusHistory model itself (that table only stores
+    # the id, per its own FK) - the router joins StaffUser to fill this in
+    # so the frontend can show "Changed by Jane Okello" without an N+1
+    # GET /staff call per history row.
+    changed_by_staff_name: str | None
     notes: str | None
     created_at: datetime
 
@@ -595,6 +638,12 @@ class StaffRead(BaseModel):
     phone_number: str | None
     role: StaffRole
     is_active: bool
+    # True until this staff member sets their own password (via
+    # PATCH /staff/me/password) for the first time after being created or
+    # having their password reset - see StaffUser.must_change_password in
+    # models.py. The frontend redirects to a forced "choose a new
+    # password" page whenever this is true.
+    must_change_password: bool
     created_at: datetime
     updated_at: datetime
 
@@ -668,6 +717,22 @@ class StaffUpdate(BaseModel):
     email: str
     phone_number: str | None = None
     role: StaffRole
+
+
+class StaffProfileUpdate(BaseModel):
+    # Self-service counterpart to StaffUpdate above, for PATCH /staff/me -
+    # deliberately only these two fields, unlike StaffUpdate's full set.
+    # There's no way to submit role/email/is_active through this schema at
+    # all (not even to reject them) - the exact same reasoning
+    # CustomerProfileUpdate already uses for a customer's own PATCH
+    # /customers/me. Both optional, for a partial update - but unlike
+    # CustomerProfileUpdate, the router treats phone_number's None
+    # specially: OMITTING it means "leave this alone", but explicitly
+    # sending null means "clear it" (frontend handoff doc, 2026-08-17 -
+    # "phone_number accepts null when cleared"). full_name can't be
+    # cleared this way since StaffUser.full_name is NOT NULL in the DB.
+    full_name: str | None = None
+    phone_number: str | None = None
 
 
 class PaymentProvider(str, enum.Enum):

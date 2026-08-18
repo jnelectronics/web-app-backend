@@ -13,12 +13,12 @@ from security import create_access_token, hash_password
 
 
 @pytest.fixture
-def inventory_manager_token(db):
+def owner_token(db):
     staff = StaffUser(
         full_name="Promo Manager",
         email=f"promomgr-{uuid.uuid4().hex[:8]}@example.com",
         password_hash=hash_password("Password123"),
-        role=StaffRole.INVENTORY_MANAGER,
+        role=StaffRole.OWNER,
     )
     db.add(staff)
     db.commit()
@@ -68,7 +68,7 @@ def test_public_banner_list_only_shows_currently_live_ones(client, scheduled_ban
     assert titles == {"Live Banner"}
 
 
-def test_banner_write_requires_inventory_manager(client, inventory_manager_token, db):
+def test_banner_write_requires_owner(client, owner_token, db):
     response = client.post(
         "/api/v1/banners", json={"title": "New Banner", "image_url": "https://example.com/new.png"}
     )
@@ -77,7 +77,7 @@ def test_banner_write_requires_inventory_manager(client, inventory_manager_token
     response = client.post(
         "/api/v1/banners",
         json={"title": "New Banner", "image_url": "https://example.com/new.png"},
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     banner = unwrap(response)
@@ -86,7 +86,7 @@ def test_banner_write_requires_inventory_manager(client, inventory_manager_token
     response = client.patch(
         f"/api/v1/banners/{banner['id']}/status",
         json={"is_active": False},
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     assert unwrap(response)["is_active"] is False
@@ -95,7 +95,7 @@ def test_banner_write_requires_inventory_manager(client, inventory_manager_token
     response = client.patch(
         f"/api/v1/banners/{banner['id']}/status",
         json={"is_active": False},
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     assert unwrap(response)["is_active"] is False
@@ -104,7 +104,7 @@ def test_banner_write_requires_inventory_manager(client, inventory_manager_token
     response = client.get("/api/v1/banners")
     assert banner["id"] not in {b["id"] for b in unwrap(response)}
     # ...but visible to staff via include_inactive=true
-    response = client.get("/api/v1/banners?include_inactive=true", headers=_auth(inventory_manager_token))
+    response = client.get("/api/v1/banners?include_inactive=true", headers=_auth(owner_token))
     assert banner["id"] in {b["id"] for b in unwrap(response)}
     # A non-staff request for include_inactive is rejected, not silently
     # downgraded to the public view
@@ -134,11 +134,11 @@ def product(db):
     db.commit()
 
 
-def test_product_discount_lifecycle(client, product, inventory_manager_token):
+def test_product_discount_lifecycle(client, product, owner_token):
     response = client.post(
         f"/api/v1/products/{product.id}/discounts",
         json={"discount_type": "percentage", "discount_value": 15},
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     discount = unwrap(response)
@@ -147,7 +147,7 @@ def test_product_discount_lifecycle(client, product, inventory_manager_token):
     response = client.put(
         f"/api/v1/products/{product.id}/discounts/{discount['id']}",
         json={"discount_type": "fixed_amount", "discount_value": 5000},
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     assert unwrap(response)["discount_type"] == "fixed_amount"
@@ -161,7 +161,7 @@ def test_product_discount_lifecycle(client, product, inventory_manager_token):
     response = client.patch(
         f"/api/v1/products/{product.id}/discounts/{discount['id']}/status",
         json={"is_active": False},
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     assert unwrap(response)["is_active"] is False

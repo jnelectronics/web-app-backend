@@ -20,8 +20,8 @@ router = APIRouter(prefix="/branches", tags=["branches"], route_class=EnvelopeRo
 def read_branch(
     branch_id: uuid.UUID,
     # get_current_staff (not require_staff_role) - per the docs, branch
-    # visibility is just "Staff", any role, unlike the Inventory Manager
-    # only writes below. Branches are never shown to customers at all
+    # visibility is just "Staff", any role, unlike the Owner/Sales
+    # Attendant-only writes below. Branches are never shown to customers at all
     # (FR-BRANCH-007), so there's no public path here like categories/products.
     _current_staff: StaffUser = Depends(get_current_staff),
     db: Session = Depends(get_db),
@@ -51,7 +51,7 @@ def list_branches(
 @router.post("", response_model=BranchRead)
 def create_branch(
     branch: BranchCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     new_branch = Branch(
@@ -70,7 +70,7 @@ def create_branch(
 def update_branch(
     branch_id: uuid.UUID,
     branch: BranchCreate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Branch, branch_id)
@@ -90,7 +90,7 @@ def update_branch(
 @router.delete("/{branch_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_branch(
     branch_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(Branch, branch_id)
@@ -104,7 +104,7 @@ def delete_branch(
 @router.patch("/{branch_id}/set-default", response_model=BranchRead)
 def set_default_branch(
     branch_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Same "clear the old one first, then set the new one" shape as

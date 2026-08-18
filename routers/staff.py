@@ -1,5 +1,5 @@
 # Staff account management. Per the docs, Sales Attendants cannot call
-# ANY endpoint here (BR-USER-003) - only Inventory Managers and the System
+# ANY endpoint here (BR-USER-003) - only Owners and the System
 # Administrator can. There's also no way to create a System Administrator
 # through this router at all - that account only ever comes from
 # seed_admin.py, run once outside the API.
@@ -7,12 +7,13 @@
 import secrets
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from audit import write_audit_log
 from database import get_db
 from envelope import EnvelopeRoute
+from jobs import send_staff_welcome_email
 from models import StaffRole, StaffUser
 from pagination import build_pagination_meta
 from schemas import (
@@ -20,6 +21,7 @@ from schemas import (
     StaffCreate,
     StaffPasswordChange,
     StaffPasswordResetResult,
+    StaffProfileUpdate,
     StaffRead,
     StaffStatusUpdate,
     StaffUpdate,
@@ -29,7 +31,7 @@ from security import get_current_staff, hash_password, require_staff_role, verif
 router = APIRouter(prefix="/staff", tags=["staff"], route_class=EnvelopeRoute)
 
 # Both roles allowed to manage staff accounts, per the docs.
-MANAGE_STAFF_ROLES = (StaffRole.INVENTORY_MANAGER, StaffRole.SYSTEM_ADMINISTRATOR)
+MANAGE_STAFF_ROLES = (StaffRole.OWNER, StaffRole.SYSTEM_ADMINISTRATOR)
 
 
 @router.patch("/me/password")
@@ -48,6 +50,11 @@ def change_my_password(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
 
     current_staff.password_hash = hash_password(change.new_password)
+    # Setting your OWN password for real (as opposed to being handed a
+    # temporary one by an admin, or one from account creation) is exactly
+    # the event that clears the forced-reset flag - see StaffUser
+    # .must_change_password in models.py for the full lifecycle.
+    current_staff.must_change_password = False
     db.commit()
     return {"message": "Password changed successfully"}
 
@@ -56,10 +63,38 @@ def change_my_password(
 def read_my_staff_profile(current_staff: StaffUser = Depends(get_current_staff)):
     # Not gated to MANAGE_STAFF_ROLES, same reasoning as change_my_password
     # above - every staff member needs to be able to see their OWN profile
-    # (name, role) regardless of role, not just Inventory Manager/System
+    # (name, role) regardless of role, not just Owner/System
     # Administrator. Registered BEFORE "/{staff_id}" below so "me" is never
     # matched as a (not-yet-validated) staff_id - see CLAUDE.md's route-
     # registration-order gotcha.
+    return current_staff
+
+
+@router.patch("/me", response_model=StaffRead)
+def update_my_staff_profile(
+    update: StaffProfileUpdate,
+    current_staff: StaffUser = Depends(get_current_staff),
+    db: Session = Depends(get_db),
+):
+    # Not gated to MANAGE_STAFF_ROLES, same reasoning as /me and
+    # /me/password above - every staff role (including Sales Attendant)
+    # can update their OWN name/phone number. StaffProfileUpdate itself
+    # doesn't even have role/email/is_active fields, so there's nothing
+    # here that could escalate a staff member's own access.
+    #
+    # full_name follows routers/customers.py's update_my_profile pattern
+    # (omitted or null both mean "leave alone" - full_name can't be
+    # cleared, it's NOT NULL in the DB). phone_number is different: the
+    # frontend needs to be able to explicitly CLEAR it to null, so this
+    # checks model_fields_set to tell "field left out of the request"
+    # (leave alone) apart from "field sent as null" (clear it) - a plain
+    # `if update.phone_number is not None` couldn't distinguish those two.
+    if update.full_name is not None:
+        current_staff.full_name = update.full_name
+    if "phone_number" in update.model_fields_set:
+        current_staff.phone_number = update.phone_number
+    db.commit()
+    db.refresh(current_staff)
     return current_staff
 
 
@@ -90,6 +125,7 @@ def read_staff(
 @router.post("", response_model=StaffRead)
 def create_staff(
     staff: StaffCreate,
+    background_tasks: BackgroundTasks,
     current_staff: StaffUser = Depends(require_staff_role(*MANAGE_STAFF_ROLES)),
     db: Session = Depends(get_db),
 ):
@@ -110,6 +146,11 @@ def create_staff(
         phone_number=staff.phone_number,
         password_hash=hash_password(staff.password),
         role=staff.role,
+        # New accounts always start on a temporary password (whatever the
+        # creator typed into the form) - forces a real password choice
+        # before the dashboard is usable at all. Cleared by
+        # change_my_password once the new hire actually sets their own.
+        must_change_password=True,
     )
     db.add(new_staff)
     db.flush()
@@ -123,6 +164,15 @@ def create_staff(
     )
     db.commit()
     db.refresh(new_staff)
+
+    # staff.password is the PLAINTEXT the creator just typed - only
+    # available here, before it's gone for good behind password_hash.
+    # Enqueued the same way every other email in this project is (see
+    # jobs.py) - runs after this response is sent, doesn't block the
+    # creator waiting on it.
+    background_tasks.add_task(
+        send_staff_welcome_email, new_staff.email, new_staff.full_name, staff.password, new_staff.role.value
+    )
     return new_staff
 
 
@@ -181,6 +231,11 @@ def reset_staff_password(
 
     temporary_password = secrets.token_urlsafe(9)
     existing.password_hash = hash_password(temporary_password)
+    # An admin-issued temporary password needs the same forced-reset
+    # treatment a brand-new account gets - the previous password no longer
+    # works, so whoever logs in with this one must be the account owner
+    # setting a real password of their own before continuing.
+    existing.must_change_password = True
     write_audit_log(
         db,
         staff_user_id=current_staff.id,

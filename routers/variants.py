@@ -136,7 +136,7 @@ def list_variants(
 @router.post("", response_model=VariantRead)
 def create_variant(
     variant: VariantCreate,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # Same reasoning as products checking their category: reject a variant
@@ -171,7 +171,7 @@ def create_variant(
 def update_variant(
     variant_id: uuid.UUID,
     variant: VariantCreate,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(ProductVariant, variant_id)
@@ -201,7 +201,7 @@ def update_variant(
 @router.delete("/{variant_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_variant(
     variant_id: uuid.UUID,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     existing = db.get(ProductVariant, variant_id)
@@ -216,7 +216,7 @@ def delete_variant(
 def set_variant_stock(
     variant_id: uuid.UUID,
     update: VariantStockUpdate,
-    current_staff: StaffUser = Depends(require_staff_role(StaffRole.INVENTORY_MANAGER)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     # The branch-less "quantity" field on the admin product form - see

@@ -12,12 +12,12 @@ from security import create_access_token, hash_password
 
 
 @pytest.fixture
-def inventory_manager_token(db):
+def owner_token(db):
     staff = StaffUser(
         full_name="Catalog Manager",
         email=f"catalogmgr-{uuid.uuid4().hex[:8]}@example.com",
         password_hash=hash_password("Password123"),
-        role=StaffRole.INVENTORY_MANAGER,
+        role=StaffRole.OWNER,
     )
     db.add(staff)
     db.commit()
@@ -97,7 +97,7 @@ def product(db):
     db.commit()
 
 
-def test_variant_attributes_created_and_replaced(client, product, inventory_manager_token):
+def test_variant_attributes_created_and_replaced(client, product, owner_token):
     response = client.post(
         "/api/v1/variants",
         json={
@@ -106,7 +106,7 @@ def test_variant_attributes_created_and_replaced(client, product, inventory_mana
             "price": 1000.0,
             "attributes": {"color": "Black", "capacity": "128GB"},
         },
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     variant = unwrap(response)
@@ -125,14 +125,14 @@ def test_variant_attributes_created_and_replaced(client, product, inventory_mana
             "price": 1200.0,
             "attributes": {"color": "White"},
         },
-        headers=_auth(inventory_manager_token),
+        headers=_auth(owner_token),
     )
     assert response.status_code == 200
     assert unwrap(response)["attributes"] == {"color": "White"}
 
 
-def test_product_image_lifecycle_and_primary_cap(client, product, inventory_manager_token, mock_cloudinary):
-    headers = _auth(inventory_manager_token)
+def test_product_image_lifecycle_and_primary_cap(client, product, owner_token, mock_cloudinary):
+    headers = _auth(owner_token)
     image_ids = []
 
     for i in range(5):
@@ -194,8 +194,8 @@ def test_product_image_lifecycle_and_primary_cap(client, product, inventory_mana
     assert len(mock_cloudinary) == 2
 
 
-def test_product_list_filtering_search_sort_and_pagination(client, db, inventory_manager_token):
-    headers = _auth(inventory_manager_token)
+def test_product_list_filtering_search_sort_and_pagination(client, db, owner_token):
+    headers = _auth(owner_token)
     group_id = uncategorized_group_id(db)
     category = Category(name=f"Filter Test Category {uuid.uuid4().hex[:8]}", category_group_id=group_id)
     other_category = Category(name=f"Filter Test Other Category {uuid.uuid4().hex[:8]}", category_group_id=group_id)
@@ -281,8 +281,8 @@ def test_product_list_filtering_search_sort_and_pagination(client, db, inventory
         db.commit()
 
 
-def test_product_read_includes_new_fields_and_computed_discount(client, db, inventory_manager_token):
-    headers = _auth(inventory_manager_token)
+def test_product_read_includes_new_fields_and_computed_discount(client, db, owner_token):
+    headers = _auth(owner_token)
     category = Category(name=f"Field Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.commit()
@@ -335,7 +335,7 @@ def test_product_read_includes_new_fields_and_computed_discount(client, db, inve
         product_ids = [p.id for p in db.query(Product).filter(Product.category_id == category.id).all()]
         # product.create writes an audit_logs row referencing the acting
         # staff member (write_audit_log) - has to go before
-        # inventory_manager_token's OWN teardown tries to delete that
+        # owner_token's OWN teardown tries to delete that
         # StaffUser row, per the LIFO fixture-teardown-order gotcha in
         # CLAUDE.md (this fixture's teardown runs AFTER this one, so it
         # can't defend against a reference this test itself created).

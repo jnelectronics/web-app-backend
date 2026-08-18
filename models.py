@@ -419,6 +419,32 @@ class Customer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class CustomerAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # A registered customer's saved delivery address, for the account
+    # manager's Address Book (frontend handoff doc, 2026-08-18). Guests
+    # never get a row here - every row requires a real customer_id, and
+    # the address-book UI itself is only reachable once signed in.
+    __tablename__ = "customer_addresses"
+
+    customer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("customers.id"))
+
+    # A short name the customer picks for THEIR OWN reference ("Home",
+    # "Office") - not validated against a fixed list, just free text.
+    label: Mapped[str] = mapped_column(String(50))
+    recipient_name: Mapped[str] = mapped_column(String(150))
+    phone_number: Mapped[str] = mapped_column(String(20))
+    address_line: Mapped[str] = mapped_column(String(255))
+
+    # "At most one is_default per customer" is enforced in the router
+    # (routers/customers.py), not here in the DB - a plain unique=True on
+    # this column would only allow ONE True across the ENTIRE table (every
+    # customer combined), which isn't what we want. A real DB-level
+    # per-customer version would need a partial unique index; application
+    # logic is simpler and good enough since every write to this table
+    # already goes through that one router.
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class CartStatus(str, enum.Enum):
     ACTIVE = "active"
     CONVERTED = "converted"
@@ -885,16 +911,23 @@ class ProductHomepageSection(UUIDPrimaryKeyMixin, Base):
 
 class StaffRole(str, enum.Enum):
     SYSTEM_ADMINISTRATOR = "system_administrator"
-    INVENTORY_MANAGER = "inventory_manager"
+    # Was INVENTORY_MANAGER / "inventory_manager" - renamed 2026-08-18 per
+    # the frontend's new role model (client-requested). The Postgres enum
+    # LABEL itself gets renamed too (see the matching alembic migration,
+    # `ALTER TYPE staff_role RENAME VALUE`), which is what makes this a
+    # rename instead of a "delete old role, add new one" migration - every
+    # existing staff_users row that already said 'inventory_manager'
+    # becomes 'owner' automatically, no separate data UPDATE needed.
+    OWNER = "owner"
     SALES_ATTENDANT = "sales_attendant"
 
 
 class StaffUser(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Internal accounts only - completely separate table from Customer.
     # There's no public "register as staff" endpoint (see routers/staff.py):
-    # staff accounts are created BY an existing Inventory Manager/System
-    # Administrator, and the very first System Administrator is created
-    # outside the API entirely, by seed_admin.py.
+    # staff accounts are created BY an existing Owner/System Administrator,
+    # and the very first System Administrator is created outside the API
+    # entirely, by seed_admin.py.
     __tablename__ = "staff_users"
 
     full_name: Mapped[str] = mapped_column(String(150))
@@ -907,3 +940,12 @@ class StaffUser(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # True from the moment an account is created (POST /staff) or given a
+    # new temporary password (POST /staff/{id}/reset-password), until the
+    # staff member actually sets their OWN password via
+    # PATCH /staff/me/password - that endpoint clears it back to False.
+    # Lets the frontend force a "choose a new password" screen before a
+    # brand-new or just-reset account can reach the dashboard at all,
+    # instead of leaving it usable on a temporary password indefinitely.
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)

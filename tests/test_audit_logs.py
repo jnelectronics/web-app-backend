@@ -1,7 +1,8 @@
 # Covers the audit_logs read endpoint: its distinctive role pair
-# (Inventory Manager + System Administrator, NOT Sales Attendant - the
-# opposite of most staff-gated endpoints in this project), filtering, and
-# that a real write (creating a product) actually produces an entry.
+# (Owner + System Administrator, NOT Sales Attendant - the one module,
+# along with staff management, that the 2026-08-18 RBAC widening
+# deliberately left Sales Attendant out of), filtering, and that a real
+# write (creating a product) actually produces an entry.
 
 import uuid
 
@@ -46,7 +47,7 @@ def test_audit_log_role_gating(client, staff_tokens):
     response = client.get("/api/v1/audit-logs", headers=_auth(tokens[StaffRole.SALES_ATTENDANT]))
     assert response.status_code == 403
 
-    response = client.get("/api/v1/audit-logs", headers=_auth(tokens[StaffRole.INVENTORY_MANAGER]))
+    response = client.get("/api/v1/audit-logs", headers=_auth(tokens[StaffRole.OWNER]))
     assert response.status_code == 200
 
     response = client.get("/api/v1/audit-logs", headers=_auth(tokens[StaffRole.SYSTEM_ADMINISTRATOR]))
@@ -55,8 +56,8 @@ def test_audit_log_role_gating(client, staff_tokens):
 
 def test_creating_a_product_writes_an_audit_entry(client, db, staff_tokens):
     tokens, created = staff_tokens
-    manager_token = tokens[StaffRole.INVENTORY_MANAGER]
-    manager = created[StaffRole.INVENTORY_MANAGER]
+    manager_token = tokens[StaffRole.OWNER]
+    manager = created[StaffRole.OWNER]
 
     category = Category(name=f"Audit Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
