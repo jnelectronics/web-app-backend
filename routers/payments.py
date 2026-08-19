@@ -347,6 +347,7 @@ def list_order_payments(
 @router.get("/payments/{payment_id}", response_model=PaymentRead)
 def read_payment(
     payment_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     actor=Depends(_resolve_actor),
     db: Session = Depends(get_db),
 ):
@@ -358,6 +359,39 @@ def read_payment(
     # Re-run the same visibility check via the payment's order, so a
     # customer can't fetch someone else's payment just by guessing its id.
     _get_visible_order(payment.order_id, actor_type, actor_account, db)
+
+    # Not in the original spec - added because the frontend polls exactly
+    # this endpoint waiting for a payment to resolve (see
+    # docs/Frontend_Integration_Contract.md), but until now the ONLY thing
+    # that ever moved a payment out of AWAITING_PAYMENT was PesaPal's own
+    # IPN callback actually reaching us. If that callback is ever missed
+    # (a dropped webhook, a misconfigured IPN, a network hiccup on
+    # PesaPal's side), the row - and the customer's polling frontend -
+    # would be stuck showing "awaiting payment" forever even though
+    # PesaPal itself already knows the real outcome. This makes a stuck
+    # payment self-heal the next time anyone checks on it, by asking
+    # PesaPal directly instead of only ever waiting to be told.
+    #
+    # Only ever PROMOTES to paid - never applies a FAILED outcome from
+    # here (see _apply_pesapal_outcome's own comment for why: this runs on
+    # every poll, including the very first one right after redirect,
+    # before the customer may have even reached PesaPal's payment form,
+    # and PesaPal has no distinct "still checking out" status to tell that
+    # case apart from a genuine decline).
+    if payment.status == PaymentStatus.AWAITING_PAYMENT and payment.provider_reference is not None:
+        try:
+            pesapal_status = get_transaction_status(payment.provider_reference)
+        except PesaPalError:
+            # Same reasoning as elsewhere: PesaPal itself being unreachable
+            # is an infrastructure problem worth knowing about, but it
+            # shouldn't fail this GET request - just fall back to
+            # returning whatever status the row already had.
+            logger.warning("PesaPal GetTransactionStatus recheck failed for payment %s", payment.id)
+        else:
+            new_status, failure_reason = _map_pesapal_status(pesapal_status["payment_status_description"])
+            if new_status == PaymentStatus.PAID:
+                _apply_pesapal_outcome(payment, new_status, failure_reason, db, background_tasks)
+
     return payment
 
 
@@ -429,67 +463,46 @@ def mark_cash_payment_paid(
     return payment
 
 
-@webhook_router.get("/payments/webhook")
-def payment_webhook(
+def _apply_pesapal_outcome(
+    payment: Payment,
+    new_status: PaymentStatus,
+    failure_reason: str | None,
+    db: Session,
     background_tasks: BackgroundTasks,
-    order_tracking_id: str = Query(alias="OrderTrackingId"),
-    order_merchant_reference: str = Query(alias="OrderMerchantReference"),
-    order_notification_type: str = Query(default="IPNCHANGE", alias="OrderNotificationType"),
-    db: Session = Depends(get_db),
-):
-    # PesaPal's IPN deliberately does NOT include the payment's actual
-    # status in this callback (a security measure - see pesapal_client.py)
-    # - just these tracking ids. Finding out what really happened means
-    # calling GetTransactionStatus ourselves, below.
-
-    # The exact acknowledgment shape PesaPal's own systems expect back -
-    # not a response for OUR API's clients. status: 200 = "we handled it",
-    # 500 = "something went wrong on our end, please retry."
-    def ack(processing_status: int) -> dict:
-        return {
-            "orderNotificationType": order_notification_type,
-            "orderTrackingId": order_tracking_id,
-            "orderMerchantReference": order_merchant_reference,
-            "status": processing_status,
-        }
-
-    payment = db.query(Payment).filter(Payment.provider_reference == order_tracking_id).first()
-    if payment is None:
-        # warning, not error - could be a stale/replayed callback (e.g.
-        # from an old test) rather than a real bug, but still worth
-        # knowing about if it happens a lot.
-        logger.warning("PesaPal IPN for unknown order_tracking_id=%s", order_tracking_id)
-        return ack(500)
-
-    # Idempotent per PAYINT-005: once paid, any further callback (even a
-    # legitimate duplicate) is a no-op - never reprocessed or reversed here.
-    if payment.status == PaymentStatus.PAID:
-        return ack(200)
-
-    try:
-        pesapal_status = get_transaction_status(order_tracking_id)
-    except PesaPalError:
-        # A real Sentry Issue, same reasoning as initiate_payment's
-        # PesaPalError handling - PesaPal itself failing to answer a
-        # status check is an infrastructure problem, not a business outcome.
-        logger.exception("PesaPal GetTransactionStatus failed for payment %s", payment.id)
-        return ack(500)
-
-    new_status, failure_reason = _map_pesapal_status(pesapal_status["payment_status_description"])
-
+) -> None:
+    # Shared by BOTH the real IPN webhook below AND read_payment's lazy
+    # recheck (added so a customer isn't stuck forever if PesaPal's IPN
+    # callback never reaches us - see read_payment's own comment). Pulled
+    # out into one function so there's exactly one place that decides what
+    # ALREADY-DECIDED outcome means for our DB, instead of two copies of
+    # this business logic that could quietly drift apart over time.
+    #
+    # Deliberately takes new_status/failure_reason already resolved by the
+    # CALLER, rather than calling get_transaction_status/_map_pesapal_status
+    # itself - the two callers are NOT allowed to treat a mapped result the
+    # same way. The webhook only ever calls this after PesaPal's IPN told
+    # us something genuinely changed, so PAID and FAILED are both fine to
+    # apply. read_payment's lazy recheck runs on every poll - including the
+    # very first one, seconds after redirect, before the customer may have
+    # even reached PesaPal's payment form - and PesaPal has no "still in
+    # progress" status of its own (_map_pesapal_status's fallback treats
+    # anything that isn't COMPLETED/REVERSED/INVALID as FAILED). Letting
+    # the lazy path apply a FAILED outcome could tell a customer their
+    # payment failed while they're still legitimately mid-checkout - so it
+    # only ever calls this function for a PAID outcome, never for FAILED.
     if new_status == PaymentStatus.PAID:
         # Defensive re-check: a DIFFERENT attempt for the same order could
         # have been confirmed paid in between this payment being created
-        # and this callback arriving. The partial unique index on the
-        # table is the last line of defense against this actually
-        # violating BR-PAY-005; this just avoids trying in the first place.
+        # and this check running. The partial unique index on the table is
+        # the last line of defense against this actually violating
+        # BR-PAY-005; this just avoids trying in the first place.
         already_paid = (
             db.query(Payment)
             .filter(Payment.order_id == payment.order_id, Payment.status == PaymentStatus.PAID)
             .first()
         )
         if already_paid is not None:
-            return ack(200)
+            return
 
     payment.status = new_status
     payment.failure_reason = failure_reason
@@ -498,24 +511,25 @@ def payment_webhook(
         db.commit()
     except IntegrityError:
         # The SELECT re-check above can't fully close a genuine race: TWO
-        # callbacks for TWO DIFFERENT payment attempts on the SAME order
-        # can both pass that check before either commits, if they land at
-        # almost the exact same instant. Only one commit can actually win -
-        # the partial unique index rejects the other one right here. That's
-        # the correct outcome (still only one PAID row, BR-PAY-005 holds),
-        # this just makes sure the LOSING request still acknowledges
-        # cleanly to PesaPal instead of surfacing a raw 500 from an
+        # confirmations for TWO DIFFERENT payment attempts on the SAME
+        # order can both pass that check before either commits, if they
+        # land at almost the exact same instant. Only one commit can
+        # actually win - the partial unique index rejects the other one
+        # right here. That's the correct outcome (still only one PAID row,
+        # BR-PAY-005 holds); this just makes sure the LOSING call still
+        # resolves cleanly instead of surfacing a raw 500 from an
         # uncaught database error.
         db.rollback()
         logger.warning(
             "Payment %s lost a same-order PAID race to another attempt - order already paid", payment.id
         )
-        return ack(200)
+        return
+    db.refresh(payment)
 
     # info, not warning, even for a FAILED outcome here - a declined card
     # is a normal, expected business event at real-world volume, not
     # something to flag for attention every time it happens.
-    logger.info("Payment %s resolved via webhook: status=%s", payment.id, new_status.value)
+    logger.info("Payment %s resolved: status=%s", payment.id, new_status.value)
 
     if new_status == PaymentStatus.PAID:
         # A DIFFERENT event from send_order_confirmation_email (fires at
@@ -563,4 +577,53 @@ def payment_webhook(
             payment.provider,
         )
 
+
+@webhook_router.get("/payments/webhook")
+def payment_webhook(
+    background_tasks: BackgroundTasks,
+    order_tracking_id: str = Query(alias="OrderTrackingId"),
+    order_merchant_reference: str = Query(alias="OrderMerchantReference"),
+    order_notification_type: str = Query(default="IPNCHANGE", alias="OrderNotificationType"),
+    db: Session = Depends(get_db),
+):
+    # PesaPal's IPN deliberately does NOT include the payment's actual
+    # status in this callback (a security measure - see pesapal_client.py)
+    # - just these tracking ids. Finding out what really happened means
+    # calling GetTransactionStatus ourselves, below.
+
+    # The exact acknowledgment shape PesaPal's own systems expect back -
+    # not a response for OUR API's clients. status: 200 = "we handled it",
+    # 500 = "something went wrong on our end, please retry."
+    def ack(processing_status: int) -> dict:
+        return {
+            "orderNotificationType": order_notification_type,
+            "orderTrackingId": order_tracking_id,
+            "orderMerchantReference": order_merchant_reference,
+            "status": processing_status,
+        }
+
+    payment = db.query(Payment).filter(Payment.provider_reference == order_tracking_id).first()
+    if payment is None:
+        # warning, not error - could be a stale/replayed callback (e.g.
+        # from an old test) rather than a real bug, but still worth
+        # knowing about if it happens a lot.
+        logger.warning("PesaPal IPN for unknown order_tracking_id=%s", order_tracking_id)
+        return ack(500)
+
+    # Idempotent per PAYINT-005: once paid, any further callback (even a
+    # legitimate duplicate) is a no-op - never reprocessed or reversed here.
+    if payment.status == PaymentStatus.PAID:
+        return ack(200)
+
+    try:
+        pesapal_status = get_transaction_status(order_tracking_id)
+    except PesaPalError:
+        # A real Sentry Issue, same reasoning as initiate_payment's
+        # PesaPalError handling - PesaPal itself failing to answer a
+        # status check is an infrastructure problem, not a business outcome.
+        logger.exception("PesaPal GetTransactionStatus failed for payment %s", payment.id)
+        return ack(500)
+
+    new_status, failure_reason = _map_pesapal_status(pesapal_status["payment_status_description"])
+    _apply_pesapal_outcome(payment, new_status, failure_reason, db, background_tasks)
     return ack(200)

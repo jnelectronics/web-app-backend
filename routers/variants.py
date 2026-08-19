@@ -16,7 +16,7 @@ from database import get_db
 from envelope import EnvelopeRoute
 from models import Branch, InventoryMovement, InventoryRecord, MovementType, Product, ProductVariant, StaffRole, StaffUser, VariantAttribute
 from pagination import build_pagination_meta
-from schemas import PaginatedResponse, VariantCreate, VariantRead, VariantStockUpdate
+from schemas import PaginatedResponse, SkuAvailability, VariantCreate, VariantRead, VariantStockUpdate
 from security import decode_token_claims, require_staff_role
 
 router = APIRouter(prefix="/variants", tags=["variants"], route_class=EnvelopeRoute)
@@ -95,6 +95,31 @@ def _replace_attributes(variant_id: uuid.UUID, attributes: dict[str, str] | None
     db.query(VariantAttribute).filter(VariantAttribute.variant_id == variant_id).delete()
     for name, value in (attributes or {}).items():
         db.add(VariantAttribute(variant_id=variant_id, attribute_name=name, attribute_value=value))
+
+
+# Registered BEFORE /{variant_id} below - same routing gotcha CLAUDE.md
+# documents for payments.py's webhook: Starlette matches routes by raw
+# path template, in registration order, BEFORE FastAPI validates a typed
+# path parameter. If /{variant_id} were registered first, a request for
+# /variants/check-sku would match THAT route first (with variant_id
+# literally set to the string "check-sku"), fail UUID validation, and
+# never reach this handler at all.
+@router.get("/check-sku", response_model=SkuAvailability)
+def check_sku(
+    sku: str,
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
+    db: Session = Depends(get_db),
+):
+    # Staff-only (same roles as create_variant/update_variant) - this only
+    # exists to serve the admin product form's SKU generator, which used
+    # to load up to 500 products client-side just to self-check for a
+    # collision (see the frontend audit notes this replaces). No
+    # is_active filter - ProductVariant.sku's unique=True constraint in
+    # models.py applies to EVERY row regardless of is_active, so a
+    # soft-deleted variant's old SKU is still taken as far as the database
+    # is concerned.
+    exists = db.query(ProductVariant).filter(ProductVariant.sku == sku).first() is not None
+    return SkuAvailability(sku=sku, exists=exists)
 
 
 @router.get("/{variant_id}", response_model=VariantRead)

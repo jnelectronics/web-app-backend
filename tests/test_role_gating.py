@@ -75,12 +75,15 @@ def test_category_read_stays_public(client):
 def test_category_write_allows_any_staff_role(client, staff_tokens, db):
     group_id = str(uncategorized_group_id(db))
 
-    # No token at all - HTTPBearer itself rejects this before our role
-    # check ever runs.
+    # No token at all - security.py's bearer_scheme (auto_error=False)
+    # hands this to get_current_staff/require_staff_role, which reject it
+    # with the SAME 401 a present-but-invalid token gets, not FastAPI's
+    # HTTPBearer default of 403 "Not authenticated" - see security.py's
+    # own comment on bearer_scheme for why that distinction matters.
     response = client.post(
         "/api/v1/categories", json={"name": f"Cat {uuid.uuid4().hex[:8]}", "category_group_id": group_id}
     )
-    assert response.status_code in (401, 403)
+    assert response.status_code == 401
 
     # Every staff role reaches this now - Owner and Sales Attendant are
     # both explicitly listed, System Administrator gets through as the
@@ -98,7 +101,7 @@ def test_category_write_allows_any_staff_role(client, staff_tokens, db):
 
 def test_branch_read_requires_any_staff_role(client, staff_tokens):
     response = client.get("/api/v1/branches")
-    assert response.status_code in (401, 403)
+    assert response.status_code == 401
 
     # ANY staff role can list branches - the docs say just "Staff" here,
     # not a specific role, unlike categories/products/inventory writes.

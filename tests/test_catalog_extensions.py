@@ -131,6 +131,33 @@ def test_variant_attributes_created_and_replaced(client, product, owner_token):
     assert unwrap(response)["attributes"] == {"color": "White"}
 
 
+def test_check_sku_endpoint(client, product, owner_token):
+    # Not in the original spec - added so the admin product form's SKU
+    # generator can ask a single question ("is this SKU taken?") instead
+    # of loading up to 500 products client-side to check for a collision
+    # itself.
+    sku = f"SKU-{uuid.uuid4().hex[:8]}"
+    headers = _auth(owner_token)
+
+    response = client.get("/api/v1/variants/check-sku", params={"sku": sku}, headers=headers)
+    assert response.status_code == 200
+    body = unwrap(response)
+    assert body == {"sku": sku, "exists": False}
+
+    client.post(
+        "/api/v1/variants",
+        json={"product_id": str(product.id), "sku": sku, "price": 1000.0},
+        headers=headers,
+    )
+
+    response = client.get("/api/v1/variants/check-sku", params={"sku": sku}, headers=headers)
+    assert unwrap(response) == {"sku": sku, "exists": True}
+
+    # Staff-only - matches create_variant/update_variant's own role gate.
+    response = client.get("/api/v1/variants/check-sku", params={"sku": sku})
+    assert response.status_code == 401
+
+
 def test_product_image_lifecycle_and_primary_cap(client, product, owner_token, mock_cloudinary):
     headers = _auth(owner_token)
     image_ids = []

@@ -72,7 +72,7 @@ def test_banner_write_requires_owner(client, owner_token, db):
     response = client.post(
         "/api/v1/banners", json={"title": "New Banner", "image_url": "https://example.com/new.png"}
     )
-    assert response.status_code in (401, 403)
+    assert response.status_code == 401
 
     response = client.post(
         "/api/v1/banners",

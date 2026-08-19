@@ -147,9 +147,10 @@ def test_read_my_orders(client, customer, customer_order):
 
 
 def test_staff_directory_requires_owner(client, customer, owner_token):
-    # No token
+    # No token - always 401, same as a present-but-invalid token (see
+    # security.py's bearer_scheme comment for why that consistency matters).
     response = client.get("/api/v1/customers")
-    assert response.status_code in (401, 403)
+    assert response.status_code == 401
 
     response = client.get("/api/v1/customers", headers=_auth(owner_token))
     assert response.status_code == 200

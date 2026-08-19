@@ -119,11 +119,23 @@ def create_password_reset_token(subject: str) -> str:
 # you paste a raw token (unlike OAuth2PasswordBearer, which expects a
 # username/password login form - we don't need that since our /login
 # already takes plain JSON).
-bearer_scheme = HTTPBearer()
+#
+# auto_error=False is load-bearing, not just a style choice: HTTPBearer's
+# own DEFAULT (auto_error=True) raises its own HTTPException(403, "Not
+# authenticated") the instant no Authorization header is present at all -
+# BEFORE any of the functions below ever run, so their own 401 handling
+# never gets a chance to apply. That meant a request with NO token at all
+# got 403, while a request with a present-but-garbage/expired token got
+# 401 from this file's own checks - two different status codes for what a
+# client should treat as the exact same case ("I'm not logged in"),
+# forcing frontend code to treat some 403s like 401s as a workaround.
+# auto_error=False hands that decision back to each function below, which
+# now raises the SAME 401 either way.
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def get_current_customer(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> Customer:
     # A FastAPI dependency - any route that adds
@@ -135,6 +147,9 @@ def get_current_customer(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    if credentials is None:
+        raise invalid_token
 
     claims = decode_token_claims(credentials.credentials)
     # Reject a staff token here too - "type" is what keeps the two account
@@ -150,7 +165,7 @@ def get_current_customer(
 
 
 def get_current_staff(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> StaffUser:
     invalid_token = HTTPException(
@@ -158,6 +173,9 @@ def get_current_staff(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    if credentials is None:
+        raise invalid_token
 
     claims = decode_token_claims(credentials.credentials)
     if claims is None or claims.get("type") != "staff":
@@ -199,7 +217,7 @@ def require_staff_role(*allowed_roles):
 
 
 def get_current_customer_or_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ):
     # Like get_current_customer, but ALSO accepts a System Administrator
@@ -221,6 +239,9 @@ def get_current_customer_or_admin(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    if credentials is None:
+        raise invalid_token
 
     claims = decode_token_claims(credentials.credentials)
     if claims is None:

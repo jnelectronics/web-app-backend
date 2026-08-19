@@ -327,6 +327,75 @@ def test_webhook_failed_payment(client, order_setup, mock_pesapal):
     assert response.status_code == 201
 
 
+def test_read_payment_recheck_resolves_paid_when_webhook_missed(
+    client, db, order_setup, mock_pesapal, mock_email
+):
+    # The scenario this whole feature exists for: PesaPal's IPN callback
+    # never arrives (dropped, misconfigured, whatever) - the customer
+    # actually paid, but nothing ever told us. GET /payments/{id} (the
+    # exact endpoint the frontend polls per
+    # docs/Frontend_Integration_Contract.md) should self-heal this the
+    # next time anyone checks, WITHOUT the webhook ever being called here.
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+    order.guest_email = "payer-inbox@example.com"
+    db.commit()
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money", "amount": 50000.0},
+        headers=headers,
+    )
+    payment = unwrap(response)
+    assert payment["status"] == "awaiting_payment"
+
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Completed"}
+
+    # No _webhook_call anywhere in this test - only the GET a real polling
+    # frontend would make.
+    response = client.get(f"/api/v1/payments/{payment['id']}", headers=headers)
+    assert unwrap(response)["status"] == "paid"
+
+    # The same confirmation email the webhook path sends still fires here -
+    # a customer shouldn't miss it just because the recheck, not the
+    # webhook, was what actually discovered the payment succeeded.
+    confirmation = next((e for e in mock_email if e["to_email"] == "payer-inbox@example.com"), None)
+    assert confirmation is not None
+    assert order.order_number in confirmation["subject"]
+
+
+def test_read_payment_recheck_does_not_mark_failed(client, order_setup, mock_pesapal):
+    # Deliberately the OPPOSITE of the "resolves paid" test above: PesaPal
+    # has no genuine "still checking out" status, so a poll landing before
+    # the customer has finished paying could map to FAILED via
+    # _map_pesapal_status's fallback. The lazy recheck must NOT apply that
+    # - only a real webhook callback is allowed to mark a payment failed
+    # (see _apply_pesapal_outcome's own comment for the full reasoning).
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "card", "amount": 50000.0},
+        headers=headers,
+    )
+    payment = unwrap(response)
+
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Invalid"}
+
+    response = client.get(f"/api/v1/payments/{payment['id']}", headers=headers)
+    # Still awaiting_payment, NOT failed - the customer may still be
+    # legitimately mid-checkout.
+    assert unwrap(response)["status"] == "awaiting_payment"
+
+    # The real webhook is still the one that gets to make this call.
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Failed"}
+    response = _webhook_call(client, payment["provider_reference"], payment["id"])
+    assert response.status_code == 200
+    response = client.get(f"/api/v1/payments/{payment['id']}", headers=headers)
+    assert unwrap(response)["status"] == "failed"
+
+
 def test_second_payment_blocked_while_first_still_pending(client, order_setup, mock_pesapal):
     # Prevents a real double-charge risk: without this, a double-click (or
     # a retried request) could open a SECOND real PesaPal checkout session

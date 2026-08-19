@@ -252,6 +252,14 @@ class VariantRead(BaseModel):
     quantity_available: int | None = None
 
 
+class SkuAvailability(BaseModel):
+    # Response for GET /variants/check-sku - lets the admin frontend ask
+    # "is this SKU taken?" directly instead of loading hundreds of
+    # products client-side just to check for a collision itself.
+    sku: str
+    exists: bool
+
+
 class VariantStockUpdate(BaseModel):
     # An ABSOLUTE quantity to set, not a +/- delta like InventoryAdjust -
     # matches how the admin product form actually works (staff type "10
