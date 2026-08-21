@@ -36,4 +36,4 @@ New test (`tests/test_products.py::test_product_read_exposes_default_variant_pri
 
 ## Deploy status
 
-**Not pushed yet.** Since this is additive and shouldn't require any frontend change to avoid breaking anything, happy to push as soon as you've confirmed — let me know.
+**Pushed to `main` (`c0613dd`), 2026-08-21.** Render is auto-deploying now. Since this is additive, nothing on your end breaks even before you've had a chance to update anything.

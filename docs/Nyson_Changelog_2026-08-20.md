@@ -59,4 +59,4 @@ The note below was accurate as of this doc's original writing but is now superse
 
 ## Deploy status
 
-**Not pushed yet.** Wanted you to see the request-shape change first since it's a real breaking change to both endpoints. Let me know once your product-creation/edit forms are updated to match and I'll push to `main`.
+**Pushed to `main` (`c0613dd`), 2026-08-21.** Render is auto-deploying now. This is a real breaking change to both endpoints — update your product-creation/edit forms per "What you need to do" above before your admin dashboard's product forms hit either endpoint again.
