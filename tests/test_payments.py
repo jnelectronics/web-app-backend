@@ -16,7 +16,6 @@ import pytest
 
 from conftest import uncategorized_group_id, unwrap
 from models import (
-    Branch,
     Category,
     Customer,
     InventoryRecord,
@@ -84,11 +83,7 @@ def order_setup(db):
     db.add(variant)
     db.flush()
 
-    branch = Branch(name="Test Branch", address="123 Test Street")
-    db.add(branch)
-    db.flush()
-
-    inventory = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
+    inventory = InventoryRecord(variant_id=variant.id, quantity_available=10)
     db.add(inventory)
 
     owner = Customer(
@@ -107,7 +102,6 @@ def order_setup(db):
     order = Order(
         order_number=f"JN-TEST-{uuid.uuid4().hex[:8]}",
         customer_id=owner.id,
-        fulfilling_branch_id=branch.id,
         guest_full_name=owner.full_name,
         guest_phone_number="+256700000000",
         delivery_address="Test Address",
@@ -155,8 +149,6 @@ def order_setup(db):
     db.query(Product).filter(Product.id == product.id).delete()
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
-    db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
     db.commit()
 
 
@@ -550,11 +542,7 @@ def guest_order_setup(db):
     db.add(variant)
     db.flush()
 
-    branch = Branch(name="Guest Pay Test Branch", address="1 Guest Way")
-    db.add(branch)
-    db.flush()
-
-    inventory = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
+    inventory = InventoryRecord(variant_id=variant.id, quantity_available=10)
     db.add(inventory)
 
     guest_token = f"guest-{uuid.uuid4().hex}"
@@ -562,7 +550,6 @@ def guest_order_setup(db):
         order_number=f"JN-TEST-{uuid.uuid4().hex[:8]}",
         customer_id=None,
         guest_token=guest_token,
-        fulfilling_branch_id=branch.id,
         guest_full_name="Guest Payer",
         guest_phone_number="+256700000099",
         delivery_address="Test Address",
@@ -600,8 +587,6 @@ def guest_order_setup(db):
     db.query(Product).filter(Product.id == product.id).delete()
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
-    db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
     db.commit()
 
 

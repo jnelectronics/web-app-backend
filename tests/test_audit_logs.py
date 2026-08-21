@@ -9,7 +9,7 @@ import uuid
 import pytest
 
 from conftest import uncategorized_group_id, unwrap
-from models import AuditLog, Category, Product, StaffRole, StaffUser
+from models import AuditLog, Category, InventoryRecord, Product, ProductVariant, StaffRole, StaffUser
 from security import create_access_token, hash_password
 
 
@@ -66,7 +66,12 @@ def test_creating_a_product_writes_an_audit_entry(client, db, staff_tokens):
     try:
         response = client.post(
             "/api/v1/products",
-            json={"category_id": str(category.id), "name": "Audited Product"},
+            json={
+                "category_id": str(category.id),
+                "name": "Audited Product",
+                "sku": f"SKU-{uuid.uuid4().hex[:8]}",
+                "price": 1000.0,
+            },
             headers=_auth(manager_token),
         )
         assert response.status_code == 200
@@ -108,6 +113,20 @@ def test_creating_a_product_writes_an_audit_entry(client, db, staff_tokens):
         db.query(AuditLog).filter(AuditLog.resource_type == "product").filter(
             AuditLog.staff_user_id == manager.id
         ).delete()
+        db.commit()
+        # POST /products now also creates a default variant + stock record
+        # (see CLAUDE.md's 2026-08-20 note) - clean those up before the
+        # product they point at.
+        variant_ids = [
+            v.id
+            for v in db.query(ProductVariant)
+            .join(Product, ProductVariant.product_id == Product.id)
+            .filter(Product.category_id == category.id)
+            .all()
+        ]
+        db.query(InventoryRecord).filter(InventoryRecord.variant_id.in_(variant_ids)).delete(synchronize_session=False)
+        db.commit()
+        db.query(ProductVariant).filter(ProductVariant.id.in_(variant_ids)).delete(synchronize_session=False)
         db.commit()
         db.query(Product).filter(Product.category_id == category.id).delete()
         db.commit()

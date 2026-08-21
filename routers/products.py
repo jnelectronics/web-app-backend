@@ -8,15 +8,31 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from audit import write_audit_log
 from cloudinary_client import CloudinaryError, delete_image, is_configured, upload_image
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Category, HomepageSection, HomepageSectionType, Product, ProductDiscount, ProductHomepageSection, ProductImage, Promotion, StaffRole, StaffUser
+from models import (
+    Category,
+    HomepageSection,
+    HomepageSectionType,
+    InventoryMovement,
+    InventoryRecord,
+    MovementType,
+    Product,
+    ProductDiscount,
+    ProductHomepageSection,
+    ProductImage,
+    ProductVariant,
+    Promotion,
+    StaffRole,
+    StaffUser,
+)
 from pagination import build_pagination_meta
-from schemas import PaginatedResponse, ProductCreate, ProductHomepageSectionsSync, ProductImageRead, ProductRead
+from schemas import PaginatedResponse, ProductCreate, ProductHomepageSectionsSync, ProductImageRead, ProductRead, ProductUpdate
 from security import decode_token_claims, require_staff_role
 
 logger = logging.getLogger(__name__)
@@ -111,13 +127,39 @@ def _homepage_section_ids_for_product(db: Session, product_id: uuid.UUID) -> lis
     return [row[0] for row in rows]
 
 
-def _build_product_read(product: Product, db: Session) -> ProductRead:
+def _default_variant(product_id: uuid.UUID, db: Session) -> ProductVariant | None:
+    # "Default" = the oldest ACTIVE variant under this product - for the
+    # vast majority of products (created via the 2026-08-20 collapsed-create
+    # flow) this is the only variant there is. A product that's since grown
+    # a second, separately-stocked variant still just surfaces its first
+    # one here; the full set is still only ever available via
+    # GET /variants?product_id=<id>, unchanged.
+    return (
+        db.query(ProductVariant)
+        .filter(ProductVariant.product_id == product_id, ProductVariant.is_active == True)  # noqa: E712
+        .order_by(ProductVariant.created_at.asc())
+        .first()
+    )
+
+
+def _build_product_read(product: Product, db: Session, *, requesting_staff: StaffUser | None = None) -> ProductRead:
     images = (
         db.query(ProductImage)
         .filter(ProductImage.product_id == product.id)
         .order_by(ProductImage.display_order)
         .all()
     )
+
+    default_variant = _default_variant(product.id, db)
+
+    # quantity_available is a REAL number, so - same reasoning as
+    # VariantRead.quantity_available in schemas.py - only ever computed for
+    # a staff-authenticated caller; stays None for the public storefront.
+    quantity_available = None
+    if requesting_staff is not None and default_variant is not None:
+        record = db.query(InventoryRecord).filter(InventoryRecord.variant_id == default_variant.id).first()
+        quantity_available = record.quantity_available if record is not None else 0
+
     return ProductRead(
         id=product.id,
         category_id=product.category_id,
@@ -134,6 +176,9 @@ def _build_product_read(product: Product, db: Session) -> ProductRead:
         created_at=product.created_at,
         updated_at=product.updated_at,
         homepage_section_ids=_homepage_section_ids_for_product(db, product.id),
+        sku=default_variant.sku if default_variant is not None else None,
+        price=default_variant.price if default_variant is not None else None,
+        quantity_available=quantity_available,
     )
 
 
@@ -211,11 +256,15 @@ router = APIRouter(prefix="/products", tags=["products"], route_class=EnvelopeRo
 # type - FastAPI validates the URL segment is a real UUID automatically,
 # same way it validated integers before.
 @router.get("/{product_id}", response_model=ProductRead)
-def read_product(product_id: uuid.UUID, db: Session = Depends(get_db)):
+def read_product(
+    product_id: uuid.UUID,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer_scheme),
+    db: Session = Depends(get_db),
+):
     product = db.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    return _build_product_read(product, db)
+    return _build_product_read(product, db, requesting_staff=_current_staff_or_none(credentials, db))
 
 
 @router.get("", response_model=PaginatedResponse[ProductRead])
@@ -248,13 +297,15 @@ def list_products(
     credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer_scheme),
     db: Session = Depends(get_db),
 ):
+    requesting_staff = _current_staff_or_none(credentials, db)
+
     if active is None:
         # .filter(Product.is_active == True) excludes soft-deleted products
         # from the normal browsing list - they still exist in the
         # database, just hidden from this query.
         query = db.query(Product).filter(Product.is_active == True)  # noqa: E712
     else:
-        if active is False and _current_staff_or_none(credentials, db) is None:
+        if active is False and requesting_staff is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
         query = db.query(Product).filter(Product.is_active == active)
 
@@ -314,7 +365,7 @@ def list_products(
     total = query.count()
     products = query.offset(skip).limit(limit).all()
     return PaginatedResponse[ProductRead](
-        items=[_build_product_read(p, db) for p in products],
+        items=[_build_product_read(p, db, requesting_staff=requesting_staff) for p in products],
         pagination=build_pagination_meta(skip, limit, total),
     )
 
@@ -349,24 +400,72 @@ def create_product(
     _assert_on_sale_has_promotion(db, new_product)
 
     db.add(new_product)       # stage it for saving
-    db.flush()                # assigns new_product.id for the audit log entry below
+    db.flush()                # assigns new_product.id for the variant below
+
+    # Every product created through this endpoint gets exactly ONE
+    # purchasable variant up front - collapses what used to be two separate
+    # staff actions (create the product, then separately create its
+    # variant) into one, since the vast majority of products never need
+    # more than one SKU/price (added 2026-08-20, see CLAUDE.md's note).
+    # Staff can still add a genuinely separate variant (a different
+    # color/size that needs its own stock count) afterward via
+    # POST /products/{id}/variants (routers/variants.py's create_variant).
+    new_variant = ProductVariant(
+        product_id=new_product.id,
+        sku=product.sku,
+        price=product.price,
+    )
+    db.add(new_variant)
+    try:
+        db.flush()  # assigns new_variant.id for the inventory record below
+    except IntegrityError:
+        # Hits ProductVariant.sku's own unique=True constraint - same
+        # reasoning as routers/variants.py's create_variant. Roll back the
+        # PRODUCT too, not just the variant - a product with no variant at
+        # all isn't a state this endpoint should ever leave behind.
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A variant with this SKU already exists")
+
+    new_record = InventoryRecord(variant_id=new_variant.id, quantity_available=product.quantity_available)
+    db.add(new_record)
+    db.flush()  # assigns new_record.id for the movement log entry below
+
+    # Same "log the starting stock as a movement" convention
+    # create_inventory_record/set_variant_stock already follow - skipped
+    # when quantity_available is 0 since nothing actually moved yet.
+    if product.quantity_available > 0:
+        db.add(
+            InventoryMovement(
+                inventory_record_id=new_record.id,
+                movement_type=MovementType.STOCK_IN,
+                quantity_changed=product.quantity_available,
+                reason="Initial stock",
+                staff_user_id=current_staff.id,
+            )
+        )
+
     write_audit_log(
         db,
         staff_user_id=current_staff.id,
         action="product.create",
         resource_type="product",
         resource_id=new_product.id,
-        new_value={"name": new_product.name, "category_id": str(new_product.category_id)},
+        new_value={
+            "name": new_product.name,
+            "category_id": str(new_product.category_id),
+            "sku": product.sku,
+            "price": product.price,
+        },
     )
     db.commit()               # actually write it to Postgres
     db.refresh(new_product)   # pull back the id/timestamps Postgres just assigned
-    return _build_product_read(new_product, db)
+    return _build_product_read(new_product, db, requesting_staff=current_staff)
 
 
 @router.put("/{product_id}", response_model=ProductRead)
 def update_product(
     product_id: uuid.UUID,
-    product: ProductCreate,
+    product: ProductUpdate,
     current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
@@ -402,7 +501,7 @@ def update_product(
     )
     db.commit()
     db.refresh(existing)
-    return _build_product_read(existing, db)
+    return _build_product_read(existing, db, requesting_staff=current_staff)
 
 
 # Nyson's 2026-08-13 doc calls this PUT /admin/products/{product_id}/homepage-sections -
@@ -418,7 +517,7 @@ def update_product(
 def sync_product_homepage_sections(
     product_id: uuid.UUID,
     sync: ProductHomepageSectionsSync,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
     product = db.get(Product, product_id)
@@ -453,7 +552,7 @@ def sync_product_homepage_sections(
         db.add(ProductHomepageSection(product_id=product_id, homepage_section_id=section_id))
     db.commit()
     db.refresh(product)
-    return _build_product_read(product, db)
+    return _build_product_read(product, db, requesting_staff=current_staff)
 
 
 # DELETE no longer removes the row - per the docs, products are
@@ -508,7 +607,7 @@ def reactivate_product(
     )
     db.commit()
     db.refresh(existing)
-    return _build_product_read(existing, db)
+    return _build_product_read(existing, db, requesting_staff=current_staff)
 
 
 @router.post("/{product_id}/images", response_model=ProductImageRead)

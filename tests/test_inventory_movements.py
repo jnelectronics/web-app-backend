@@ -9,7 +9,6 @@ import pytest
 from conftest import uncategorized_group_id, unwrap
 from models import (
     AuditLog,
-    Branch,
     Cart,
     CartItem,
     Category,
@@ -60,7 +59,7 @@ def _auth(token):
 
 
 @pytest.fixture
-def variant_and_branch(db):
+def movement_variant(db):
     category = Category(name=f"Mv Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
@@ -69,12 +68,9 @@ def variant_and_branch(db):
     db.flush()
     variant = ProductVariant(product_id=product.id, sku=f"SKU-{uuid.uuid4().hex[:8]}", price=1000.0)
     db.add(variant)
-    db.flush()
-    branch = Branch(name="Mv Test Branch", address="Test Address")
-    db.add(branch)
     db.commit()
 
-    yield variant, branch
+    yield variant
 
     db.query(ProductVariant).filter(ProductVariant.id == variant.id).delete()
     db.commit()
@@ -82,17 +78,15 @@ def variant_and_branch(db):
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
     db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
-    db.commit()
 
 
-def test_creating_record_with_stock_logs_stock_in(client, db, variant_and_branch, staff_tokens):
-    variant, branch = variant_and_branch
+def test_creating_record_with_stock_logs_stock_in(client, db, movement_variant, staff_tokens):
+    variant = movement_variant
     headers = _auth(staff_tokens[StaffRole.OWNER])
 
     response = client.post(
         "/api/v1/inventory",
-        json={"variant_id": str(variant.id), "branch_id": str(branch.id), "quantity_available": 20},
+        json={"variant_id": str(variant.id), "quantity_available": 20},
         headers=headers,
     )
     assert response.status_code == 200
@@ -111,9 +105,9 @@ def test_creating_record_with_stock_logs_stock_in(client, db, variant_and_branch
     db.commit()
 
 
-def test_adjust_logs_custom_movement_type_and_reason(client, db, variant_and_branch, staff_tokens):
-    variant, branch = variant_and_branch
-    record = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
+def test_adjust_logs_custom_movement_type_and_reason(client, db, movement_variant, staff_tokens):
+    variant = movement_variant
+    record = InventoryRecord(variant_id=variant.id, quantity_available=10)
     db.add(record)
     db.commit()
     headers = _auth(staff_tokens[StaffRole.OWNER])
@@ -143,9 +137,9 @@ def test_adjust_logs_custom_movement_type_and_reason(client, db, variant_and_bra
     db.commit()
 
 
-def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, variant_and_branch, staff_tokens):
-    variant, branch = variant_and_branch
-    record = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
+def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, movement_variant, staff_tokens):
+    variant = movement_variant
+    record = InventoryRecord(variant_id=variant.id, quantity_available=10)
     db.add(record)
 
     customer = Customer(

@@ -105,42 +105,6 @@ class Category(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
-class Branch(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "branches"
-
-    name: Mapped[str] = mapped_column(String(150))
-    address: Mapped[str] = mapped_column(String(255))
-
-    # `str | None` = optional column - per the docs, phone/email aren't
-    # required for a branch to exist.
-    phone_number: Mapped[str | None] = mapped_column(String(20))
-    email: Mapped[str | None] = mapped_column(String(255))
-
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-
-    # Which branch the product-form "quantity" field (no branch picker -
-    # see routers/variants.py's stock endpoint) reads/writes against. Added
-    # because the storefront's admin product form was simplified to not
-    # collect a branch at all, but this project's inventory is genuinely
-    # per-branch - something still has to decide WHICH branch a plain
-    # "quantity" means.
-    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    __table_args__ = (
-        # Partial unique index, same technique as product_images'
-        # "uq_product_images_one_primary" below - only rows where
-        # is_default is true are checked against each other, so any number
-        # of branches can have is_default=False, but Postgres itself
-        # refuses a second branch ever being flagged default at the same time.
-        Index(
-            "uq_branches_single_default",
-            "is_default",
-            unique=True,
-            postgresql_where=text("is_default = true"),
-        ),
-    )
-
-
 class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "products"
 
@@ -212,8 +176,8 @@ class ProductVariant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Per the docs, this is what actually gets bought/stocked/priced - a
     # Product is just the shared "listing" (name, category); each variant
     # is one purchasable option under it (e.g. a specific color/size),
-    # with its own SKU and price. Inventory tracks stock per-variant,
-    # per-branch - never per-product directly.
+    # with its own SKU and price. Inventory tracks stock per-variant -
+    # never per-product directly.
     __tablename__ = "product_variants"
 
     product_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("products.id"))
@@ -279,14 +243,15 @@ class VariantAttribute(UUIDPrimaryKeyMixin, Base):
 
 
 class InventoryRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    # One row per (variant, branch) pair - e.g. "10 units of the Black
-    # FreePods 4 variant at the Westlands branch". This is deliberately its
-    # own table rather than columns on ProductVariant, since a variant's
-    # stock differs branch to branch.
+    # One row per variant, globally - e.g. "10 units of the Black FreePods 4
+    # variant, period." This project used to track stock per-branch (one row
+    # per variant+branch pair), but the client decided branches don't exist
+    # as a concept at all - every delivery comes from the same place, so
+    # there's nothing for stock to be split across. See CLAUDE.md's
+    # 2026-08-20 note for the full story on why Branch disappeared entirely.
     __tablename__ = "inventory_records"
 
     variant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("product_variants.id"))
-    branch_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("branches.id"))
 
     # Integer, not float - you can't have half a unit of stock.
     quantity_available: Mapped[int] = mapped_column(Integer, default=0)
@@ -302,10 +267,10 @@ class InventoryRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         # line of defense even if application code has a bug.
         CheckConstraint("quantity_available >= 0", name="ck_quantity_available_non_negative"),
         CheckConstraint("quantity_reserved >= 0", name="ck_quantity_reserved_non_negative"),
-        # One branch can only have ONE stock row per variant - stock
-        # adjustments update that single row rather than ever inserting
-        # a duplicate for the same (variant, branch) pair.
-        UniqueConstraint("variant_id", "branch_id", name="uq_inventory_variant_branch"),
+        # A variant can only have ONE stock row now - stock adjustments
+        # update that single row rather than ever inserting a duplicate for
+        # the same variant.
+        UniqueConstraint("variant_id", name="uq_inventory_variant"),
     )
 
 
@@ -544,9 +509,6 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # X-Guest-Token header already used for cart operations, just checked
     # against this snapshot instead of a live Cart row.
     guest_token: Mapped[str | None] = mapped_column(String(100))
-
-    # NULL until a branch with enough stock is found during checkout.
-    fulfilling_branch_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("branches.id"))
 
     # Always collected, even for a registered customer, since the docs'
     # checkout example takes this per-order - keeps delivery details tied

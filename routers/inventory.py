@@ -1,7 +1,7 @@
 # All the HTTP routes for the "inventory" domain live here.
 # Unlike the other domains, inventory records aren't soft-deleted (there's
 # no is_active column) - a zero-stock row is still meaningful, it just
-# means "this branch currently has none of this variant."
+# means "this variant currently has none in stock."
 
 import uuid
 from datetime import datetime
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from audit import write_audit_log
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Branch, InventoryMovement, InventoryRecord, MovementType, ProductVariant, StaffRole, StaffUser
+from models import InventoryMovement, InventoryRecord, MovementType, ProductVariant, StaffRole, StaffUser
 from pagination import build_pagination_meta
 from schemas import InventoryAdjust, InventoryCreate, InventoryMovementRead, InventoryRead, PaginatedResponse
 from security import require_staff_role
@@ -41,15 +41,14 @@ router = APIRouter(prefix="/inventory", tags=["inventory"], route_class=Envelope
 
 
 # Not in the original spec - the only movement endpoint used to be scoped
-# to ONE inventory record, meaning a branch-wide "what's moved here
-# recently" view (the admin dashboard's stock history) needed one request
-# PER inventory record - an N+1 that grows with the catalogue. Registered
+# to ONE inventory record, meaning a "what's moved here recently across the
+# whole catalogue" view (the admin dashboard's stock history) needed one
+# request PER inventory record - an N+1 that grows with the catalogue. Registered
 # BEFORE "/{inventory_id}" below, same reasoning as routers/orders.py's
 # "/staff" - a fixed path ahead of a param path that could otherwise
 # swallow it (see CLAUDE.md's route-registration-order gotcha).
 @router.get("/movements", response_model=PaginatedResponse[InventoryMovementRead])
 def list_movements(
-    branch_id: uuid.UUID | None = None,
     variant_id: uuid.UUID | None = None,
     movement_type: MovementType | None = None,
     start_date: datetime | None = None,
@@ -59,15 +58,13 @@ def list_movements(
     _current_staff: StaffUser = Depends(require_staff_role(*VIEW_INVENTORY_ROLES)),
     db: Session = Depends(get_db),
 ):
-    # branch_id/variant_id aren't columns on InventoryMovement itself - it
-    # only points at inventory_record_id - so filtering by either means
-    # joining through InventoryRecord first.
+    # variant_id isn't a column on InventoryMovement itself - it only points
+    # at inventory_record_id - so filtering by it means joining through
+    # InventoryRecord first.
     query = db.query(InventoryMovement).join(
         InventoryRecord, InventoryMovement.inventory_record_id == InventoryRecord.id
     )
 
-    if branch_id is not None:
-        query = query.filter(InventoryRecord.branch_id == branch_id)
     if variant_id is not None:
         query = query.filter(InventoryRecord.variant_id == variant_id)
     if movement_type is not None:
@@ -99,7 +96,6 @@ def read_inventory_record(
 
 @router.get("", response_model=PaginatedResponse[InventoryRead])
 def list_inventory_records(
-    branch_id: uuid.UUID | None = None,
     variant_id: uuid.UUID | None = None,
     skip: int = 0,
     limit: int = 10,
@@ -108,10 +104,7 @@ def list_inventory_records(
 ):
     query = db.query(InventoryRecord)
 
-    # Both filters are optional and combinable - e.g. ?branch_id=X&variant_id=Y
-    # narrows to the exact (variant, branch) row.
-    if branch_id is not None:
-        query = query.filter(InventoryRecord.branch_id == branch_id)
+    # Optional - e.g. ?variant_id=Y narrows to that one variant's stock row.
     if variant_id is not None:
         query = query.filter(InventoryRecord.variant_id == variant_id)
 
@@ -131,12 +124,9 @@ def create_inventory_record(
 ):
     if db.get(ProductVariant, record.variant_id) is None:
         raise HTTPException(status_code=404, detail="Variant not found")
-    if db.get(Branch, record.branch_id) is None:
-        raise HTTPException(status_code=404, detail="Branch not found")
 
     new_record = InventoryRecord(
         variant_id=record.variant_id,
-        branch_id=record.branch_id,
         quantity_available=record.quantity_available,
         quantity_reserved=record.quantity_reserved,
     )
@@ -144,13 +134,13 @@ def create_inventory_record(
     try:
         db.flush()
     except IntegrityError:
-        # Hits the UNIQUE(variant_id, branch_id) constraint - this
-        # variant/branch pair already has a stock row, so create a new one
-        # doesn't make sense; the caller should adjust the existing one instead.
+        # Hits the UNIQUE(variant_id) constraint - this variant already has
+        # a stock row, so creating a new one doesn't make sense; the caller
+        # should adjust the existing one instead.
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Inventory record already exists for this variant/branch pair",
+            detail="Inventory record already exists for this variant",
         )
 
     # Log the record's starting stock as a movement, same as any other

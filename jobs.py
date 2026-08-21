@@ -171,8 +171,8 @@ def notify_staff_new_order(
 ) -> None:
     # Spec'd alongside send_order_confirmation_email in the same sequence
     # diagram ("Enqueue notify_staff_new_order") - fires for EVERY active
-    # staff member, regardless of role or branch (a deliberate, simple
-    # choice - not every staff role even manages orders day to day, but
+    # staff member, regardless of role (a deliberate, simple choice - not
+    # every staff role even manages orders day to day, but
     # the docs don't specify a narrower audience, and "everyone sees it"
     # is easy to reason about and safe to start with).
     if not staff_emails:

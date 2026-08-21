@@ -13,7 +13,6 @@ from rate_limit import RateLimitedError
 from routers import (
     audit,
     auth,
-    branches,
     cart,
     categories,
     customers,
@@ -270,7 +269,6 @@ def validation_exception_handler(request: Request, exc: RequestValidationError):
 app.include_router(products.router, prefix="/api/v1")
 app.include_router(categories.router, prefix="/api/v1")
 app.include_router(categories.group_router, prefix="/api/v1")
-app.include_router(branches.router, prefix="/api/v1")
 app.include_router(variants.router, prefix="/api/v1")
 app.include_router(inventory.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")

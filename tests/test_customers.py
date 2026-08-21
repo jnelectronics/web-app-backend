@@ -7,7 +7,7 @@ import uuid
 import pytest
 
 from conftest import uncategorized_group_id, unwrap
-from models import Branch, Category, Customer, CustomerAddress, Order, Product, ProductVariant, RefreshToken, StaffRole, StaffUser
+from models import Category, Customer, CustomerAddress, Order, Product, ProductVariant, RefreshToken, StaffRole, StaffUser
 from security import create_access_token, hash_password
 
 
@@ -105,14 +105,10 @@ def customer_order(db, customer):
     variant = ProductVariant(product_id=product.id, sku=f"SKU-{uuid.uuid4().hex[:8]}", price=1000.0)
     db.add(variant)
     db.flush()
-    branch = Branch(name="Cust Test Branch", address="Test Address")
-    db.add(branch)
-    db.flush()
 
     order = Order(
         order_number=f"JN-TEST-{uuid.uuid4().hex[:8]}",
         customer_id=customer.id,
-        fulfilling_branch_id=branch.id,
         guest_full_name=customer.full_name,
         guest_phone_number="+256700000000",
         delivery_address="Test Address",
@@ -132,8 +128,6 @@ def customer_order(db, customer):
     db.query(Product).filter(Product.id == product.id).delete()
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
-    db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
     db.commit()
 
 

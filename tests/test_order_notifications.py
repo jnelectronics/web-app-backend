@@ -15,7 +15,6 @@ import pytest
 
 from conftest import uncategorized_group_id, unwrap
 from models import (
-    Branch,
     Cart,
     CartItem,
     Category,
@@ -50,11 +49,7 @@ def checkout_setup(db):
     db.add(variant)
     db.flush()
 
-    branch = Branch(name="Notify Test Branch", address="1 Test Way")
-    db.add(branch)
-    db.flush()
-
-    inventory = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
+    inventory = InventoryRecord(variant_id=variant.id, quantity_available=10)
     db.add(inventory)
 
     customer = Customer(
@@ -67,7 +62,7 @@ def checkout_setup(db):
 
     token = create_access_token(subject=str(customer.id), account_type="customer")
 
-    yield {"variant": variant, "branch": branch, "customer": customer, "token": token}
+    yield {"variant": variant, "customer": customer, "token": token}
 
     # Teardown in FK-dependency order (see CLAUDE.md) - checkout() creates
     # Order/OrderItem/InventoryMovement rows this fixture's setup never
@@ -99,8 +94,6 @@ def checkout_setup(db):
     db.query(Product).filter(Product.id == product.id).delete()
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
-    db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
     db.commit()
 
 
@@ -146,7 +139,7 @@ def _add_to_cart(client, token, variant_id, quantity=1):
 
 def test_checkout_409_reports_which_items_are_short(client, checkout_setup, active_staff, mock_email):
     # checkout_setup's InventoryRecord has 10 units available - requesting
-    # more than that means no branch can fulfill it.
+    # more than that means there isn't enough stock to fulfill it.
     _add_to_cart(client, checkout_setup["token"], checkout_setup["variant"].id, quantity=999)
 
     response = client.post(

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from models import Branch, InventoryMovement, InventoryRecord, MovementType, Product, ProductVariant, StaffRole, StaffUser, VariantAttribute
+from models import InventoryMovement, InventoryRecord, MovementType, Product, ProductVariant, StaffRole, StaffUser, VariantAttribute
 from pagination import build_pagination_meta
 from schemas import PaginatedResponse, SkuAvailability, VariantCreate, VariantRead, VariantStockUpdate
 from security import decode_token_claims, require_staff_role
@@ -47,9 +47,9 @@ def _build_variant_read(variant: ProductVariant, db: Session, *, requesting_staf
     # Shared by every route below - re-reads this variant's attributes
     # fresh from the database, same pattern as cart.py's _build_cart_read.
     attribute_rows = db.query(VariantAttribute).filter(VariantAttribute.variant_id == variant.id).all()
-    # ANY branch with stock > 0 makes this true - a plain existence check,
-    # not a sum, since a customer only needs to know "can I buy this
-    # somewhere", not the total quantity across every branch.
+    # Whether this variant's single stock row has any quantity available -
+    # a plain existence check, not a number, since a customer only needs to
+    # know "can I buy this", not the exact count.
     in_stock = (
         db.query(InventoryRecord)
         .filter(InventoryRecord.variant_id == variant.id, InventoryRecord.quantity_available > 0)
@@ -62,15 +62,9 @@ def _build_variant_read(variant: ProductVariant, db: Session, *, requesting_staf
     # this field for why) - stays None for the public storefront call.
     quantity_available = None
     if requesting_staff is not None:
-        default_branch = db.query(Branch).filter(Branch.is_default == True).first()  # noqa: E712
-        if default_branch is not None:
-            record = (
-                db.query(InventoryRecord)
-                .filter(InventoryRecord.variant_id == variant.id, InventoryRecord.branch_id == default_branch.id)
-                .first()
-            )
-            # No record yet just means "never stocked" - 0, not unknown.
-            quantity_available = record.quantity_available if record is not None else 0
+        record = db.query(InventoryRecord).filter(InventoryRecord.variant_id == variant.id).first()
+        # No record yet just means "never stocked" - 0, not unknown.
+        quantity_available = record.quantity_available if record is not None else 0
 
     return VariantRead(
         id=variant.id,
@@ -182,7 +176,7 @@ def create_variant(
         # Hits ProductVariant.sku's own unique=True constraint - same
         # "pre-check would need a second query anyway, so just catch the
         # constraint instead" reasoning as create_inventory_record's
-        # (variant_id, branch_id) check in routers/inventory.py.
+        # (variant_id) check in routers/inventory.py.
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A variant with this SKU already exists")
 
@@ -244,10 +238,9 @@ def set_variant_stock(
     current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
     db: Session = Depends(get_db),
 ):
-    # The branch-less "quantity" field on the admin product form - see
-    # models.py's Branch.is_default. Always resolves against whichever ONE
-    # branch is flagged default; multi-branch stock management still goes
-    # through the real per-branch /inventory endpoints, untouched by this.
+    # The admin product form's plain "quantity" field - stock is just a
+    # single global number per variant now, no branch concept left to
+    # resolve against at all (see CLAUDE.md's 2026-08-20 note).
     variant = db.get(ProductVariant, variant_id)
     if variant is None:
         raise HTTPException(status_code=404, detail="Variant not found")
@@ -255,29 +248,14 @@ def set_variant_stock(
     if update.quantity_available < 0:
         raise HTTPException(status_code=422, detail="quantity_available cannot be negative")
 
-    default_branch = db.query(Branch).filter(Branch.is_default == True).first()  # noqa: E712
-    if default_branch is None:
-        # Only reachable if every branch's is_default got manually cleared -
-        # the migration that added this column auto-flagged one branch, and
-        # routers/branches.py's set_default_branch always clears-then-sets
-        # rather than ever leaving zero. Still worth a clean error over a
-        # confusing "NoneType has no attribute id" crash.
-        raise HTTPException(status_code=422, detail="No default branch is configured")
-
-    record = (
-        db.query(InventoryRecord)
-        .filter(InventoryRecord.variant_id == variant_id, InventoryRecord.branch_id == default_branch.id)
-        .first()
-    )
+    record = db.query(InventoryRecord).filter(InventoryRecord.variant_id == variant_id).first()
 
     if record is None:
         # First time this variant has ever been stocked - create the row
         # rather than requiring a separate POST /inventory call first,
-        # which is the whole point of this endpoint (product create flow
-        # never has to know a branch_id exists at all).
+        # which is the whole point of this endpoint.
         record = InventoryRecord(
             variant_id=variant_id,
-            branch_id=default_branch.id,
             quantity_available=0,
             quantity_reserved=0,
         )

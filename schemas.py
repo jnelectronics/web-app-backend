@@ -123,30 +123,6 @@ class CategoryRead(BaseModel):
     updated_at: datetime
 
 
-class BranchCreate(BaseModel):
-    name: str
-    address: str
-    phone_number: str | None = None
-    email: str | None = None
-
-
-class BranchRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    name: str
-    address: str
-    phone_number: str | None
-    email: str | None
-    is_active: bool
-    # Which branch the branch-less product-form "quantity" field reads/
-    # writes against - see routers/variants.py's stock endpoint and
-    # routers/branches.py's set_default_branch.
-    is_default: bool
-    created_at: datetime
-    updated_at: datetime
-
-
 class ProductCreate(BaseModel):
     # The client must say which category this product belongs to -
     # matches the NOT NULL foreign key on the real products table.
@@ -172,6 +148,34 @@ class ProductCreate(BaseModel):
     # schema, on POST) is never true yet, since apply-promotion needs a
     # real product id to target. Practically: create with this False, then
     # POST /products/{id}/apply-promotion, which flips it on for you.
+    is_on_sale: bool = False
+
+    # Collapses "create a product" + "create its one purchasable variant"
+    # into a single staff action (added 2026-08-20 - see CLAUDE.md's note).
+    # Every product needs at least one priced/stocked ProductVariant to be
+    # sellable at all, so these are required here rather than a separate
+    # follow-up call most products would never actually need. Staff can
+    # still add a genuinely separate variant (a different color/size that
+    # needs its OWN stock count) afterward via POST /products/{id}/variants.
+    sku: str
+    price: float
+    # Defaults to 0 - a listing often gets created before physical stock
+    # has actually arrived.
+    quantity_available: int = 0
+
+
+class ProductUpdate(BaseModel):
+    # Used by PUT /products/{id} - deliberately does NOT include
+    # sku/price/quantity_available like ProductCreate above. A product can
+    # end up with more than one variant (via POST /products/{id}/variants),
+    # so there's no single price/sku a plain product-details edit could
+    # safely overwrite - editing an existing variant's price/sku goes
+    # through PUT /variants/{id} directly instead.
+    category_id: uuid.UUID
+    name: str
+    description: str | None = Field(default=None, max_length=2000)
+    is_featured: bool = False
+    is_new_arrival: bool = False
     is_on_sale: bool = False
 
 
@@ -207,6 +211,24 @@ class ProductRead(BaseModel):
     # the product belongs to none.
     homepage_section_ids: list[uuid.UUID] = []
 
+    # Added 2026-08-21 for the admin dashboard, which lists/edits products
+    # without wanting a second GET /variants call per row just to show price.
+    # Both come from this product's DEFAULT variant (the oldest active
+    # ProductVariant under it - the one the 2026-08-20 collapsed-create
+    # change always creates alongside the product) - see
+    # routers/products.py's _build_product_read for exactly how that's
+    # picked. A product can still have MORE variants (a genuine color/size
+    # split via POST /products/{id}/variants), each with its own price/sku -
+    # those still only ever show up via GET /variants?product_id=<id>, same
+    # as before. None only for the edge case of a product with no active
+    # variant left at all (every variant soft-deleted).
+    sku: str | None
+    price: float | None
+    # A REAL number, so - same reasoning as VariantRead.quantity_available -
+    # only ever populated for a staff-authenticated caller; always None on a
+    # public/customer request.
+    quantity_available: int | None = None
+
 
 class VariantCreate(BaseModel):
     # The client must say which product this variant belongs to - matches
@@ -235,14 +257,13 @@ class VariantRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     attributes: dict[str, str]
-    # Aggregate across EVERY branch's InventoryRecord for this variant -
-    # deliberately just a boolean, exposing no actual quantities or which
-    # branch(es) have stock (inventory levels are staff-only information).
-    # No "low_stock" flag alongside this yet - that needs a threshold
-    # (how few units counts as "low"?) that's a product decision, not
-    # something to invent a number for here.
+    # Whether this variant's single global InventoryRecord has any stock -
+    # deliberately just a boolean, exposing no actual quantity (inventory
+    # levels are staff-only information). No "low_stock" flag alongside
+    # this yet - that needs a threshold (how few units counts as "low"?)
+    # that's a product decision, not something to invent a number for here.
     in_stock: bool
-    # The DEFAULT branch's actual quantity_available - unlike in_stock
+    # The variant's actual global quantity_available - unlike in_stock
     # above, this IS a real number, so it's only ever populated for a
     # staff-authenticated caller (routers/variants.py's read routes accept
     # an OPTIONAL staff token for exactly this reason). A public/customer
@@ -297,10 +318,9 @@ ProductRead.model_rebuild()
 
 class InventoryCreate(BaseModel):
     variant_id: uuid.UUID
-    branch_id: uuid.UUID
-    # Defaults to 0 - a stock record for a variant/branch pair usually
-    # starts empty and gets stocked up afterwards via the adjust endpoint,
-    # rather than being created with an arbitrary starting count.
+    # Defaults to 0 - a stock record for a variant usually starts empty and
+    # gets stocked up afterwards via the adjust endpoint, rather than being
+    # created with an arbitrary starting count.
     quantity_available: int = 0
     quantity_reserved: int = 0
 
@@ -310,7 +330,6 @@ class InventoryRead(BaseModel):
 
     id: uuid.UUID
     variant_id: uuid.UUID
-    branch_id: uuid.UUID
     quantity_available: int
     quantity_reserved: int
     created_at: datetime
@@ -577,7 +596,6 @@ class OrderRead(BaseModel):
     id: uuid.UUID
     order_number: str
     customer_id: uuid.UUID | None
-    fulfilling_branch_id: uuid.UUID | None
     guest_full_name: str
     guest_phone_number: str
     guest_email: str | None

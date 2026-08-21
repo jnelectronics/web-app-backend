@@ -7,7 +7,7 @@ import uuid
 import pytest
 
 from conftest import uncategorized_group_id, unwrap
-from models import AuditLog, Category, Product, ProductDiscount, ProductImage, ProductVariant, StaffRole, StaffUser, VariantAttribute
+from models import AuditLog, Category, InventoryRecord, Product, ProductDiscount, ProductImage, ProductVariant, StaffRole, StaffUser, VariantAttribute
 from security import create_access_token, hash_password
 
 
@@ -237,17 +237,29 @@ def test_product_list_filtering_search_sort_and_pagination(client, db, owner_tok
                 "name": "Apple Widget",
                 "description": "A shiny gadget",
                 "is_featured": True,
+                "sku": f"SKU-{uuid.uuid4().hex[:8]}",
+                "price": 1000.0,
             },
             headers=headers,
         )
         banana_response = client.post(
             "/api/v1/products",
-            json={"category_id": str(category.id), "name": "Banana Widget"},
+            json={
+                "category_id": str(category.id),
+                "name": "Banana Widget",
+                "sku": f"SKU-{uuid.uuid4().hex[:8]}",
+                "price": 1000.0,
+            },
             headers=headers,
         )
         other_category_response = client.post(
             "/api/v1/products",
-            json={"category_id": str(other_category.id), "name": "Cherry Widget"},
+            json={
+                "category_id": str(other_category.id),
+                "name": "Cherry Widget",
+                "sku": f"SKU-{uuid.uuid4().hex[:8]}",
+                "price": 1000.0,
+            },
             headers=headers,
         )
         assert apple_response.status_code == 200
@@ -302,6 +314,14 @@ def test_product_list_filtering_search_sort_and_pagination(client, db, owner_tok
         db.commit()
         db.query(ProductDiscount).filter(ProductDiscount.product_id.in_(product_ids)).delete(synchronize_session=False)
         db.commit()
+        # POST /products now also creates a default variant + stock record
+        # (see CLAUDE.md's 2026-08-20 note) - clean those up before the
+        # products they point at.
+        variant_ids = [v.id for v in db.query(ProductVariant).filter(ProductVariant.product_id.in_(product_ids)).all()]
+        db.query(InventoryRecord).filter(InventoryRecord.variant_id.in_(variant_ids)).delete(synchronize_session=False)
+        db.commit()
+        db.query(ProductVariant).filter(ProductVariant.id.in_(variant_ids)).delete(synchronize_session=False)
+        db.commit()
         db.query(Product).filter(Product.id.in_(product_ids)).delete(synchronize_session=False)
         db.commit()
         db.query(Category).filter(Category.id.in_(all_category_ids)).delete(synchronize_session=False)
@@ -322,6 +342,8 @@ def test_product_read_includes_new_fields_and_computed_discount(client, db, owne
                 "name": "Field Test Product",
                 "description": "A great product",
                 "is_featured": True,
+                "sku": f"SKU-{uuid.uuid4().hex[:8]}",
+                "price": 1000.0,
             },
             headers=headers,
         )
@@ -338,7 +360,12 @@ def test_product_read_includes_new_fields_and_computed_discount(client, db, owne
         # not a duplicate (the column is unique) or a crash
         response2 = client.post(
             "/api/v1/products",
-            json={"category_id": str(category.id), "name": "Field Test Product"},
+            json={
+                "category_id": str(category.id),
+                "name": "Field Test Product",
+                "sku": f"SKU-{uuid.uuid4().hex[:8]}",
+                "price": 1000.0,
+            },
             headers=headers,
         )
         assert response2.status_code == 200
@@ -371,6 +398,14 @@ def test_product_read_includes_new_fields_and_computed_discount(client, db, owne
         ).delete(synchronize_session=False)
         db.commit()
         db.query(ProductDiscount).filter(ProductDiscount.product_id.in_(product_ids)).delete(synchronize_session=False)
+        db.commit()
+        # POST /products now also creates a default variant + stock record
+        # (see CLAUDE.md's 2026-08-20 note) - clean those up before the
+        # products they point at.
+        variant_ids = [v.id for v in db.query(ProductVariant).filter(ProductVariant.product_id.in_(product_ids)).all()]
+        db.query(InventoryRecord).filter(InventoryRecord.variant_id.in_(variant_ids)).delete(synchronize_session=False)
+        db.commit()
+        db.query(ProductVariant).filter(ProductVariant.id.in_(variant_ids)).delete(synchronize_session=False)
         db.commit()
         db.query(Product).filter(Product.id.in_(product_ids)).delete(synchronize_session=False)
         db.commit()

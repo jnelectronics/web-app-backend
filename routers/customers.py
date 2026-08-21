@@ -217,7 +217,7 @@ def delete_my_address(
     current_customer: Customer = Depends(get_current_customer),
     db: Session = Depends(get_db),
 ):
-    # A real delete, not a soft one - unlike products/branches/etc, the
+    # A real delete, not a soft one - unlike products/categories/etc, the
     # docs describe this as "Remove a saved address", and there's no
     # audit/history need for a customer's own address book the way there
     # is for catalog data staff manage.

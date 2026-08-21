@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import func, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from audit import write_audit_log
@@ -15,7 +15,6 @@ from database import get_db
 from envelope import EnvelopeRoute
 from jobs import notify_staff_new_order, send_order_confirmation_email
 from models import (
-    Branch,
     Cart,
     CartItem,
     CartStatus,
@@ -124,50 +123,17 @@ def _generate_order_number(db: Session) -> str:
     return f"JN-{today}-{count_today + 1:04d}"
 
 
-def _find_fulfilling_branch(db: Session, cart_items: list[CartItem]) -> Branch | None:
-    # Naive rule (the docs don't specify the real one): the first active
-    # branch that has enough quantity_available of EVERY item in the cart.
-    branches = db.query(Branch).filter(Branch.is_active == True).all()  # noqa: E712
-    for branch in branches:
-        has_enough_stock = True
-        for item in cart_items:
-            record = (
-                db.query(InventoryRecord)
-                .filter(
-                    InventoryRecord.branch_id == branch.id,
-                    InventoryRecord.variant_id == item.variant_id,
-                )
-                .first()
-            )
-            if record is None or record.quantity_available < item.quantity:
-                has_enough_stock = False
-                break
-        if has_enough_stock:
-            return branch
-    return None
-
-
 def _find_short_items(db: Session, cart_items: list[CartItem]) -> list[dict]:
-    # Only called when NO single branch could fulfill the whole cart -
-    # reports, per item, the most stock available at any ONE active branch
-    # vs what was requested. Not in the original spec.
-    #
-    # An item with enough stock SOMEWHERE (just not at the same branch as
-    # everything else in the cart) won't show up here - this reports
-    # genuine system-wide shortfalls, not the "split across branches"
-    # case, which is a real but different problem this simple per-branch
-    # fulfillment rule doesn't attempt to solve (see _find_fulfilling_branch).
+    # There's only ever one global InventoryRecord per variant now (no more
+    # branches to search across) - this just checks each cart item against
+    # that single stock row and reports any that don't have enough.
     short_items = []
     for item in cart_items:
-        best_available = (
-            db.query(func.max(InventoryRecord.quantity_available))
-            .join(Branch, InventoryRecord.branch_id == Branch.id)
-            .filter(InventoryRecord.variant_id == item.variant_id, Branch.is_active == True)  # noqa: E712
-            .scalar()
-        ) or 0
-        if best_available < item.quantity:
+        record = db.query(InventoryRecord).filter(InventoryRecord.variant_id == item.variant_id).first()
+        available = record.quantity_available if record is not None else 0
+        if available < item.quantity:
             short_items.append(
-                {"variant_id": str(item.variant_id), "requested": item.quantity, "available": best_available}
+                {"variant_id": str(item.variant_id), "requested": item.quantity, "available": available}
             )
     return short_items
 
@@ -178,7 +144,6 @@ def _build_order_read(order: Order, db: Session) -> OrderRead:
         id=order.id,
         order_number=order.order_number,
         customer_id=order.customer_id,
-        fulfilling_branch_id=order.fulfilling_branch_id,
         guest_full_name=order.guest_full_name,
         guest_phone_number=order.guest_phone_number,
         guest_email=order.guest_email,
@@ -205,8 +170,8 @@ def checkout(
     if not cart_items:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cart is empty")
 
-    branch = _find_fulfilling_branch(db, cart_items)
-    if branch is None:
+    short_items = _find_short_items(db, cart_items)
+    if short_items:
         # warning, not error - this is a real business event worth having
         # visibility into (repeated occurrences might mean a restocking
         # problem), but it's an EXPECTED outcome the app already handles
@@ -214,10 +179,10 @@ def checkout(
         # LoggingIntegration only turns ERROR+ into its own Issue by
         # default, so this becomes a breadcrumb/log entry, not a false-alarm
         # error notification.
-        logger.warning("Checkout failed: no branch has enough stock for cart %s", cart.id)
+        logger.warning("Checkout failed: not enough stock for cart %s", cart.id)
         raise InsufficientInventoryError(
-            "No branch has enough stock to fulfill this order",
-            short_items=_find_short_items(db, cart_items),
+            "Not enough stock to fulfill this order",
+            short_items=short_items,
         )
 
     # Build the order's line items BEFORE touching inventory, so if
@@ -263,7 +228,6 @@ def checkout(
         # prove ownership of this order later, when paying for it
         # (routers/payments.py), since they have no account/login at all.
         guest_token=cart.guest_token,
-        fulfilling_branch_id=branch.id,
         guest_full_name=request.guest_full_name,
         guest_phone_number=request.guest_phone_number,
         guest_email=request.guest_email,
@@ -280,14 +244,10 @@ def checkout(
         order_item.order_id = new_order.id
         db.add(order_item)
 
-    # Decrement the chosen branch's stock for every item now that the
-    # order is committed to existing.
+    # Decrement each item's single global stock row now that the order is
+    # committed to existing.
     for item in cart_items:
-        record = (
-            db.query(InventoryRecord)
-            .filter(InventoryRecord.branch_id == branch.id, InventoryRecord.variant_id == item.variant_id)
-            .first()
-        )
+        record = db.query(InventoryRecord).filter(InventoryRecord.variant_id == item.variant_id).first()
         record.quantity_available -= item.quantity
         # staff_user_id=None - a checkout is system-generated (the docs
         # explicitly call this out: null for system-generated 'sold'
@@ -308,9 +268,7 @@ def checkout(
 
     db.commit()
     db.refresh(new_order)
-    logger.info(
-        "Order %s placed (branch=%s, total=%s)", new_order.order_number, branch.id, new_order.total
-    )
+    logger.info("Order %s placed (total=%s)", new_order.order_number, new_order.total)
 
     # Spec'd in docs/JN_API_Specification.md's checkout sequence diagram
     # (§4.2) - both run AFTER this response is sent (see jobs.py's module
@@ -496,14 +454,7 @@ def cancel_order(
     # going to be fulfilled.
     order_items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
     for item in order_items:
-        record = (
-            db.query(InventoryRecord)
-            .filter(
-                InventoryRecord.branch_id == order.fulfilling_branch_id,
-                InventoryRecord.variant_id == item.variant_id,
-            )
-            .first()
-        )
+        record = db.query(InventoryRecord).filter(InventoryRecord.variant_id == item.variant_id).first()
         if record is not None:
             record.quantity_available += item.quantity
             # Closest fit among the docs' fixed movement_type set for "an

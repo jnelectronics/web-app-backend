@@ -9,7 +9,7 @@ import uuid
 import pytest
 
 from conftest import uncategorized_group_id, unwrap
-from models import Branch, Cart, CartItem, Category, Customer, InventoryRecord, Product, ProductImage, ProductVariant
+from models import Cart, CartItem, Category, Customer, InventoryRecord, Product, ProductImage, ProductVariant
 from security import create_access_token, hash_password
 
 
@@ -36,10 +36,7 @@ def cart_setup(db):
     image = ProductImage(product_id=product.id, image_url="https://res.cloudinary.com/test/cart.png", is_primary=True)
     db.add(image)
 
-    branch = Branch(name="Cart Test Branch", address="1 Cart Way")
-    db.add(branch)
-    db.flush()
-    db.add(InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10))
+    db.add(InventoryRecord(variant_id=variant.id, quantity_available=10))
 
     customer = Customer(
         full_name="Cart Test Customer",
@@ -70,8 +67,6 @@ def cart_setup(db):
     db.query(Product).filter(Product.id == product.id).delete()
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
-    db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
     db.commit()
 
 

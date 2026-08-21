@@ -1,8 +1,7 @@
-# Verifies the staff role gates on categories, products, variants,
-# branches, and inventory. Only covers categories + branches + inventory
-# directly (products/variants use the exact same require_staff_role(...)
-# pattern, already proven here) to avoid five near-identical copies of the
-# same test.
+# Verifies the staff role gates on categories, products, variants, and
+# inventory. Only covers categories + inventory directly (products/variants
+# use the exact same require_staff_role(...) pattern, already proven here)
+# to avoid several near-identical copies of the same test.
 #
 # As of the 2026-08-18 RBAC widening, Sales Attendant gained access to
 # every admin section except Staff and Audit Logs - so for these three
@@ -18,7 +17,6 @@ import pytest
 from conftest import uncategorized_group_id, unwrap
 from models import (
     AuditLog,
-    Branch,
     Category,
     InventoryMovement,
     InventoryRecord,
@@ -99,29 +97,6 @@ def test_category_write_allows_any_staff_role(client, staff_tokens, db):
         db.commit()
 
 
-def test_branch_read_requires_any_staff_role(client, staff_tokens):
-    response = client.get("/api/v1/branches")
-    assert response.status_code == 401
-
-    # ANY staff role can list branches - the docs say just "Staff" here,
-    # not a specific role, unlike categories/products/inventory writes.
-    for role in StaffRole:
-        response = client.get("/api/v1/branches", headers=_auth(staff_tokens[role]))
-        assert response.status_code == 200
-
-
-def test_branch_write_allows_any_staff_role(client, staff_tokens, db):
-    for role in StaffRole:
-        response = client.post(
-            "/api/v1/branches",
-            json={"name": f"Test Branch {uuid.uuid4().hex[:8]}", "address": "123 Test Street"},
-            headers=_auth(staff_tokens[role]),
-        )
-        assert response.status_code == 200
-        db.query(Branch).filter(Branch.id == uuid.UUID(unwrap(response)["id"])).delete()
-        db.commit()
-
-
 @pytest.fixture
 def inventory_record(db):
     category = Category(name=f"Inv Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
@@ -133,10 +108,7 @@ def inventory_record(db):
     variant = ProductVariant(product_id=product.id, sku=f"SKU-{uuid.uuid4().hex[:8]}", price=1000.0)
     db.add(variant)
     db.flush()
-    branch = Branch(name="Inv Test Branch", address="Test Address")
-    db.add(branch)
-    db.flush()
-    record = InventoryRecord(variant_id=variant.id, branch_id=branch.id, quantity_available=10)
+    record = InventoryRecord(variant_id=variant.id, quantity_available=10)
     db.add(record)
     db.commit()
 
@@ -155,8 +127,6 @@ def inventory_record(db):
     db.query(Product).filter(Product.id == product.id).delete()
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
-    db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
     db.commit()
 
 

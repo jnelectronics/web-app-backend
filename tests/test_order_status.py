@@ -9,7 +9,6 @@ import pytest
 from conftest import uncategorized_group_id, unwrap
 from models import (
     AuditLog,
-    Branch,
     Category,
     Customer,
     Order,
@@ -33,9 +32,6 @@ def order_setup(db):
     variant = ProductVariant(product_id=product.id, sku=f"SKU-{uuid.uuid4().hex[:8]}", price=1000.0)
     db.add(variant)
     db.flush()
-    branch = Branch(name="OS Test Branch", address="Test Address")
-    db.add(branch)
-    db.flush()
 
     owner = Customer(
         full_name="Order Owner",
@@ -53,7 +49,6 @@ def order_setup(db):
     order = Order(
         order_number=f"JN-TEST-{uuid.uuid4().hex[:8]}",
         customer_id=owner.id,
-        fulfilling_branch_id=branch.id,
         guest_full_name=owner.full_name,
         guest_phone_number="+256700000000",
         delivery_address="Test Address",
@@ -85,8 +80,6 @@ def order_setup(db):
     db.query(Product).filter(Product.id == product.id).delete()
     db.commit()
     db.query(Category).filter(Category.id == category.id).delete()
-    db.commit()
-    db.query(Branch).filter(Branch.id == branch.id).delete()
     db.commit()
 
 
