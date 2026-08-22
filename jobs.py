@@ -28,9 +28,12 @@ logger = logging.getLogger(__name__)
 PASSWORD_RESET_URL = os.getenv("PASSWORD_RESET_URL", "http://localhost:3000/reset-password")
 
 # Where the "Log in to the staff dashboard" link in staff-facing emails
-# points - same placeholder pattern as PASSWORD_RESET_URL above until
-# Nyson's staff dashboard has a real login page to link to.
-STAFF_DASHBOARD_URL = os.getenv("STAFF_DASHBOARD_URL", "http://localhost:3000/staff/login")
+# points - same placeholder pattern as PASSWORD_RESET_URL above. This is a
+# fallback ONLY - the real value lives in .env locally and in Render's own
+# environment variables for production (see .env.example's comment). If
+# this default ever shows up in a real email again, it means the env var
+# is missing wherever that email was actually sent from.
+STAFF_DASHBOARD_URL = os.getenv("STAFF_DASHBOARD_URL", "http://localhost:3000/admin/login")
 
 # Built ONCE at import time, not re-created on every single email sent -
 # same "set up shared config once at module level" idea as this project's
