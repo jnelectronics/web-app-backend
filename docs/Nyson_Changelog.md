@@ -96,4 +96,4 @@ Full automated suite passing (91/91), including a new end-to-end test that drive
 
 ### Deploy status
 
-**Pushed to `main`** (see the git log for the exact commit — this doc is updated at the same time as the push). Render auto-deploys on push and should already be live.
+**Pushed to `main` (`c710ee1`).** Render auto-deploys on push and should already be live.
