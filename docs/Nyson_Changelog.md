@@ -1,6 +1,8 @@
 # Backend changes — action items for the frontend
 
-Covers two related changes to the products API, both already pushed to `main` (Render auto-deploys on push).
+All changes below are already pushed to `main` (Render auto-deploys on push).
+
+## Products: collapsed create + price/sku/quantity fields
 
 ## What you need to do
 
@@ -72,3 +74,26 @@ Full automated suite passing (90/90, `pytest tests/ -v`), including dedicated co
 ## Deploy status
 
 **Pushed to `main` (`c0613dd`, `7e77cd3`).** Render auto-deploys on push and should already be live.
+
+---
+
+## Promotion discounts now actually reduce cart/order/payment totals (2026-08-22)
+
+Fixes the bug you reported: `discounted_price` on a cart item was correct, but `line_total`, cart `subtotal`, order `subtotal`/`total`, order item `unit_price`/`line_total`, and the amount charged via PesaPal were all still computed from the undiscounted list price. All of that now uses the discounted price whenever an active promotion applies, exactly as your bug report's acceptance criteria described.
+
+### What you need to do
+
+1. **Nothing required for the discount fix itself** — no request/response shapes changed for cart or checkout. `GET /cart`, `POST /cart/items`, `PATCH /cart/items/{id}`, `POST /orders`, and `POST /orders/{id}/payments` all just return correct numbers now.
+2. **`amount` is no longer read from `POST /orders/{order_id}/payments`.** The endpoint now always charges `order.total` server-side, regardless of what (if anything) is sent as `amount` in the request body. You can safely stop sending it whenever convenient — it's harmless to leave in for now (unknown fields are ignored, not rejected), but it does nothing. If your own computed `amount` and the real order total were ever to disagree for any reason, the order total silently wins; nothing you send in that field is authoritative anymore.
+
+### Why this changed
+
+Root cause was that `discounted_price` was originally built as **display-only** — a comment in the code said so explicitly. That assumption stopped being correct once sale prices needed to actually be charged, not just shown. While fixing it, we also found the payment endpoint was trusting a client-supplied `amount` with no server-side check against the order at all — a separate, more serious gap (not just this bug) — so that's now closed too: the backend decides the charge amount, never the caller.
+
+### Verified
+
+Full automated suite passing (91/91), including a new end-to-end test that drives the real API (add to cart → checkout → initiate payment) for a USh 1,000 item with an active 50%-off discount, and asserts `500` at every stage: cart line total, cart subtotal, order subtotal/total, order item unit price/line total, and payment amount.
+
+### Deploy status
+
+**Pushed to `main`** (see the git log for the exact commit — this doc is updated at the same time as the push). Render auto-deploys on push and should already be live.

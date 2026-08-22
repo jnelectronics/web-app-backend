@@ -32,7 +32,7 @@ from models import (
     StaffUser,
 )
 from pagination import build_pagination_meta
-from routers.cart import get_current_cart
+from routers.cart import _resolve_discounted_price, get_current_cart
 from routers.inventory import InsufficientInventoryError
 from schemas import CheckoutRequest, OrderAddressUpdate, OrderItemRead, OrderRead, OrderStatusHistoryRead, OrderStatusUpdate, PaginatedResponse
 from security import (
@@ -199,7 +199,15 @@ def checkout(
     for item in cart_items:
         variant = db.get(ProductVariant, item.variant_id)
         product = db.get(Product, variant.product_id)
-        line_total = item.quantity * item.unit_price_snapshot
+        # Same discount lookup routers/cart.py's own GET /cart response
+        # already used to compute this item's discounted_price - reused,
+        # not duplicated, so an order can never charge a different price
+        # than what the cart just showed the customer (the exact mismatch
+        # this fix closes, see CLAUDE.md's 2026-08-22 note). None means no
+        # active promotion right now, so the frozen list price stands.
+        discounted_price = _resolve_discounted_price(db, product.id, item.unit_price_snapshot)
+        unit_price = discounted_price if discounted_price is not None else item.unit_price_snapshot
+        line_total = item.quantity * unit_price
         subtotal += line_total
         order_items.append(
             OrderItem(
@@ -207,7 +215,7 @@ def checkout(
                 product_name_snapshot=product.name,
                 variant_label_snapshot=variant.variant_label,
                 quantity=item.quantity,
-                unit_price=item.unit_price_snapshot,
+                unit_price=unit_price,
                 line_total=line_total,
             )
         )
@@ -234,7 +242,7 @@ def checkout(
         delivery_address=request.delivery_address,
         district=request.district,
         subtotal=subtotal,
-        total=subtotal,  # no tax/delivery fee/discount logic yet
+        total=subtotal,  # subtotal above already reflects any active discount; no tax/delivery fee logic yet
     )
     db.add(new_order)
     db.flush()  # assigns new_order.id without fully committing yet, so

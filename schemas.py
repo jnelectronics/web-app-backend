@@ -534,27 +534,34 @@ class CartItemRead(BaseModel):
     quantity: int
     unit_price_snapshot: float
 
-    # DISPLAY ONLY - resolved fresh at read time by routers/cart.py's
+    # Resolved fresh at read time by routers/cart.py's
     # _resolve_discounted_price, so the frontend doesn't have to
     # reimplement percentage/fixed discount math itself (api-concerns.md
-    # §10). original_price always equals unit_price_snapshot (the actual
-    # price this line is billed at - see that field's own comment on why
+    # §10). original_price always equals unit_price_snapshot (the list
+    # price this line was added at - see that field's own comment on why
     # it's frozen); discounted_price is None when no discount currently
-    # applies, or the lower price if one does. Deliberately does NOT change
-    # what line_total/subtotal below actually charge - this project's
-    # checkout/PesaPal flow is verified live with real money, and isn't
-    # touched by this addition.
+    # applies, or the lower price if one does.
+    #
+    # Fixed 2026-08-22 (frontend bug report): this field USED to be
+    # display-only, deliberately not affecting line_total/subtotal below -
+    # that was wrong per FR-PROMO-005. A customer shown a sale price has to
+    # actually be charged that price, all the way through checkout and
+    # payment - see routers/orders.py's checkout and routers/payments.py's
+    # initiate_payment for the matching fixes on the order/payment side.
     original_price: float
     discounted_price: float | None
 
-    # Not a real database column - computed on the way out so a client
-    # doesn't have to multiply quantity * unit_price_snapshot itself.
+    # Not a real database column - computed on the way out. Uses the
+    # discounted price when one currently applies, otherwise falls back to
+    # the frozen list price - this is what makes a promotion actually
+    # reduce what the customer is charged, not just what they're shown.
     # @computed_field is what makes this actually appear in the JSON
     # response - a plain @property would be invisible to serialization.
     @computed_field
     @property
     def line_total(self) -> float:
-        return self.quantity * self.unit_price_snapshot
+        unit_price = self.discounted_price if self.discounted_price is not None else self.unit_price_snapshot
+        return self.quantity * unit_price
 
 
 class CartRead(BaseModel):
@@ -780,8 +787,16 @@ class PaymentProvider(str, enum.Enum):
 
 
 class PaymentInitiate(BaseModel):
+    # No `amount` field, on purpose (removed 2026-08-22) - a payment's
+    # actual charge must always be the order's own total, decided
+    # server-side in routers/payments.py's initiate_payment, never
+    # something a client hands in. Trusting a client-supplied amount here
+    # would mean anyone calling this endpoint directly could set the
+    # PesaPal charge to whatever they wanted, regardless of what the order
+    # actually costs. Pydantic ignores unknown fields by default, so an
+    # older frontend still sending `amount` in its request body won't
+    # break - the value just no longer does anything.
     provider: PaymentProvider
-    amount: float
 
 
 class PaymentRead(BaseModel):

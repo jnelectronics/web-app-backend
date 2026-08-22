@@ -262,7 +262,11 @@ def initiate_payment(
         new_payment = Payment(
             order_id=order.id,
             provider=request.provider.value,
-            amount=request.amount,
+            # order.total, not a client-supplied amount (removed 2026-08-22
+            # - see PaymentInitiate's own comment) - already reflects any
+            # active discount, since routers/orders.py's checkout computes
+            # it from each item's discounted price.
+            amount=order.total,
             status=PaymentStatus.PENDING,
             initiated_at=datetime.now(timezone.utc),
         )
@@ -278,7 +282,7 @@ def initiate_payment(
     new_payment = Payment(
         order_id=order.id,
         provider=request.provider.value,
-        amount=request.amount,
+        amount=order.total,  # see the cash-on-delivery branch above for why
         status=PaymentStatus.AWAITING_PAYMENT,
         initiated_at=datetime.now(timezone.utc),
     )
@@ -293,7 +297,7 @@ def initiate_payment(
     try:
         pesapal_result = submit_order_request(
             merchant_reference=str(new_payment.id),
-            amount=request.amount,
+            amount=order.total,
             currency="UGX",
             description=f"Order {order.order_number} ({request.provider.value})",
             billing_email=order.guest_email,
@@ -323,7 +327,7 @@ def initiate_payment(
         new_payment.id,
         order.id,
         request.provider.value,
-        request.amount,
+        order.total,
     )
     return new_payment
 
