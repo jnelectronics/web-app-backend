@@ -45,6 +45,23 @@ def owner_token(db):
     db.commit()
 
 
+@pytest.fixture
+def sales_attendant_token(db):
+    staff = StaffUser(
+        full_name="Attendant",
+        email=f"attendant-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("Password123"),
+        role=StaffRole.SALES_ATTENDANT,
+    )
+    db.add(staff)
+    db.commit()
+
+    yield create_access_token(subject=str(staff.id), account_type="staff")
+
+    db.query(StaffUser).filter(StaffUser.id == staff.id).delete()
+    db.commit()
+
+
 def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
@@ -188,6 +205,19 @@ def test_set_customer_status_blocks_login(client, customer, owner_token):
         "/api/v1/auth/login", json={"identifier": customer.email, "password": "OriginalPass123"}
     )
     assert response.status_code == 200
+
+
+def test_deactivate_customer_rejects_sales_attendant(client, customer, sales_attendant_token):
+    # 2026-08-30, client UAT request: "Remove the Deactivate Customer option
+    # from Sales Attendant accounts" - they keep read access to the
+    # directory (list_customers/read_customer above), this is only the
+    # write endpoint.
+    response = client.patch(
+        f"/api/v1/customers/{customer.id}/status",
+        json={"status": "inactive"},
+        headers=_auth(sales_attendant_token),
+    )
+    assert response.status_code == 403
 
 
 def test_self_service_deactivate_revokes_refresh_tokens_and_rejects_reactivate(client, db, customer):

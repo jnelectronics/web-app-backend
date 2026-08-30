@@ -187,6 +187,56 @@ def test_status_history_visible_to_owner_and_staff_not_others(client, order_setu
     assert response.status_code == 200
 
 
+def test_out_for_delivery_and_delivered_emails_sent_with_rating_link(
+    client, db, order_setup, staff_tokens, mock_email
+):
+    # 2026-08-30, client-requested: an email at these two specific
+    # transitions, and the Delivered one carries the "Rate your
+    # experience" link (routers/order_ratings.py's public token flow).
+    order = order_setup["order"]
+    order.guest_email = "buyer@example.com"
+    db.commit()
+
+    owner_headers = _auth(staff_tokens[StaffRole.OWNER])
+
+    client.patch(f"/api/v1/orders/{order.id}/status", json={"to_status": "confirmed"}, headers=owner_headers)
+    client.patch(f"/api/v1/orders/{order.id}/status", json={"to_status": "packed"}, headers=owner_headers)
+    assert mock_email == []  # neither intermediate transition sends anything
+
+    response = client.patch(
+        f"/api/v1/orders/{order.id}/status", json={"to_status": "out_for_delivery"}, headers=owner_headers
+    )
+    assert response.status_code == 200
+    out_for_delivery_email = next((e for e in mock_email if e["to_email"] == "buyer@example.com"), None)
+    assert out_for_delivery_email is not None
+    assert "Out for Delivery" in out_for_delivery_email["subject"]
+    assert order.delivery_address in out_for_delivery_email["body"]
+
+    response = client.patch(
+        f"/api/v1/orders/{order.id}/status", json={"to_status": "delivered"}, headers=owner_headers
+    )
+    assert response.status_code == 200
+    delivered_emails = [
+        e for e in mock_email if e["to_email"] == "buyer@example.com" and "Delivered" in e["subject"]
+    ]
+    assert len(delivered_emails) == 1
+    assert "rate-order?token=" in delivered_emails[0]["body"]
+
+
+def test_no_status_change_email_without_guest_email(client, order_setup, staff_tokens, mock_email):
+    # order_setup's Order has no guest_email set - a phone-only guest has
+    # nothing for either job to send to, same gate checkout's own
+    # confirmation email already uses.
+    order = order_setup["order"]
+    owner_headers = _auth(staff_tokens[StaffRole.OWNER])
+    for to_status in ("confirmed", "packed", "out_for_delivery", "delivered"):
+        response = client.patch(
+            f"/api/v1/orders/{order.id}/status", json={"to_status": to_status}, headers=owner_headers
+        )
+        assert response.status_code == 200
+    assert mock_email == []
+
+
 def test_order_edit_widened_to_contact_fields(client, order_setup):
     order = order_setup["order"]
     tokens = order_setup["tokens"]

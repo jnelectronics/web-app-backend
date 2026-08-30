@@ -1,7 +1,12 @@
-# Staff-facing operational dashboard. Per FR-ADMIN-003, Sales Attendants
-# get a NARROWER view than just "which endpoints can they call" - the
-# summary endpoint itself hides the revenue figure from them, even though
-# they're allowed to call it at all (see read_dashboard_summary below).
+# Staff-facing operational dashboard.
+#
+# Sales Attendant access to this whole module was REVOKED on 2026-08-30, at
+# the client's explicit request during UAT ("Remove Dashboard, Sales, and
+# Payments access from Sales Attendants") - this reverses the 2026-08-18
+# widening for this one module specifically, everywhere else that widening
+# still stands. System Administrator is unaffected either way - it's a
+# true superset role handled centrally in security.py's require_staff_role,
+# not something that has to be listed in these tuples at all.
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
@@ -16,7 +21,7 @@ from security import require_staff_role
 
 router = APIRouter(prefix="/admin/dashboard", tags=["dashboard"], route_class=EnvelopeRoute)
 
-VIEW_SUMMARY_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.OWNER)
+VIEW_SUMMARY_ROLES = (StaffRole.OWNER,)
 
 
 def _total_revenue(db: Session) -> float:
@@ -77,7 +82,7 @@ def read_recent_orders(
 @router.get("/low-inventory", response_model=list[InventoryRead])
 def read_low_inventory(
     threshold: int = 10,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
+    _current_staff: StaffUser = Depends(require_staff_role(*VIEW_SUMMARY_ROLES)),
     db: Session = Depends(get_db),
 ):
     return (
@@ -90,7 +95,7 @@ def read_low_inventory(
 
 @router.get("/sales-summary", response_model=SalesSummary)
 def read_sales_summary(
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
+    _current_staff: StaffUser = Depends(require_staff_role(*VIEW_SUMMARY_ROLES)),
     db: Session = Depends(get_db),
 ):
     total_orders = db.query(Order).filter(Order.status != OrderStatus.CANCELLED).count()

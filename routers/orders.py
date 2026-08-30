@@ -13,12 +13,18 @@ from sqlalchemy.orm import Session
 from audit import write_audit_log
 from database import get_db
 from envelope import EnvelopeRoute
-from jobs import notify_staff_new_order, send_order_confirmation_email
+from jobs import (
+    notify_staff_new_order,
+    send_order_confirmation_email,
+    send_order_delivered_email,
+    send_order_out_for_delivery_email,
+)
 from models import (
     Cart,
     CartItem,
     CartStatus,
     Customer,
+    DeliveryZone,
     InventoryMovement,
     InventoryRecord,
     MovementType,
@@ -37,6 +43,7 @@ from routers.inventory import InsufficientInventoryError
 from schemas import CheckoutRequest, OrderAddressUpdate, OrderItemRead, OrderRead, OrderStatusHistoryRead, OrderStatusUpdate, PaginatedResponse
 from security import (
     bearer_scheme,
+    create_order_rating_token,
     decode_token_claims,
     get_current_customer,
     get_current_customer_or_admin,
@@ -149,6 +156,8 @@ def _build_order_read(order: Order, db: Session) -> OrderRead:
         guest_email=order.guest_email,
         delivery_address=order.delivery_address,
         district=order.district,
+        delivery_zone_id=order.delivery_zone_id,
+        delivery_fee=order.delivery_fee,
         status=order.status,
         requires_prepayment=order.requires_prepayment,
         subtotal=order.subtotal,
@@ -169,6 +178,34 @@ def checkout(
     cart_items = db.query(CartItem).filter(CartItem.cart_id == cart.id).all()
     if not cart_items:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cart is empty")
+
+    # Resolve the delivery zone SERVER-SIDE - same "never trust a
+    # client-supplied money figure as authoritative" rule that removed
+    # PaymentInitiate.amount entirely (see CLAUDE.md's 2026-08-22 note).
+    # request.delivery_fee is only used to detect a STALE frontend (the
+    # zone's fee changed since the customer's page loaded) and reject with
+    # a clear message - the real charged fee always comes from the zone
+    # row itself, never from the request body.
+    delivery_fee = 0
+    delivery_district = request.district
+    if request.delivery_zone_id is not None:
+        zone = db.get(DeliveryZone, request.delivery_zone_id)
+        if zone is None or not zone.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Selected delivery zone is not available",
+            )
+        if request.delivery_fee is not None and request.delivery_fee != zone.fee:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Delivery fee has changed - please refresh and try again",
+            )
+        delivery_fee = zone.fee
+        # Server overwrites district with the zone's own name, per Nyson's
+        # spec - keeps this field consistent with delivery_zone_id instead
+        # of trusting whatever free-text label the frontend happened to
+        # send alongside it.
+        delivery_district = zone.name
 
     short_items = _find_short_items(db, cart_items)
     if short_items:
@@ -240,9 +277,14 @@ def checkout(
         guest_phone_number=request.guest_phone_number,
         guest_email=request.guest_email,
         delivery_address=request.delivery_address,
-        district=request.district,
+        district=delivery_district,
+        delivery_zone_id=request.delivery_zone_id,
+        delivery_fee=delivery_fee,
         subtotal=subtotal,
-        total=subtotal,  # subtotal above already reflects any active discount; no tax/delivery fee logic yet
+        # subtotal already reflects any active discount (2026-08-22 fix);
+        # delivery_fee resolved above from the zone lookup, 0 for a pickup
+        # order with no zone selected.
+        total=subtotal + delivery_fee,
     )
     db.add(new_order)
     db.flush()  # assigns new_order.id without fully committing yet, so
@@ -311,7 +353,7 @@ def checkout(
         new_order.order_number,
         request.guest_full_name,
         request.guest_email,
-        request.district,
+        new_order.district,  # the zone-resolved district, not necessarily request.district verbatim
         new_order.total,
         request.delivery_address,
     )
@@ -492,6 +534,7 @@ def cancel_order(
 def advance_order_status(
     order_id: uuid.UUID,
     update: OrderStatusUpdate,
+    background_tasks: BackgroundTasks,
     current_staff: StaffUser = Depends(require_staff_role(*STATUS_ADVANCE_ROLES)),
     db: Session = Depends(get_db),
 ):
@@ -537,6 +580,31 @@ def advance_order_status(
     )
     db.commit()
     db.refresh(order)
+
+    # Client-requested 2026-08-30: notify the customer by email at these
+    # two specific transitions - only enqueued when the order actually has
+    # an email to send to, same "guest_email is optional" gate checkout's
+    # own confirmation email already uses (a phone-only guest checkout has
+    # nothing for either job to send to).
+    if order.guest_email:
+        if order.status == OrderStatus.OUT_FOR_DELIVERY:
+            background_tasks.add_task(
+                send_order_out_for_delivery_email,
+                order.guest_email,
+                order.guest_full_name,
+                order.order_number,
+                order.delivery_address,
+            )
+        elif order.status == OrderStatus.DELIVERED:
+            rating_token = create_order_rating_token(str(order.id))
+            background_tasks.add_task(
+                send_order_delivered_email,
+                order.guest_email,
+                order.guest_full_name,
+                order.order_number,
+                rating_token,
+            )
+
     return _build_order_read(order, db)
 
 

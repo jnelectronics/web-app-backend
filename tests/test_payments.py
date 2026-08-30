@@ -170,6 +170,29 @@ def staff_token(db):
     db.commit()
 
 
+@pytest.fixture
+def owner_staff_token(db):
+    # A real StaffRole.OWNER account - NOT to be confused with order_setup's
+    # "owner_token", which is a customer token (the customer who owns the
+    # order). Needed because mark-paid became Owner/System-Administrator-only
+    # on 2026-08-30 (Sales Attendant lost Payments access) - staff_token
+    # above is a Sales Attendant and can no longer call it.
+    staff = StaffUser(
+        full_name="Test Owner",
+        email=f"owner-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("Password123"),
+        role=StaffRole.OWNER,
+    )
+    db.add(staff)
+    db.commit()
+
+    token = create_access_token(subject=str(staff.id), account_type="staff")
+    yield token
+
+    db.query(StaffUser).filter(StaffUser.id == staff.id).delete()
+    db.commit()
+
+
 def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
@@ -644,7 +667,7 @@ def test_payment_provider_rejects_unknown_value(client, order_setup):
 
 
 def test_cash_on_delivery_skips_pesapal_and_staff_can_mark_it_paid(
-    client, db, order_setup, staff_token, mock_email
+    client, db, order_setup, owner_staff_token, mock_email
 ):
     # Deliberately NOT using mock_pesapal - cash-on-delivery should never
     # touch pesapal_client at all, so if it did, this test would fail with
@@ -665,7 +688,11 @@ def test_cash_on_delivery_skips_pesapal_and_staff_can_mark_it_paid(
     assert payment["redirect_url"] is None
     assert payment["provider_reference"] is None
 
-    staff_headers = _auth(staff_token)
+    # mark-paid is Owner/System-Administrator-only as of 2026-08-30 (Sales
+    # Attendant lost Payments access entirely - see
+    # test_mark_paid_rejects_sales_attendant below), so this uses a real
+    # StaffRole.OWNER token, not the Sales Attendant staff_token fixture.
+    staff_headers = _auth(owner_staff_token)
     response = client.patch(f"/api/v1/payments/{payment['id']}/mark-paid", headers=staff_headers)
     assert response.status_code == 200
     assert unwrap(response)["status"] == "paid"
@@ -687,7 +714,7 @@ def test_cash_on_delivery_skips_pesapal_and_staff_can_mark_it_paid(
     assert response.status_code == 409  # already paid (the first cash payment)
 
 
-def test_mark_paid_rejects_non_cash_payments(client, order_setup, staff_token, mock_pesapal):
+def test_mark_paid_rejects_non_cash_payments(client, order_setup, owner_staff_token, mock_pesapal):
     order = order_setup["order"]
     headers = _auth(order_setup["owner_token"])
 
@@ -699,6 +726,27 @@ def test_mark_paid_rejects_non_cash_payments(client, order_setup, staff_token, m
     payment = unwrap(response)
 
     response = client.patch(
-        f"/api/v1/payments/{payment['id']}/mark-paid", headers=_auth(staff_token)
+        f"/api/v1/payments/{payment['id']}/mark-paid", headers=_auth(owner_staff_token)
     )
     assert response.status_code == 400
+
+
+def test_mark_paid_rejects_sales_attendant(client, order_setup, staff_token, mock_pesapal):
+    # Pins the 2026-08-30 client-requested RBAC narrowing: Sales Attendant
+    # lost Payments access entirely, so even a legitimate cash-on-delivery
+    # payment can no longer be marked paid by that role - a plain 403, not
+    # reaching any of the business-rule checks inside the route at all.
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "cash_on_delivery", "amount": 50000.0},
+        headers=headers,
+    )
+    payment = unwrap(response)
+
+    response = client.patch(
+        f"/api/v1/payments/{payment['id']}/mark-paid", headers=_auth(staff_token)
+    )
+    assert response.status_code == 403

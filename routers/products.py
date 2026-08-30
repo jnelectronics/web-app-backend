@@ -3,7 +3,7 @@
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,12 +16,14 @@ from cloudinary_client import CloudinaryError, delete_image, is_configured, uplo
 from database import get_db
 from envelope import EnvelopeRoute
 from models import (
+    CartItem,
     Category,
     HomepageSection,
     HomepageSectionType,
     InventoryMovement,
     InventoryRecord,
     MovementType,
+    OrderItem,
     Product,
     ProductDiscount,
     ProductHomepageSection,
@@ -30,6 +32,7 @@ from models import (
     Promotion,
     StaffRole,
     StaffUser,
+    VariantAttribute,
 )
 from pagination import build_pagination_meta
 from schemas import PaginatedResponse, ProductCreate, ProductHomepageSectionsSync, ProductImageRead, ProductRead, ProductUpdate
@@ -173,6 +176,7 @@ def _build_product_read(product: Product, db: Session, *, requesting_staff: Staf
         is_discounted=_is_product_discounted(db, product.id),
         images=[ProductImageRead.model_validate(i) for i in images],
         is_active=product.is_active,
+        deactivated_at=product.deactivated_at,
         created_at=product.created_at,
         updated_at=product.updated_at,
         homepage_section_ids=_homepage_section_ids_for_product(db, product.id),
@@ -568,6 +572,10 @@ def delete_product(
         raise HTTPException(status_code=404, detail="Product not found")
 
     existing.is_active = False
+    # Stamped alongside is_active so the admin UI can compute the 30-day
+    # permanent-delete eligibility window (see delete_product_permanent
+    # below) - added 2026-08-30, the product lifecycle feature.
+    existing.deactivated_at = datetime.now(timezone.utc)
     write_audit_log(
         db,
         staff_user_id=current_staff.id,
@@ -596,6 +604,7 @@ def reactivate_product(
         raise HTTPException(status_code=404, detail="Product not found")
 
     existing.is_active = True
+    existing.deactivated_at = None
     write_audit_log(
         db,
         staff_user_id=current_staff.id,
@@ -608,6 +617,111 @@ def reactivate_product(
     db.commit()
     db.refresh(existing)
     return _build_product_read(existing, db, requesting_staff=current_staff)
+
+
+PRODUCT_PERMANENT_DELETE_AFTER_DAYS = 30
+
+
+# A genuine, irreversible hard delete - unlike DELETE above (which only
+# flips is_active), this one actually removes the Product row and
+# everything under it. Added 2026-08-30 for the admin "archived" tab's
+# permanent-delete action, matching the frontend's own
+# PRODUCT_PERMANENT_DELETE_AFTER_DAYS constant.
+#
+# Deliberately narrower than every other product-write endpoint in this
+# file (Owner only, not Sales Attendant) - a judgment call, not something
+# explicitly spec'd, made because this is the one product action with no
+# undo at all, unlike deactivate/reactivate which are just a flag flip.
+# System Administrator still passes regardless, as always.
+@router.delete("/{product_id}/permanent", status_code=status.HTTP_204_NO_CONTENT)
+def delete_product_permanent(
+    product_id: uuid.UUID,
+    current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER)),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    if product.deactivated_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Product must be deactivated first (DELETE /products/{id}) before it can be permanently deleted",
+        )
+
+    eligible_at = product.deactivated_at + timedelta(days=PRODUCT_PERMANENT_DELETE_AFTER_DAYS)
+    if datetime.now(timezone.utc) < eligible_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Product can't be permanently deleted until {eligible_at.isoformat()} "
+            f"({PRODUCT_PERMANENT_DELETE_AFTER_DAYS} days after it was deactivated)",
+        )
+
+    variant_ids = [
+        v.id for v in db.query(ProductVariant.id).filter(ProductVariant.product_id == product.id).all()
+    ]
+
+    # Order history must survive a permanently-deleted product (OrderItem
+    # already snapshots product_name_snapshot/unit_price for exactly this
+    # reason) - but that only works if the variant row it points at is
+    # never actually removed. So if ANY variant under this product has
+    # ever been ordered, refuse the whole delete rather than leave
+    # OrderItem.variant_id dangling or violate its own FK constraint.
+    if variant_ids and db.query(OrderItem).filter(OrderItem.variant_id.in_(variant_ids)).first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot permanently delete a product that has order history",
+        )
+
+    # Cloudinary assets are cleaned up the same way delete_product_image
+    # does it - best-effort, logged on failure, never blocking the request
+    # (the DB rows are the part the client actually asked to remove).
+    images = db.query(ProductImage).filter(ProductImage.product_id == product.id).all()
+    public_ids = [i.cloudinary_public_id for i in images if i.cloudinary_public_id]
+
+    write_audit_log(
+        db,
+        staff_user_id=current_staff.id,
+        action="product.permanent_delete",
+        resource_type="product",
+        resource_id=product.id,
+        previous_value={"name": product.name, "deactivated_at": product.deactivated_at.isoformat()},
+        new_value=None,
+    )
+
+    # FK-safe order: everything that points AT a variant first, then the
+    # variants themselves, then everything that points at the product
+    # directly, then the product row last.
+    if variant_ids:
+        inventory_record_ids = [
+            r.id for r in db.query(InventoryRecord.id).filter(InventoryRecord.variant_id.in_(variant_ids)).all()
+        ]
+        if inventory_record_ids:
+            db.query(InventoryMovement).filter(
+                InventoryMovement.inventory_record_id.in_(inventory_record_ids)
+            ).delete(synchronize_session=False)
+        db.query(InventoryRecord).filter(InventoryRecord.variant_id.in_(variant_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(CartItem).filter(CartItem.variant_id.in_(variant_ids)).delete(synchronize_session=False)
+        db.query(VariantAttribute).filter(VariantAttribute.variant_id.in_(variant_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(ProductVariant).filter(ProductVariant.product_id == product.id).delete(synchronize_session=False)
+
+    db.query(ProductImage).filter(ProductImage.product_id == product.id).delete(synchronize_session=False)
+    db.query(ProductDiscount).filter(ProductDiscount.product_id == product.id).delete(synchronize_session=False)
+    db.query(ProductHomepageSection).filter(ProductHomepageSection.product_id == product.id).delete(
+        synchronize_session=False
+    )
+    db.delete(product)
+    db.commit()
+
+    for public_id in public_ids:
+        try:
+            delete_image(public_id)
+        except CloudinaryError:
+            logger.exception("Failed to delete Cloudinary asset %s during permanent product delete", public_id)
 
 
 @router.post("/{product_id}/images", response_model=ProductImageRead)

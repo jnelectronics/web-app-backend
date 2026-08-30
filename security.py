@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
+from jose import ExpiredSignatureError, JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
@@ -113,6 +113,47 @@ def create_password_reset_token(subject: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
     to_encode = {"sub": subject, "exp": expire, "type": "password_reset"}
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+# How long the "Rate your experience" link in the Order Delivered email
+# stays valid - the confirmed decision in Nyson's doc (2026-08-29): 30 days
+# from delivery, long enough that a customer who doesn't open the email
+# right away can still rate later.
+ORDER_RATING_TOKEN_EXPIRE_MINUTES = 30 * 24 * 60
+
+
+def create_order_rating_token(order_id: str) -> str:
+    # Same self-contained-JWT idea as create_password_reset_token above -
+    # no separate order_rating_tokens table, "sub" is the order's own id.
+    # Whether the rating itself is still allowed (order actually delivered,
+    # not already rated) is checked at submit time against the real
+    # order_ratings table, not baked into the token - the token only proves
+    # "this really is a link JN Electronics sent for this specific order",
+    # nothing more.
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ORDER_RATING_TOKEN_EXPIRE_MINUTES)
+    to_encode = {"sub": order_id, "exp": expire, "type": "order_rating"}
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_order_rating_token(token: str) -> tuple[str | None, bool]:
+    # Returns (order_id, is_expired). order_id is None for EITHER an
+    # invalid token or an expired one - is_expired distinguishes the two,
+    # since the public rating page needs to show a different message for
+    # "this link's 30 days ran out" (Nyson's rating_status: "expired")
+    # versus "this isn't a real JN Electronics rating link at all"
+    # ("invalid"). decode_access_token/decode_token_claims above don't
+    # need this distinction anywhere else they're used, which is why it's
+    # a separate function rather than a shared one.
+    try:
+        claims = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except ExpiredSignatureError:
+        return None, True
+    except JWTError:
+        return None, False
+
+    if claims.get("type") != "order_rating":
+        return None, False
+    return claims.get("sub"), False
 
 
 # HTTPBearer is what makes Swagger UI show an "Authorize" lock icon where

@@ -35,6 +35,11 @@ PASSWORD_RESET_URL = os.getenv("PASSWORD_RESET_URL", "http://localhost:3000/rese
 # is missing wherever that email was actually sent from.
 STAFF_DASHBOARD_URL = os.getenv("STAFF_DASHBOARD_URL", "http://localhost:3000/admin/login")
 
+# Base storefront page for the "Rate your experience" link in the Order
+# Delivered email - send_order_delivered_email appends "?token=<opaque>"
+# itself. Same fallback-placeholder pattern as the two URLs above.
+RATING_URL = os.getenv("RATING_URL", "http://localhost:3000/rate-order")
+
 # Built ONCE at import time, not re-created on every single email sent -
 # same "set up shared config once at module level" idea as this project's
 # other wrapper modules. os.path.dirname(__file__) gives the FOLDER this
@@ -365,3 +370,84 @@ def send_payment_confirmed_email(
         return
 
     logger.info("Payment confirmation email sent to %s for order %s", email, order_number)
+
+
+def send_order_out_for_delivery_email(
+    email: str,
+    full_name: str,
+    order_number: str,
+    delivery_address: str,
+) -> None:
+    # Fires from routers/orders.py's advance_order_status, only when a
+    # staff member moves an order INTO OrderStatus.OUT_FOR_DELIVERY -
+    # client-requested 2026-08-30 ("Send an Out for Delivery email to the
+    # customer, including the delivery address based on the selected
+    # delivery town"). delivery_address already contains the real street
+    # address the customer gave at checkout - it needs no separate town/
+    # zone lookup here, unlike Order.district which is the zone NAME, not
+    # the full address.
+    subject = f"Your JN Electronics Order {order_number} Is Out for Delivery"
+    body = (
+        f"Hi {full_name},\n\n"
+        f"Your order {order_number} is out for delivery and should arrive soon.\n\n"
+        f"Delivering to: {delivery_address}\n\n"
+        "Thanks for shopping with JN Electronics."
+    )
+    html = _template_env.get_template("order_out_for_delivery.html").render(
+        full_name=full_name,
+        order_number=order_number,
+        delivery_address=delivery_address,
+    )
+
+    if not email_client.is_configured():
+        logger.info("Resend not configured - out-for-delivery email for %s not sent (order %s)", email, order_number)
+        return
+
+    try:
+        email_client.send_email(email, subject, body, html=html)
+    except email_client.EmailError:
+        logger.exception("Failed to send out-for-delivery email to %s for order %s", email, order_number)
+        return
+
+    logger.info("Out-for-delivery email sent to %s for order %s", email, order_number)
+
+
+def send_order_delivered_email(
+    email: str,
+    full_name: str,
+    order_number: str,
+    rating_token: str,
+) -> None:
+    # Fires from routers/orders.py's advance_order_status, only when a
+    # staff member moves an order INTO OrderStatus.DELIVERED -
+    # client-requested 2026-08-30, together with the "Add a rating/review
+    # option to the Order Delivered email" ask. rating_token is a fresh
+    # signed token from security.py's create_order_rating_token, generated
+    # by the caller (which has DB access to the order) - this function
+    # itself never touches the database, same reasoning every other job
+    # here takes plain values instead of ORM objects.
+    subject = f"Your JN Electronics Order {order_number} Has Been Delivered"
+    rating_url = f"{RATING_URL}?token={rating_token}"
+    body = (
+        f"Hi {full_name},\n\n"
+        f"Your order {order_number} has been delivered. We hope you're happy with it!\n\n"
+        f"Rate your experience: {rating_url}\n\n"
+        "Thanks for shopping with JN Electronics."
+    )
+    html = _template_env.get_template("order_delivered.html").render(
+        full_name=full_name,
+        order_number=order_number,
+        rating_url=rating_url,
+    )
+
+    if not email_client.is_configured():
+        logger.info("Resend not configured - delivered email for %s not sent (order %s)", email, order_number)
+        return
+
+    try:
+        email_client.send_email(email, subject, body, html=html)
+    except email_client.EmailError:
+        logger.exception("Failed to send delivered email to %s for order %s", email, order_number)
+        return
+
+    logger.info("Delivered email sent to %s for order %s", email, order_number)

@@ -399,11 +399,13 @@ def read_payment(
     return payment
 
 
-# Same roles that can advance an order's fulfillment status
-# (routers/orders.py's STATUS_ADVANCE_ROLES) - whoever's handling the
-# order at collection/delivery time is who'd actually be confirming cash
-# changed hands, not a separate permission concept.
-MARK_CASH_PAID_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.OWNER)
+# Used to match routers/orders.py's STATUS_ADVANCE_ROLES (whoever's handling
+# the order at collection/delivery time confirms cash changed hands too) -
+# but the client explicitly asked, during UAT on 2026-08-30, to remove
+# Sales Attendant's access to Payments entirely, so this is now narrower
+# than order-status advancement on purpose. System Administrator still
+# passes regardless, as always (security.py's require_staff_role superset).
+MARK_CASH_PAID_ROLES = (StaffRole.OWNER,)
 
 
 @router.patch("/payments/{payment_id}/mark-paid", response_model=PaymentRead)

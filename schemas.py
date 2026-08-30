@@ -6,7 +6,7 @@ import enum
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated, Generic, TypeVar
+from typing import Annotated, Generic, Literal, TypeVar
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, computed_field
 
@@ -200,6 +200,10 @@ class ProductRead(BaseModel):
     is_discounted: bool
     images: list["ProductImageRead"]
     is_active: bool
+    # NULL while active - when this product was last soft-deleted, so the
+    # admin UI can compute its 30-day permanent-delete eligibility window.
+    # Added 2026-08-30 for the product lifecycle feature.
+    deactivated_at: datetime | None
     created_at: datetime
     updated_at: datetime
     # Which CURATED homepage sections this product currently belongs to -
@@ -586,6 +590,18 @@ class CheckoutRequest(BaseModel):
     delivery_address: str
     district: str
 
+    # Both added 2026-08-30 for Kampala door-to-door delivery zones. NULL/
+    # omitted for a pickup order (no zone selected). delivery_fee is what
+    # the FRONTEND currently believes the fee is (from whatever it last
+    # fetched via GET /delivery-zones) - routers/orders.py's checkout
+    # re-checks it against the zone's real, current fee and rejects if
+    # they've drifted apart, the same "never trust a client-supplied money
+    # figure as authoritative" rule PaymentInitiate.amount's removal
+    # already established. The order's real delivery_fee always comes from
+    # the zone lookup, never from this field directly.
+    delivery_zone_id: uuid.UUID | None = None
+    delivery_fee: int | None = None
+
 
 class OrderItemRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -608,6 +624,8 @@ class OrderRead(BaseModel):
     guest_email: str | None
     delivery_address: str
     district: str
+    delivery_zone_id: uuid.UUID | None
+    delivery_fee: int
     status: OrderStatus
     requires_prepayment: bool
     subtotal: float
@@ -648,6 +666,43 @@ class OrderStatusHistoryRead(BaseModel):
     changed_by_staff_name: str | None
     notes: str | None
     created_at: datetime
+
+
+class OrderRatingPrefill(BaseModel):
+    # Everything the /rate-order page needs to render BEFORE the customer
+    # submits anything - built entirely by the router (not from_attributes
+    # off one single model), since it blends an Order, its item count, and
+    # (maybe) an existing OrderRating into one response shape.
+    #
+    # order_number/delivered_at/item_count are None in the "expired"/
+    # "invalid" cases - there's no real order to describe safely yet (an
+    # invalid token could be anyone poking at the endpoint, not necessarily
+    # someone who should learn anything about a real order).
+    rating_status: Literal["eligible", "already_rated", "expired", "invalid"]
+    order_number: str | None = None
+    delivered_at: datetime | None = None
+    item_count: int | None = None
+    # Only set when rating_status == "already_rated".
+    score: int | None = None
+    comment: str | None = None
+    submitted_at: datetime | None = None
+
+
+class OrderRatingSubmit(BaseModel):
+    score: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=500)
+
+
+class OrderRatingRead(BaseModel):
+    # Built explicitly in the router (order_id passed in, submitted_at
+    # renamed from the model's own created_at column - see models.py's
+    # OrderRating) rather than model_validate'd straight off the ORM
+    # object, so there's no field-name aliasing magic to keep track of.
+    id: uuid.UUID
+    order_id: uuid.UUID
+    score: int
+    comment: str | None
+    submitted_at: datetime
 
 
 class StaffCreate(BaseModel):
@@ -847,6 +902,37 @@ class BannerStatusUpdate(BaseModel):
     # Sets is_active to exactly this value - same "not a toggle" reasoning
     # as StaffStatusUpdate above.
     is_active: bool
+
+
+class DeliveryZoneCreate(BaseModel):
+    name: str
+    fee: int = Field(ge=0)
+    sort_order: int = 0
+
+
+class DeliveryZoneUpdate(BaseModel):
+    # Both optional, same "send only what you're changing" pattern as
+    # ProductUpdate - None means "leave this one as it is".
+    name: str | None = None
+    fee: int | None = Field(default=None, ge=0)
+
+
+class DeliveryZoneStatusUpdate(BaseModel):
+    # Sets is_active to exactly this value - same "not a toggle" reasoning
+    # as BannerStatusUpdate above.
+    is_active: bool
+
+
+class DeliveryZoneRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    fee: int
+    is_active: bool
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class PromotionCreate(BaseModel):

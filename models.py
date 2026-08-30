@@ -163,6 +163,18 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # When this product was last soft-deleted (DELETE /products/{id}
+    # setting is_active=False) - NULL while active. Added 2026-08-30 for
+    # the product lifecycle feature: the admin UI needs to know WHEN a
+    # product was archived to compute its 30-day permanent-delete
+    # eligibility window, which a plain boolean can't tell you by itself.
+    # DateTime(timezone=True) because routers/products.py's permanent-
+    # delete check compares this against datetime.now(timezone.utc) - see
+    # CLAUDE.md's naive-vs-aware-datetime gotcha for why that matters.
+    # reactivate_product (below, in routers/products.py) clears this back
+    # to NULL, same as it already flips is_active back to True.
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     # NOTE: is_discounted is deliberately NOT a column here - product_discounts
     # (see ProductDiscount below) has its own starts_at/ends_at/is_active
     # window, so "is this product currently discounted" is a question that
@@ -490,6 +502,37 @@ class OrderStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class DeliveryZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # Kampala door-to-door delivery areas + what each one costs to deliver
+    # to - added 2026-08-30 at the client's request, to replace the
+    # frontend's flat PLACEHOLDER_DELIVERY_FEE estimate with real,
+    # staff-configurable numbers. Starts with Kampala/Mukono/Wakiso, but
+    # the schema has nothing Kampala-specific in it - an "upcountry" town
+    # is just another row here, added the same way through the same admin
+    # CRUD, not a separate concept.
+    __tablename__ = "delivery_zones"
+
+    # Customer-facing label shown in the checkout dropdown, e.g. "Kampala
+    # Central", "Wakiso". Unique so two zones can't collide under the same
+    # name in the picker.
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+
+    # Whole Ugandan shillings - this market doesn't use sub-shilling cents,
+    # matching Nyson's frontend contract (`fee: integer`).
+    fee: Mapped[int] = mapped_column(Integer)
+
+    # Inactive zones stay in the admin list (for reactivating later) but
+    # are hidden from the public/storefront GET /delivery-zones list -
+    # same soft-delete pattern as every other catalog table in this project.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Lower numbers show first in the storefront picker - same idea as
+    # Banner.display_order above.
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (CheckConstraint("fee >= 0", name="ck_delivery_zone_fee_non_negative"),)
+
+
 class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "orders"
 
@@ -521,6 +564,14 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     district: Mapped[str] = mapped_column(String(100))
 
+    # NULL for a pickup order (no Kampala door-to-door delivery selected) -
+    # both added 2026-08-30 alongside DeliveryZone above. delivery_fee is
+    # SNAPSHOTTED at checkout, same reasoning as CartItem.unit_price_snapshot
+    # elsewhere in this project: if staff later change a zone's fee, every
+    # order placed before that change must keep showing what was actually
+    # charged at the time, not today's number.
+    delivery_zone_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("delivery_zones.id"))
+    delivery_fee: Mapped[int] = mapped_column(Integer, default=0)
 
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
@@ -531,9 +582,12 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # always false for now since Payments (Phase 6) isn't built yet.
     requires_prepayment: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # subtotal and total are the same for now (no delivery fee/tax/discount
-    # logic yet) but kept as separate columns since the docs treat them as
-    # distinct - future phases (Promotions) will make them diverge.
+    # subtotal already reflects any active promotion discount (see the
+    # 2026-08-22 fix above). total = subtotal + delivery_fee, computed and
+    # stored once at checkout (routers/orders.py) - kept as its own column,
+    # like every other total in this project, rather than a computed_field,
+    # since a real order's charged amount must never silently recompute
+    # itself if a promotion or delivery zone fee changes later.
     subtotal: Mapped[float]
     total: Mapped[float]
 
@@ -581,6 +635,33 @@ class OrderStatusHistory(UUIDPrimaryKeyMixin, Base):
     notes: Mapped[str | None] = mapped_column(String(500))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class OrderRating(UUIDPrimaryKeyMixin, Base):
+    # A customer's overall "how was your JN Electronics experience" rating,
+    # from the "Rate your experience" link in the Order Delivered email
+    # (added 2026-08-30, client-requested). unique=True on order_id is what
+    # actually enforces "one rating per order" at the database level - the
+    # router checks it too (for a friendlier 409/already-rated response),
+    # but the constraint is the real guarantee. Append-only like
+    # OrderStatusHistory just above: a rating is submitted once and never
+    # edited, so - same reasoning - no TimestampMixin/updated_at here.
+    __tablename__ = "order_ratings"
+
+    order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orders.id"), unique=True)
+
+    # 1 to 5 stars, overall experience only - per the confirmed decision
+    # (Nyson's doc, 2026-08-29): no per-dimension scores (delivery,
+    # communication, etc.) in this first version.
+    score: Mapped[int] = mapped_column(Integer)
+
+    # Optional written feedback - 500 characters, the frontend's confirmed
+    # max length.
+    comment: Mapped[str | None] = mapped_column(String(500))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (CheckConstraint("score >= 1 AND score <= 5", name="ck_order_rating_score_range"),)
 
 
 class PaymentStatus(str, enum.Enum):

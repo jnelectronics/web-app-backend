@@ -97,3 +97,62 @@ Full automated suite passing (91/91), including a new end-to-end test that drive
 ### Deploy status
 
 **Pushed to `main` (`c710ee1`).** Render auto-deploys on push and should already be live.
+
+---
+
+## Delivery zones, post-delivery rating, and product lifecycle (2026-08-30)
+
+All three of your "still open" backend items from the handoff doc are now implemented, plus the client's UAT RBAC requests.
+
+### Delivery zones
+
+Implemented exactly as your doc specced it:
+
+- `GET /delivery-zones` — public, active zones only, sorted by `sort_order` then `name`. Fields: `id`, `name`, `fee` (integer UGX), `is_active`, `sort_order`, `created_at`, `updated_at`.
+- `GET/POST /admin/delivery-zones`, `PATCH /admin/delivery-zones/{id}`, `PATCH /admin/delivery-zones/{id}/status` — **Owner and System Administrator only**, per your doc (not Sales Attendant, unlike most of the admin API).
+- `POST /orders` now accepts `delivery_zone_id` (uuid, omit for a pickup order) and `delivery_fee` (integer). **We re-validate the fee server-side against the zone's real current fee and reject with `422` if they've drifted** (e.g. your cached zone list is stale) — send the fee for that check, but don't treat it as authoritative on your end either. `district` gets overwritten with the zone's own name when a zone is selected.
+- `GET /orders/{id}` (and everywhere else `OrderRead` appears) now includes `delivery_zone_id` and `delivery_fee`. `total` is `subtotal + delivery_fee`.
+- Duplicate zone names are rejected case-insensitively (`409`) — "Kampala Central" and "kampala central" count as the same name.
+
+Upcountry towns (Joan's list) are just more rows in the same table — nothing Kampala-specific in the schema, so no separate endpoint or flag is needed for those.
+
+### Post-delivery experience rating
+
+Implemented as Option A from your doc, with your confirmed decisions (30-day TTL, 500-char comment, 1-5 stars, no dimension scores):
+
+- `GET /public/order-ratings/{token}` — prefill, always `200`. `rating_status` is `eligible` / `already_rated` / `expired` / `invalid` — render your error states off this field, not an HTTP status code. Also returns `order_number`, `delivered_at`, `item_count`, and (only when `already_rated`) `score`/`comment`/`submitted_at`.
+- `POST /public/order-ratings/{token}` — submit, body `{"score": 1-5, "comment": "optional, max 500 chars"}`. `201` on success. `404` if the token doesn't resolve to a delivered order, `409` if already rated, `410` if the token's expired.
+- The Order Delivered email now sends automatically (see below) with the CTA link already pointed at `https://www.jnelectronics.ug/rate-order?token=<opaque>`.
+
+### Order status emails
+
+`PATCH /orders/{id}/status` now sends an email on two specific transitions (only when the order has a `guest_email`):
+
+- **Out for Delivery** — includes the order's `delivery_address`.
+- **Delivered** — includes the "Rate your experience" link above.
+
+Nothing changes on your end here — this is purely a new side effect of the existing status-advance endpoint you already call.
+
+### Product lifecycle
+
+- `ProductRead` now includes `deactivated_at` (nullable datetime) — matches your `PRODUCT_PERMANENT_DELETE_AFTER_DAYS = 30` constant exactly (the backend enforces the same 30 days server-side).
+- `PATCH /products/{id}/reactivate` (already existed) now also clears `deactivated_at` back to `null`.
+- `DELETE /products/{id}/permanent` is new. `204` on success. `409` if the product was never deactivated, `409` if it's not yet 30 days past `deactivated_at`, and `409` if the product still has real order history (we refuse to break historical orders — this last case shouldn't come up in the admin UI if you're only showing the permanent-delete button for products past the eligibility window, but the server enforces it regardless). **Owner only, not Sales Attendant** — a deliberate extra restriction on our end since this is the one fully irreversible product action.
+
+### RBAC narrowing (client UAT request, affects your admin nav/guards)
+
+Sales Attendant lost access to four things, reversing part of the 2026-08-18 widening:
+
+- The whole Dashboard module (`/admin/dashboard/*` — summary, recent-orders, low-inventory, sales-summary) — now `403` for Sales Attendant.
+- `PATCH /payments/{id}/mark-paid` — now `403` for Sales Attendant.
+- `PATCH /customers/{id}/status` (deactivate) — now `403` for Sales Attendant. Reading the customer directory (`GET /customers`, `GET /customers/{id}`) is unaffected.
+
+If your admin nav/route guards check role client-side too (not just relying on the API's `403`), these three spots need updating to match.
+
+### Verified
+
+Full automated suite passing, including new coverage for: delivery-zone CRUD + RBAC + the three checkout paths (zoned, stale-fee-rejected, pickup-with-no-zone), the full rating prefill/submit/already-rated/expired/not-delivered flow, product-lifecycle permanent-delete (blocked-while-active, blocked-before-30-days, blocked-with-order-history, succeeds-once-eligible), the two new status-change emails, and the RBAC narrowing on all four affected endpoints.
+
+### Deploy status
+
+**Not yet pushed** — will update this section once it's committed and pushed to `main`. Render will also need `alembic upgrade head` run against its DB after this deploys (new tables/columns), and the `RATING_URL` environment variable added to Render's dashboard (same pattern as `STAFF_DASHBOARD_URL` — see `.env.example`) before the rating link in the Delivered email will point anywhere real instead of a localhost placeholder.

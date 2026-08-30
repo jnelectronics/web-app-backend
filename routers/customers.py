@@ -280,7 +280,12 @@ def read_customer(
 def set_customer_status(
     customer_id: uuid.UUID,
     update: CustomerStatusUpdate,
-    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER, StaffRole.SALES_ATTENDANT)),
+    # Sales Attendant lost this specific action on 2026-08-30, at the
+    # client's explicit request ("Remove the Deactivate Customer option
+    # from Sales Attendant accounts") - they keep read access to the
+    # customer directory just above (list_customers/read_customer), this
+    # is only about the write.
+    _current_staff: StaffUser = Depends(require_staff_role(StaffRole.OWNER)),
     db: Session = Depends(get_db),
 ):
     # Sets status to whatever the caller asked for, rather than blindly
