@@ -17,7 +17,7 @@ from routers import (
     categories,
     customers,
     dashboard,
-    delivery_zones,
+    delivery,
     homepage_sections,
     inventory,
     order_ratings,
@@ -26,6 +26,7 @@ from routers import (
     products,
     promotions,
     staff,
+    storefront,
     store_settings,
     variants,
 )
@@ -303,9 +304,14 @@ app.include_router(store_settings.admin_router, prefix="/api/v1")
 # itself (not here) is what protects it - see that file's own comment.
 app.include_router(homepage_sections.public_router, prefix="/api/v1")
 app.include_router(homepage_sections.admin_router, prefix="/api/v1")
-app.include_router(delivery_zones.public_router, prefix="/api/v1")
-app.include_router(delivery_zones.admin_router, prefix="/api/v1")
+app.include_router(delivery.division_public_router, prefix="/api/v1")
+app.include_router(delivery.division_admin_router, prefix="/api/v1")
+app.include_router(delivery.area_public_router, prefix="/api/v1")
+app.include_router(delivery.area_admin_router, prefix="/api/v1")
+app.include_router(delivery.station_public_router, prefix="/api/v1")
+app.include_router(delivery.station_admin_router, prefix="/api/v1")
 app.include_router(order_ratings.router, prefix="/api/v1")
+app.include_router(storefront.router, prefix="/api/v1")
 
 
 @app.get("/")

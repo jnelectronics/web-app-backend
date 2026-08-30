@@ -24,7 +24,8 @@ from models import (
     CartItem,
     CartStatus,
     Customer,
-    DeliveryZone,
+    DeliveryArea,
+    DeliveryDivision,
     InventoryMovement,
     InventoryRecord,
     MovementType,
@@ -34,6 +35,7 @@ from models import (
     OrderStatusHistory,
     Product,
     ProductVariant,
+    RegionalPickupStation,
     StaffRole,
     StaffUser,
 )
@@ -156,8 +158,14 @@ def _build_order_read(order: Order, db: Session) -> OrderRead:
         guest_email=order.guest_email,
         delivery_address=order.delivery_address,
         district=order.district,
-        delivery_zone_id=order.delivery_zone_id,
+        delivery_division_id=order.delivery_division_id,
+        delivery_area_id=order.delivery_area_id,
+        regional_pickup_station_id=order.regional_pickup_station_id,
         delivery_fee=order.delivery_fee,
+        delivery_division_name=order.delivery_division_name,
+        delivery_area_name=order.delivery_area_name,
+        pickup_town=order.pickup_town,
+        delivery_instructions=order.delivery_instructions,
         status=order.status,
         requires_prepayment=order.requires_prepayment,
         subtotal=order.subtotal,
@@ -179,33 +187,84 @@ def checkout(
     if not cart_items:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cart is empty")
 
-    # Resolve the delivery zone SERVER-SIDE - same "never trust a
-    # client-supplied money figure as authoritative" rule that removed
-    # PaymentInitiate.amount entirely (see CLAUDE.md's 2026-08-22 note).
+    # Resolve the delivery/pickup selection SERVER-SIDE - same "never trust
+    # a client-supplied money figure as authoritative" rule that removed
+    # PaymentInitiate.amount entirely (see CLAUDE.md's 2026-08-22 note),
+    # now applied to Nyson's 2026-08-30 delivery/pickup rework (replacing
+    # the single DeliveryZone path). Per Nyson's spec, exactly ONE of the
+    # three ids may be populated:
+    #   - all three None                          -> Kampala pickup
+    #   - delivery_division_id + delivery_area_id  -> Kampala door-to-door
+    #   - regional_pickup_station_id only          -> outside-Kampala pickup
     # request.delivery_fee is only used to detect a STALE frontend (the
-    # zone's fee changed since the customer's page loaded) and reject with
-    # a clear message - the real charged fee always comes from the zone
-    # row itself, never from the request body.
+    # area/station's fee changed since the customer's page loaded) - the
+    # real charged fee always comes from the area/station row itself.
+    # Unlike the old DeliveryZone flow, district/delivery_address are
+    # trusted AS SENT (Nyson's frontend already computes the right display
+    # strings for each path) - the server only resolves the fee and the
+    # name snapshots below, it doesn't overwrite either field.
     delivery_fee = 0
-    delivery_district = request.district
-    if request.delivery_zone_id is not None:
-        zone = db.get(DeliveryZone, request.delivery_zone_id)
-        if zone is None or not zone.is_active:
+    delivery_division_name = None
+    delivery_area_name = None
+    pickup_town = None
+
+    wants_area_path = request.delivery_division_id is not None or request.delivery_area_id is not None
+    if wants_area_path and request.regional_pickup_station_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot select both a Kampala delivery area and a regional pickup station",
+        )
+
+    if wants_area_path:
+        if request.delivery_division_id is None or request.delivery_area_id is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Selected delivery zone is not available",
+                detail="delivery_division_id and delivery_area_id must both be provided together",
             )
-        if request.delivery_fee is not None and request.delivery_fee != zone.fee:
+        division = db.get(DeliveryDivision, request.delivery_division_id)
+        if division is None or not division.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Selected delivery division is not available",
+            )
+        area = db.get(DeliveryArea, request.delivery_area_id)
+        if area is None or not area.is_active or area.division_id != division.id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Selected delivery area is not available",
+            )
+        if request.delivery_fee != area.fee:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Delivery fee has changed - please refresh and try again",
             )
-        delivery_fee = zone.fee
-        # Server overwrites district with the zone's own name, per Nyson's
-        # spec - keeps this field consistent with delivery_zone_id instead
-        # of trusting whatever free-text label the frontend happened to
-        # send alongside it.
-        delivery_district = zone.name
+        delivery_fee = area.fee
+        delivery_division_name = division.name
+        delivery_area_name = area.name
+    elif request.regional_pickup_station_id is not None:
+        station = db.get(RegionalPickupStation, request.regional_pickup_station_id)
+        if station is None or not station.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Selected pickup station is not available",
+            )
+        if request.delivery_fee != station.fee:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Delivery fee has changed - please refresh and try again",
+            )
+        delivery_fee = station.fee
+        pickup_town = station.major_town
+    else:
+        # Kampala pickup (from our own shop) - no area/station row to
+        # check the fee against, but 0 is still the one correct value, so
+        # a client that thinks otherwise is just as stale as one pointing
+        # at a real area/station whose fee moved.
+        if request.delivery_fee != 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Delivery fee has changed - please refresh and try again",
+            )
 
     short_items = _find_short_items(db, cart_items)
     if short_items:
@@ -277,13 +336,19 @@ def checkout(
         guest_phone_number=request.guest_phone_number,
         guest_email=request.guest_email,
         delivery_address=request.delivery_address,
-        district=delivery_district,
-        delivery_zone_id=request.delivery_zone_id,
+        district=request.district,
+        delivery_division_id=request.delivery_division_id,
+        delivery_area_id=request.delivery_area_id,
+        regional_pickup_station_id=request.regional_pickup_station_id,
         delivery_fee=delivery_fee,
+        delivery_division_name=delivery_division_name,
+        delivery_area_name=delivery_area_name,
+        pickup_town=pickup_town,
+        delivery_instructions=request.delivery_instructions,
         subtotal=subtotal,
         # subtotal already reflects any active discount (2026-08-22 fix);
-        # delivery_fee resolved above from the zone lookup, 0 for a pickup
-        # order with no zone selected.
+        # delivery_fee resolved above from the area/station lookup, 0 for
+        # a Kampala pickup order with none selected.
         total=subtotal + delivery_fee,
     )
     db.add(new_order)
@@ -353,7 +418,7 @@ def checkout(
         new_order.order_number,
         request.guest_full_name,
         request.guest_email,
-        new_order.district,  # the zone-resolved district, not necessarily request.district verbatim
+        new_order.district,
         new_order.total,
         request.delivery_address,
     )

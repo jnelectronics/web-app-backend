@@ -590,17 +590,33 @@ class CheckoutRequest(BaseModel):
     delivery_address: str
     district: str
 
-    # Both added 2026-08-30 for Kampala door-to-door delivery zones. NULL/
-    # omitted for a pickup order (no zone selected). delivery_fee is what
-    # the FRONTEND currently believes the fee is (from whatever it last
-    # fetched via GET /delivery-zones) - routers/orders.py's checkout
-    # re-checks it against the zone's real, current fee and rejects if
-    # they've drifted apart, the same "never trust a client-supplied money
-    # figure as authoritative" rule PaymentInitiate.amount's removal
-    # already established. The order's real delivery_fee always comes from
-    # the zone lookup, never from this field directly.
-    delivery_zone_id: uuid.UUID | None = None
-    delivery_fee: int | None = None
+    # Replaces the single delivery_zone_id (2026-08-30 delivery/pickup
+    # rework, per Nyson's updated spec) - exactly ONE of these three is
+    # populated depending on the fulfillment path the customer picked:
+    #   - all three None       -> Kampala pickup (from our own shop)
+    #   - division_id + area_id -> Kampala door-to-door delivery
+    #   - regional_pickup_station_id only -> outside-Kampala pickup
+    # routers/orders.py's checkout() enforces exactly this combination and
+    # 422s on anything else (e.g. only one of division_id/area_id set).
+    delivery_division_id: uuid.UUID | None = None
+    delivery_area_id: uuid.UUID | None = None
+    regional_pickup_station_id: uuid.UUID | None = None
+
+    # What the FRONTEND currently believes the fee is (from whatever
+    # area/station list it last fetched). routers/orders.py's checkout
+    # re-checks this against the real, current area/station fee and
+    # rejects with 422 if they've drifted apart - the same "never trust a
+    # client-supplied money figure as authoritative" rule
+    # PaymentInitiate.amount's removal already established. The order's
+    # real delivery_fee always comes from the area/station lookup (or 0
+    # for a pickup order), never from this field directly.
+    delivery_fee: int = 0
+
+    # Free-text "more information" collected at checkout - optional since
+    # Nyson's frontend doesn't wire this up to POST yet (see the Order
+    # model's comment); accepted here so no further backend change is
+    # needed once it does.
+    delivery_instructions: str | None = None
 
 
 class OrderItemRead(BaseModel):
@@ -624,8 +640,16 @@ class OrderRead(BaseModel):
     guest_email: str | None
     delivery_address: str
     district: str
-    delivery_zone_id: uuid.UUID | None
+    delivery_division_id: uuid.UUID | None
+    delivery_area_id: uuid.UUID | None
+    regional_pickup_station_id: uuid.UUID | None
     delivery_fee: int
+    # Name snapshots - see the Order model's comment. NULL for a Kampala
+    # pickup order (no area/station was ever selected).
+    delivery_division_name: str | None
+    delivery_area_name: str | None
+    pickup_town: str | None
+    delivery_instructions: str | None
     status: OrderStatus
     requires_prepayment: bool
     subtotal: float
@@ -904,31 +928,98 @@ class BannerStatusUpdate(BaseModel):
     is_active: bool
 
 
-class DeliveryZoneCreate(BaseModel):
+class DeliveryDivisionCreate(BaseModel):
     name: str
-    fee: int = Field(ge=0)
     sort_order: int = 0
 
 
-class DeliveryZoneUpdate(BaseModel):
-    # Both optional, same "send only what you're changing" pattern as
+class DeliveryDivisionUpdate(BaseModel):
+    # Optional, same "send only what you're changing" pattern as
     # ProductUpdate - None means "leave this one as it is".
     name: str | None = None
-    fee: int | None = Field(default=None, ge=0)
 
 
-class DeliveryZoneStatusUpdate(BaseModel):
+class DeliveryDivisionStatusUpdate(BaseModel):
     # Sets is_active to exactly this value - same "not a toggle" reasoning
     # as BannerStatusUpdate above.
     is_active: bool
 
 
-class DeliveryZoneRead(BaseModel):
+class DeliveryDivisionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     name: str
+    is_active: bool
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class DeliveryAreaCreate(BaseModel):
+    division_id: uuid.UUID
+    name: str
+    fee: int = Field(ge=0)
+    sort_order: int = 0
+
+
+class DeliveryAreaUpdate(BaseModel):
+    division_id: uuid.UUID | None = None
+    name: str | None = None
+    fee: int | None = Field(default=None, ge=0)
+
+
+class DeliveryAreaStatusUpdate(BaseModel):
+    is_active: bool
+
+
+class DeliveryAreaRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    division_id: uuid.UUID
+    name: str
     fee: int
+    is_active: bool
+    sort_order: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class DeliveryAreaWithDivisionRead(DeliveryAreaRead):
+    # The admin list needs division_name alongside every area, per Nyson's
+    # spec, so the settings table doesn't have to make a second request per
+    # row just to label which division an area belongs to.
+    division_name: str
+
+
+class RegionalPickupStationCreate(BaseModel):
+    major_town: str
+    address: str
+    fee: int = Field(ge=0)
+    contact: str
+    sort_order: int = 0
+
+
+class RegionalPickupStationUpdate(BaseModel):
+    major_town: str | None = None
+    address: str | None = None
+    fee: int | None = Field(default=None, ge=0)
+    contact: str | None = None
+
+
+class RegionalPickupStationStatusUpdate(BaseModel):
+    is_active: bool
+
+
+class RegionalPickupStationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    major_town: str
+    address: str
+    fee: int
+    contact: str
     is_active: bool
     sort_order: int
     created_at: datetime
@@ -1059,6 +1150,36 @@ class HomepageSectionWithProducts(HomepageSectionRead):
     # full ProductRead shape rather than inventing a slimmer "product
     # summary" schema, matching how this project generally favors one
     # consistent product shape over several narrower ones.
+    products: list["ProductRead"]
+
+
+class HomepageSectionProductsRead(BaseModel):
+    # One entry per homepage section, used by HomepageBundleRead.section_products
+    # below - kept as its own {section_id, products} list (order-preserving,
+    # matching display_order) rather than a dict keyed by section id, so it
+    # stays plain JSON-array-of-objects like everything else in this API.
+    section_id: uuid.UUID
+    products: list["ProductRead"]
+
+
+class HomepageBundleRead(BaseModel):
+    # Native replacement for Nyson's frontend-side interim BFF
+    # (buildHomepageBundle()) - added 2026-08-30. One response instead of
+    # the five-plus separate public GET calls the frontend currently fans
+    # out to build the homepage. See routers/storefront.py for how each
+    # field is assembled.
+    categories: list["CategoryRead"]
+    category_groups: list["CategoryGroupWithCategories"]
+    store_settings: "StoreSettingsRead"
+    homepage_sections: list[HomepageSectionRead]
+    catalogue_products: list["ProductRead"]
+    section_products: list[HomepageSectionProductsRead]
+
+
+class CatalogueBundleRead(BaseModel):
+    # Native replacement for buildCatalogueBundle() - the "All Products"
+    # page's own interim BFF.
+    categories: list["CategoryRead"]
     products: list["ProductRead"]
 
 

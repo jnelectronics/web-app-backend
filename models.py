@@ -502,35 +502,66 @@ class OrderStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
-class DeliveryZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    # Kampala door-to-door delivery areas + what each one costs to deliver
-    # to - added 2026-08-30 at the client's request, to replace the
-    # frontend's flat PLACEHOLDER_DELIVERY_FEE estimate with real,
-    # staff-configurable numbers. Starts with Kampala/Mukono/Wakiso, but
-    # the schema has nothing Kampala-specific in it - an "upcountry" town
-    # is just another row here, added the same way through the same admin
-    # CRUD, not a separate concept.
-    __tablename__ = "delivery_zones"
+class DeliveryDivision(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # Replaces DeliveryZone (2026-08-30 UAT), same day it shipped - Nyson's
+    # frontend rebuilt checkout's fulfillment step around a real two-level
+    # Kampala hierarchy (division -> area, each area its own fee) plus a
+    # separate flat list of upcountry pickup stations, instead of one flat
+    # list of "zones". A division is just a grouping label (e.g. "Kampala
+    # Central", "Nakawa") - no fee/ETA/notes of its own, per Nyson's spec;
+    # the fee lives on the DeliveryArea rows underneath it.
+    __tablename__ = "delivery_divisions"
 
-    # Customer-facing label shown in the checkout dropdown, e.g. "Kampala
-    # Central", "Wakiso". Unique so two zones can't collide under the same
-    # name in the picker.
-    name: Mapped[str] = mapped_column(String(100), unique=True)
+    name: Mapped[str] = mapped_column(String(100))
 
-    # Whole Ugandan shillings - this market doesn't use sub-shilling cents,
-    # matching Nyson's frontend contract (`fee: integer`).
-    fee: Mapped[int] = mapped_column(Integer)
-
-    # Inactive zones stay in the admin list (for reactivating later) but
-    # are hidden from the public/storefront GET /delivery-zones list -
-    # same soft-delete pattern as every other catalog table in this project.
+    # Inactive divisions stay in the admin list (for reactivating later)
+    # but are hidden from the public GET /delivery-divisions list - same
+    # soft-delete pattern as every other catalog table in this project.
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # Lower numbers show first in the storefront picker - same idea as
     # Banner.display_order above.
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
-    __table_args__ = (CheckConstraint("fee >= 0", name="ck_delivery_zone_fee_non_negative"),)
+
+class DeliveryArea(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # One door-to-door area WITHIN a division, and what it costs to
+    # deliver there - e.g. "Ntinda" under the "Nakawa" division. This is
+    # where DeliveryZone's old fee/is_active/sort_order columns actually
+    # ended up; the division above is purely a grouping layer.
+    __tablename__ = "delivery_areas"
+
+    division_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("delivery_divisions.id"))
+
+    name: Mapped[str] = mapped_column(String(100))
+
+    # Whole Ugandan shillings - this market doesn't use sub-shilling cents,
+    # matching Nyson's frontend contract (`fee: integer`).
+    fee: Mapped[int] = mapped_column(Integer)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (CheckConstraint("fee >= 0", name="ck_delivery_area_fee_non_negative"),)
+
+
+class RegionalPickupStation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    # A flat (not nested under any division) list of upcountry pickup
+    # points - one row per town/station, each with its own delivery fee
+    # (this is a "we deliver TO this station, you collect from there" fee,
+    # not a door-to-door fee). Deliberately flat, per Nyson's spec: "No
+    # operating hours, no nested region hierarchy, no separate area label."
+    __tablename__ = "regional_pickup_stations"
+
+    major_town: Mapped[str] = mapped_column(String(100))
+    address: Mapped[str] = mapped_column(String(255))
+    fee: Mapped[int] = mapped_column(Integer)
+    contact: Mapped[str] = mapped_column(String(50))
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (CheckConstraint("fee >= 0", name="ck_regional_pickup_station_fee_non_negative"),)
 
 
 class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -562,16 +593,46 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     delivery_address: Mapped[str] = mapped_column(String(500))
 
+    # Sent directly by the frontend (not overwritten server-side, unlike
+    # the old DeliveryZone flow) - Nyson's checkout step already computes
+    # these as plain display strings before POSTing (e.g.
+    # "{division_name} - {area_name}" for a Kampala delivery, or the
+    # station's major_town for an outside-Kampala pickup).
     district: Mapped[str] = mapped_column(String(100))
 
-    # NULL for a pickup order (no Kampala door-to-door delivery selected) -
-    # both added 2026-08-30 alongside DeliveryZone above. delivery_fee is
-    # SNAPSHOTTED at checkout, same reasoning as CartItem.unit_price_snapshot
-    # elsewhere in this project: if staff later change a zone's fee, every
-    # order placed before that change must keep showing what was actually
-    # charged at the time, not today's number.
-    delivery_zone_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("delivery_zones.id"))
+    # Exactly ONE of these three is populated per Nyson's 2026-08-30 spec
+    # (replacing the single DeliveryZone.delivery_zone_id column):
+    #   - all NULL                              -> Kampala pickup (from our own shop)
+    #   - delivery_division_id + delivery_area_id -> Kampala door-to-door
+    #   - regional_pickup_station_id only        -> outside-Kampala pickup
+    # routers/orders.py's checkout() enforces this combination server-side.
+    delivery_division_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("delivery_divisions.id"))
+    delivery_area_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("delivery_areas.id"))
+    regional_pickup_station_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("regional_pickup_stations.id"))
+
+    # delivery_fee is SNAPSHOTTED at checkout, same reasoning as
+    # CartItem.unit_price_snapshot elsewhere in this project: if staff
+    # later change an area/station's fee, every order placed before that
+    # change must keep showing what was actually charged at the time, not
+    # today's number.
     delivery_fee: Mapped[int] = mapped_column(Integer, default=0)
+
+    # NAME SNAPSHOTS - the frontend doesn't send these on POST (it only
+    # sends the ids above), but Nyson's spec asks GET /orders/{id} to echo
+    # them back so staff/account views can show "Nakawa - Ntinda" without
+    # a second lookup, even if the division/area/station is later renamed
+    # or deactivated. NULL for a Kampala pickup order (no area/station
+    # selected, nothing to snapshot).
+    delivery_division_name: Mapped[str | None] = mapped_column(String(100))
+    delivery_area_name: Mapped[str | None] = mapped_column(String(100))
+    pickup_town: Mapped[str | None] = mapped_column(String(100))
+
+    # Free-text "more information" the customer typed at checkout (e.g. a
+    # landmark, gate code) - added 2026-08-30 per Nyson's "gap to know"
+    # note: collected in the UI already, not yet wired to actually POST it.
+    # Nullable/optional now so this column is ready the moment the
+    # frontend starts sending it, without needing another migration.
+    delivery_instructions: Mapped[str | None] = mapped_column(String(500))
 
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
