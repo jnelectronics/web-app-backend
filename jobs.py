@@ -101,7 +101,7 @@ def send_password_reset_email(email: str, reset_token: str, full_name: str | Non
     logger.info("Password reset email sent to %s", email)
 
 
-def send_order_confirmation_email(
+def send_order_placed_email(
     email: str,
     full_name: str,
     order_number: str,
@@ -118,13 +118,20 @@ def send_order_confirmation_email(
     # doesn't enqueue it in that case, rather than this function silently
     # no-op-ing on an empty string).
     #
+    # Renamed from send_order_confirmation_email 2026-08-31 (client-
+    # requested fix): checkout used to send an "order confirmed" email
+    # while staff still saw the order sitting in "pending" - a real lie
+    # about what had actually happened. This email now only ever says the
+    # order was PLACED; send_order_confirmed_email (below) is the genuinely
+    # separate email that fires once staff actually confirm it.
+    #
     # Takes plain values (a list of dicts, not ORM Item objects), same
     # reasoning as send_password_reset_email taking plain strings: this
     # runs from a BackgroundTasks callback AFTER the request's own DB
     # session has already been closed, so it can't safely touch ORM
     # objects tied to that session - only plain Python values survive that
     # boundary safely.
-    subject = f"Your JN Electronics Order {order_number} Is Confirmed"
+    subject = f"Your JN Electronics Order {order_number} Has Been Placed"
 
     item_lines = "\n".join(
         f"- {item['name']}"
@@ -134,7 +141,7 @@ def send_order_confirmation_email(
     )
     body = (
         f"Hi {full_name},\n\n"
-        f"Thanks for your order! {order_number} has been placed and is now being processed.\n\n"
+        f"Thanks for your order! {order_number} has been placed and is now pending confirmation.\n\n"
         f"Items:\n{item_lines}\n\n"
         f"Subtotal: UGX {subtotal:,.2f}\n"
         f"Total: UGX {total:,.2f}\n\n"
@@ -146,7 +153,7 @@ def send_order_confirmation_email(
     # in Python keeps the template itself simple (just print the string),
     # and keeps the exact same formatting logic in one place for both the
     # plain-text body above and the HTML below.
-    html = _template_env.get_template("order_confirmation.html").render(
+    html = _template_env.get_template("order_placed.html").render(
         full_name=full_name,
         order_number=order_number,
         items=[{**item, "line_total": f"{item['line_total']:,.2f}"} for item in items],
@@ -156,16 +163,47 @@ def send_order_confirmation_email(
     )
 
     if not email_client.is_configured():
-        logger.info("Resend not configured - order confirmation for %s not sent (order %s)", email, order_number)
+        logger.info("Resend not configured - order placed email for %s not sent (order %s)", email, order_number)
         return
 
     try:
         email_client.send_email(email, subject, body, html=html)
     except email_client.EmailError:
-        logger.exception("Failed to send order confirmation email to %s for order %s", email, order_number)
+        logger.exception("Failed to send order placed email to %s for order %s", email, order_number)
         return
 
-    logger.info("Order confirmation email sent to %s for order %s", email, order_number)
+    logger.info("Order placed email sent to %s for order %s", email, order_number)
+
+
+def send_order_confirmed_email(email: str, full_name: str, order_number: str) -> None:
+    # NEW 2026-08-31 (client-requested fix, alongside the send_order_placed
+    # rename above): fires from routers/orders.py's advance_order_status,
+    # only on the specific pending -> confirmed transition - this is the
+    # email that actually means "a staff member has looked at this order
+    # and confirmed it", which send_order_placed_email (checkout time)
+    # never claimed.
+    subject = f"Your JN Electronics Order {order_number} Is Confirmed"
+    body = (
+        f"Hi {full_name},\n\n"
+        f"Good news - your order {order_number} has been confirmed and is now being prepared.\n\n"
+        "We'll notify you as your order's status changes."
+    )
+    html = _template_env.get_template("order_confirmed.html").render(
+        full_name=full_name,
+        order_number=order_number,
+    )
+
+    if not email_client.is_configured():
+        logger.info("Resend not configured - order confirmed email for %s not sent (order %s)", email, order_number)
+        return
+
+    try:
+        email_client.send_email(email, subject, body, html=html)
+    except email_client.EmailError:
+        logger.exception("Failed to send order confirmed email to %s for order %s", email, order_number)
+        return
+
+    logger.info("Order confirmed email sent to %s for order %s", email, order_number)
 
 
 def notify_staff_new_order(
@@ -337,7 +375,7 @@ def send_payment_confirmed_email(
     provider: str,
 ) -> None:
     # NOT in the original spec's checkout sequence diagram (that one only
-    # covers send_order_confirmation_email/notify_staff_new_order at ORDER
+    # covers send_order_placed_email/notify_staff_new_order at ORDER
     # placement, before any payment exists) - added afterward because an
     # order being PLACED and an order being PAID FOR are genuinely
     # different events or a customer, worth its own confirmation. Fires
@@ -451,3 +489,47 @@ def send_order_delivered_email(
         return
 
     logger.info("Delivered email sent to %s for order %s", email, order_number)
+
+
+def send_order_collected_email(
+    email: str,
+    full_name: str,
+    order_number: str,
+    rating_token: str,
+) -> None:
+    # NEW 2026-08-31 (Nyson's pickup-aware status lifecycle): fires from
+    # routers/orders.py's advance_order_status instead of
+    # send_order_delivered_email, only when the order transitioning INTO
+    # DELIVERED is a Kampala store pickup order (routers/orders.py's
+    # is_kampala_store_pickup) - those orders never pass through
+    # out_for_delivery, so "delivered" for them really means "collected
+    # from our Kampala store", and the copy should say that instead of
+    # implying a rider dropped it off. Still carries the same rating link
+    # as send_order_delivered_email - the customer's experience is worth
+    # rating either way.
+    subject = f"Your JN Electronics Order {order_number} Has Been Collected"
+    rating_url = f"{RATING_URL}?token={rating_token}"
+    body = (
+        f"Hi {full_name},\n\n"
+        f"Your order {order_number} has been collected from our Kampala store. "
+        "We hope you're happy with it!\n\n"
+        f"Rate your experience: {rating_url}\n\n"
+        "Thanks for shopping with JN Electronics."
+    )
+    html = _template_env.get_template("order_collected.html").render(
+        full_name=full_name,
+        order_number=order_number,
+        rating_url=rating_url,
+    )
+
+    if not email_client.is_configured():
+        logger.info("Resend not configured - collected email for %s not sent (order %s)", email, order_number)
+        return
+
+    try:
+        email_client.send_email(email, subject, body, html=html)
+    except email_client.EmailError:
+        logger.exception("Failed to send collected email to %s for order %s", email, order_number)
+        return
+
+    logger.info("Collected email sent to %s for order %s", email, order_number)

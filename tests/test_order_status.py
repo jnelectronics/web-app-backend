@@ -11,6 +11,8 @@ from models import (
     AuditLog,
     Category,
     Customer,
+    DeliveryArea,
+    DeliveryDivision,
     Order,
     OrderStatusHistory,
     Product,
@@ -23,6 +25,13 @@ from security import create_access_token, hash_password
 
 @pytest.fixture
 def order_setup(db):
+    # A genuine Kampala DOOR-TO-DOOR DELIVERY order - needs a real
+    # DeliveryDivision/DeliveryArea row (an FK, not just an id) so that
+    # is_kampala_store_pickup(order) is unambiguously False here, keeping
+    # this fixture's regression coverage of the plain
+    # pending->confirmed->packed->out_for_delivery->delivered lifecycle
+    # meaningful. Kampala STORE pickup (all three ids None) gets its own
+    # pickup_order_setup fixture below.
     category = Category(name=f"OS Test Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
     db.add(category)
     db.flush()
@@ -31,6 +40,13 @@ def order_setup(db):
     db.flush()
     variant = ProductVariant(product_id=product.id, sku=f"SKU-{uuid.uuid4().hex[:8]}", price=1000.0)
     db.add(variant)
+    db.flush()
+
+    division = DeliveryDivision(name=f"OS Test Division {uuid.uuid4().hex[:8]}")
+    db.add(division)
+    db.flush()
+    area = DeliveryArea(division_id=division.id, name=f"OS Test Area {uuid.uuid4().hex[:8]}", fee=5000)
+    db.add(area)
     db.flush()
 
     owner = Customer(
@@ -53,8 +69,13 @@ def order_setup(db):
         guest_phone_number="+256700000000",
         delivery_address="Test Address",
         district="Test District",
+        delivery_division_id=division.id,
+        delivery_area_id=area.id,
+        delivery_fee=area.fee,
+        delivery_division_name=division.name,
+        delivery_area_name=area.name,
         subtotal=1000.0,
-        total=1000.0,
+        total=1000.0 + area.fee,
     )
     db.add(order)
     db.commit()
@@ -74,6 +95,66 @@ def order_setup(db):
     db.query(Order).filter(Order.id == order.id).delete()
     db.commit()
     db.query(Customer).filter(Customer.id.in_([owner.id, other.id])).delete(synchronize_session=False)
+    db.commit()
+    db.query(ProductVariant).filter(ProductVariant.id == variant.id).delete()
+    db.commit()
+    db.query(Product).filter(Product.id == product.id).delete()
+    db.commit()
+    db.query(Category).filter(Category.id == category.id).delete()
+    db.commit()
+    db.query(DeliveryArea).filter(DeliveryArea.id == area.id).delete()
+    db.commit()
+    db.query(DeliveryDivision).filter(DeliveryDivision.id == division.id).delete()
+    db.commit()
+
+
+@pytest.fixture
+def pickup_order_setup(db):
+    # A Kampala STORE PICKUP order - all three delivery-selection ids left
+    # None, delivery_fee left at its 0 default - exactly the shape
+    # routers/orders.py's is_kampala_store_pickup() detects. Separate
+    # fixture from order_setup (a real delivery order) so each test's
+    # intent is unambiguous from which fixture it asks for.
+    category = Category(name=f"OS Pickup Category {uuid.uuid4().hex[:8]}", category_group_id=uncategorized_group_id(db))
+    db.add(category)
+    db.flush()
+    product = Product(category_id=category.id, name="OS Pickup Product")
+    db.add(product)
+    db.flush()
+    variant = ProductVariant(product_id=product.id, sku=f"SKU-{uuid.uuid4().hex[:8]}", price=1000.0)
+    db.add(variant)
+    db.flush()
+
+    owner = Customer(
+        full_name="Pickup Order Owner",
+        email=f"pickupowner-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("Password123"),
+    )
+    db.add(owner)
+    db.flush()
+
+    order = Order(
+        order_number=f"JN-TEST-{uuid.uuid4().hex[:8]}",
+        customer_id=owner.id,
+        guest_full_name=owner.full_name,
+        guest_phone_number="+256700000099",
+        delivery_address="JN Electronics Kampala Store",
+        district="Kampala",
+        subtotal=1000.0,
+        total=1000.0,
+    )
+    db.add(order)
+    db.commit()
+
+    token = create_access_token(subject=str(owner.id), account_type="customer")
+
+    yield {"order": order, "token": token}
+
+    db.query(OrderStatusHistory).filter(OrderStatusHistory.order_id == order.id).delete()
+    db.commit()
+    db.query(Order).filter(Order.id == order.id).delete()
+    db.commit()
+    db.query(Customer).filter(Customer.id == owner.id).delete()
     db.commit()
     db.query(ProductVariant).filter(ProductVariant.id == variant.id).delete()
     db.commit()
@@ -187,12 +268,14 @@ def test_status_history_visible_to_owner_and_staff_not_others(client, order_setu
     assert response.status_code == 200
 
 
-def test_out_for_delivery_and_delivered_emails_sent_with_rating_link(
+def test_confirmed_out_for_delivery_and_delivered_emails_sent_with_rating_link(
     client, db, order_setup, staff_tokens, mock_email
 ):
-    # 2026-08-30, client-requested: an email at these two specific
-    # transitions, and the Delivered one carries the "Rate your
-    # experience" link (routers/order_ratings.py's public token flow).
+    # 2026-08-30/31, client-requested: an email at each of these three
+    # transitions - Confirmed is its own separate email from checkout's
+    # "Order Placed" one (see jobs.py's send_order_confirmed_email), and
+    # the Delivered one carries the "Rate your experience" link
+    # (routers/order_ratings.py's public token flow).
     order = order_setup["order"]
     order.guest_email = "buyer@example.com"
     db.commit()
@@ -200,16 +283,21 @@ def test_out_for_delivery_and_delivered_emails_sent_with_rating_link(
     owner_headers = _auth(staff_tokens[StaffRole.OWNER])
 
     client.patch(f"/api/v1/orders/{order.id}/status", json={"to_status": "confirmed"}, headers=owner_headers)
+    confirmed_email = next((e for e in mock_email if e["to_email"] == "buyer@example.com"), None)
+    assert confirmed_email is not None
+    assert "Confirmed" in confirmed_email["subject"]
+
     client.patch(f"/api/v1/orders/{order.id}/status", json={"to_status": "packed"}, headers=owner_headers)
-    assert mock_email == []  # neither intermediate transition sends anything
+    assert len(mock_email) == 1  # packed itself sends nothing new
 
     response = client.patch(
         f"/api/v1/orders/{order.id}/status", json={"to_status": "out_for_delivery"}, headers=owner_headers
     )
     assert response.status_code == 200
-    out_for_delivery_email = next((e for e in mock_email if e["to_email"] == "buyer@example.com"), None)
+    out_for_delivery_email = next(
+        (e for e in mock_email if e["to_email"] == "buyer@example.com" and "Out for Delivery" in e["subject"]), None
+    )
     assert out_for_delivery_email is not None
-    assert "Out for Delivery" in out_for_delivery_email["subject"]
     assert order.delivery_address in out_for_delivery_email["body"]
 
     response = client.patch(
@@ -221,6 +309,54 @@ def test_out_for_delivery_and_delivered_emails_sent_with_rating_link(
     ]
     assert len(delivered_emails) == 1
     assert "rate-order?token=" in delivered_emails[0]["body"]
+
+
+def test_kampala_store_pickup_skips_out_for_delivery(client, db, pickup_order_setup, staff_tokens, mock_email):
+    # Nyson, 2026-08-31: a Kampala store pickup order goes straight from
+    # packed to delivered - out_for_delivery must not even be a reachable
+    # transition for it, and the "delivered" email should be the pickup-
+    # specific "Collected" one, not the door-to-door "Delivered" one.
+    order = pickup_order_setup["order"]
+    order.guest_email = "pickup-buyer@example.com"
+    db.commit()
+
+    owner_headers = _auth(staff_tokens[StaffRole.OWNER])
+
+    client.patch(f"/api/v1/orders/{order.id}/status", json={"to_status": "confirmed"}, headers=owner_headers)
+    client.patch(f"/api/v1/orders/{order.id}/status", json={"to_status": "packed"}, headers=owner_headers)
+
+    # packed -> out_for_delivery is rejected for a Kampala pickup order.
+    response = client.patch(
+        f"/api/v1/orders/{order.id}/status", json={"to_status": "out_for_delivery"}, headers=owner_headers
+    )
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "INVALID_STATE_TRANSITION"
+
+    # packed -> delivered (straight through) is allowed.
+    response = client.patch(
+        f"/api/v1/orders/{order.id}/status", json={"to_status": "delivered"}, headers=owner_headers
+    )
+    assert response.status_code == 200
+    assert unwrap(response)["status"] == "delivered"
+    assert unwrap(response)["fulfillment_method"] == "pickup"
+    assert unwrap(response)["location"] == "kampala"
+
+    # The email sent on delivery is the pickup-specific "Collected" one,
+    # not the door-to-door "Delivered" one (the confirmed-transition email
+    # sent earlier is also addressed to this same inbox, hence checking
+    # "any"/"not any" across everything sent rather than assuming a single
+    # matching email).
+    pickup_emails = [e for e in mock_email if e["to_email"] == "pickup-buyer@example.com"]
+    assert any("Collected" in e["subject"] for e in pickup_emails)
+    assert not any("Delivered" in e["subject"] for e in pickup_emails)
+    assert any("rate-order?token=" in e["body"] for e in pickup_emails)
+
+    # Status history never contains out_for_delivery - the rejected patch
+    # above never wrote a row (advance_order_status raises before it does).
+    history = unwrap(
+        client.get(f"/api/v1/orders/{order.id}/status-history", headers=_auth(pickup_order_setup["token"]))
+    )
+    assert [h["to_status"] for h in history] == ["confirmed", "packed", "delivered"]
 
 
 def test_no_status_change_email_without_guest_email(client, order_setup, staff_tokens, mock_email):

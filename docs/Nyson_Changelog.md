@@ -2,33 +2,50 @@
 
 All changes below are already pushed to `main` (Render auto-deploys on push).
 
-## Kampala delivery/pickup rework and storefront bundle endpoints (2026-08-30)
+## Pickup-aware order status lifecycle + Order Placed/Order Confirmed emails (2026-08-31)
 
 ### What you need to do
 
-**Delivery divisions, areas, and pickup stations (replaces `/delivery-zones` entirely):**
+**Skip `out_for_delivery` for Kampala store pickup:**
 
-1. `GET /delivery-divisions` — public, active divisions only, sorted by `sort_order` then `name`. Fields: `id`, `name`, `is_active`, `sort_order`, `created_at`, `updated_at`.
-2. `GET /delivery-areas?division_id={uuid}` — public, `division_id` is **required**. Returns active areas under that division only. Fields: `id`, `division_id`, `name`, `fee` (integer UGX), `is_active`, `sort_order`, `created_at`, `updated_at`.
-3. `GET /regional-pickup-stations` — public, active stations only, sorted by `sort_order` then `major_town`. Fields: `id`, `major_town`, `address`, `fee` (integer UGX), `contact`, `is_active`, `sort_order`, `created_at`, `updated_at`.
-4. Admin CRUD for all three lives under `/admin/delivery-divisions`, `/admin/delivery-areas` (admin list also returns `division_name` on each row), `/admin/regional-pickup-stations` — each supports `GET` (all, active + inactive), `POST` (create), `PATCH /{id}` (edit), `PATCH /{id}/status` (`{"is_active": boolean}`). **Gate all three to Owner and System Administrator only** — Sales Attendant gets `403`.
-5. `POST /orders` now accepts exactly one of three combinations (matches your spec):
-   - all three `null` → Kampala pickup from our shop, `delivery_fee` must be `0`
-   - `delivery_division_id` + `delivery_area_id` together → Kampala door-to-door, `delivery_fee` must match the area's current fee
-   - `regional_pickup_station_id` alone → outside-Kampala pickup, `delivery_fee` must match the station's current fee
-   Any other combination (e.g. only one of division/area, or an area+station both set) is rejected with `422`. A stale `delivery_fee` is also rejected with `422` — refetch and retry.
-6. **`district` and `delivery_address` are no longer overwritten server-side** — send whatever your checkout step already computes for each path; we no longer resolve/replace them from the selected division/area/station name.
-7. `delivery_instructions` (string, optional, max 500 chars) is now accepted on `POST /orders` — send it whenever you wire up the "more information" field.
-8. `GET /orders/{id}` (and everywhere else `OrderRead` appears) now includes: `delivery_division_id`, `delivery_area_id`, `regional_pickup_station_id`, `delivery_fee`, `district`, `delivery_address`, `delivery_instructions`, and the three name snapshots — `delivery_division_name`, `delivery_area_name` (Kampala delivery only), `pickup_town` (outside-Kampala pickup only, `= station.major_town`). All three snapshots are `null` for a Kampala pickup order. `total` is still `subtotal + delivery_fee`.
-9. `delivery_zone_id` is gone. `GET /delivery-zones` and `/admin/delivery-zones` are gone (`404`) — update every reference.
+1. A Kampala store pickup order (`fulfillment_method = "pickup"`, `location = "kampala"`, `delivery_fee = 0` — all three together, exactly your spec) now skips `out_for_delivery` entirely. `PATCH /orders/{id}/status`:
+   - `packed` → `out_for_delivery` on a Kampala pickup order is rejected with `409` (`error_code: "INVALID_STATE_TRANSITION"`).
+   - `packed` → `delivered` on a Kampala pickup order succeeds directly.
+   - Every other transition, and every non-pickup order, is unchanged (delivery orders still require the full `pending → confirmed → packed → out_for_delivery → delivered` pipeline; `packed → delivered` directly is still rejected for them).
+2. Outside-Kampala regional pickup is **unchanged for now** — it still goes through the full five-step pipeline, per your note that this wasn't confirmed otherwise yet.
+3. `fulfillment_method` (`"pickup" | "delivery"`) and `location` (`"kampala" | "outside_kampala"`) are now present on `GET /orders/{id}` and every staff list response, exactly as you asked — derived server-side from the order's delivery-selection fields, not stored separately, so they can never disagree with them.
+4. No new `OrderStatus` value was added — `delivered` is still the one terminal status for both pickup and delivery orders, as you specified. Use `fulfillment_method`/`location` (and which status-lifecycle email arrived — see below) to decide whether to render "Delivered" or "Collected" copy.
+5. Customer edit/cancel eligibility needed no backend change — it already blocks at `out_for_delivery` and later, and a Kampala pickup order simply never reaches that status, so `packed` remains editable/cancellable for it exactly like every other pre-`out_for_delivery` status.
 
-**Storefront catalogue bundles (native replacement for your interim BFF):**
+**New "Marked as Collected" email:**
 
-10. `GET /storefront/homepage-bundle` — public, returns `{categories, category_groups, store_settings, homepage_sections, catalogue_products, section_products}` in one response. `homepage_sections` is enabled-sections metadata only (no products nested); `section_products` is a separate list of `{section_id, products}` entries, **one per enabled section that has at least 4 matching products** — a section below that threshold is simply absent from `section_products` (it still appears in `homepage_sections`). `catalogue_products` is the first 100 active products, for your price-filter bounds.
-11. `GET /storefront/catalogue-bundle` — public, returns `{categories, products}` (same `catalogue_products` shape, first 100 active products).
-12. Both are cached (`Cache-Control: public, max-age=60, s-maxage=300`) and **not** wrapped in the usual `{success, message, data}` envelope — read the response body directly.
-13. Once you switch over, `buildHomepageBundle()`/`buildCatalogueBundle()` and their fan-out calls can be retired.
+6. When a Kampala store pickup order transitions into `delivered`, the customer now gets a distinct **"Your Order Has Been Collected"** email (pickup-worded — no mention of delivery/riders) instead of the door-to-door "Delivered" email. It still carries the same "Rate your experience" link as the Delivered email. A door-to-door delivery order's `delivered` transition still sends the original "Delivered" email, unchanged.
+
+**Order Placed vs. Order Confirmed (bug fix):**
+
+7. Checkout's own confirmation email no longer says "Order Confirmed" — it now says **"Order Placed"** (subject: "Your JN Electronics Order {order_number} Has Been Placed"), sent at the same point as before (right after checkout, before any staff review). This matches what actually happened: at that point the order is only `pending`.
+8. A **new, separate** "Your Order Is Confirmed" email now fires specifically when a staff member advances the order from `pending` to `confirmed` — this is the email that should have existed all along for the word "confirmed" to mean anything. Same `guest_email`-gated behavior as every other order-status email (a phone-only guest checkout gets nothing).
+9. No API shape changed for either of these — same `POST /orders` and `PATCH /orders/{id}/status` endpoints, same request/response bodies. This is purely which email gets sent and what it says.
+
+### API contract (unchanged endpoints, no new routes)
+
+| Method | Path | Change |
+| --- | --- | --- |
+| PATCH | `/orders/{id}/status` | Rejects `packed → out_for_delivery` with `409` for a Kampala store pickup order; allows `packed → delivered` directly for one |
+| GET | `/orders/{id}` | Now includes `fulfillment_method`, `location` |
+| GET | `/orders` (staff) | Same two fields on list items |
+
+### Verification checklist
+
+- [ ] Kampala store pickup order: `pending → confirmed → packed → delivered` succeeds
+- [ ] Kampala store pickup order: `packed → out_for_delivery` returns `409`
+- [ ] Kampala store pickup order's status history never contains `out_for_delivery`
+- [ ] Kampala store pickup order's `delivered` transition sends the "Collected" email, not "Delivered"
+- [ ] Delivery order (regression): `packed → out_for_delivery → delivered` still works; `packed → delivered` directly is still blocked
+- [ ] `fulfillment_method`/`location` populated correctly on both order shapes
+- [ ] Checkout email now reads "Order Placed", not "Order Confirmed"
+- [ ] A separate "Order Confirmed" email arrives only once staff actually advance the order to `confirmed`
 
 ### Deploy status
 
-**Pushed to `main` (`a612b12`).** Render auto-deploys on push — not yet manually confirmed live on the deployed URL.
+Pushed to `main`. Render auto-deploys on push — not yet manually confirmed live on the deployed URL.

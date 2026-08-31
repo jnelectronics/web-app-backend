@@ -1,6 +1,7 @@
 # Covers the two background jobs spec'd in docs/JN_API_Specification.md's
 # checkout sequence diagram (§4.2) that were never actually built until
-# now: send_order_confirmation_email (customer-facing) and
+# now: send_order_placed_email (customer-facing, renamed 2026-08-31 from
+# send_order_confirmation_email - see jobs.py for why) and
 # notify_staff_new_order (every active staff member). Both fire from
 # routers/orders.py's checkout - see jobs.py for what each actually sends.
 #

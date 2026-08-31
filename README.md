@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/images/logo-dark.png" alt="JN Electronics" width="280">
+  <img src="assets/images/email_logo.png" alt="JN Electronics" width="280">
 </p>
 
 <h1 align="center">JN Electronics — Backend API</h1>

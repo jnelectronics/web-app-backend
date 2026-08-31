@@ -15,9 +15,11 @@ from database import get_db
 from envelope import EnvelopeRoute
 from jobs import (
     notify_staff_new_order,
-    send_order_confirmation_email,
+    send_order_collected_email,
+    send_order_confirmed_email,
     send_order_delivered_email,
     send_order_out_for_delivery_email,
+    send_order_placed_email,
 )
 from models import (
     Cart,
@@ -85,6 +87,33 @@ VALID_STATUS_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
 STATUS_ADVANCE_ROLES = (StaffRole.SALES_ATTENDANT, StaffRole.OWNER)
 
 
+def _resolve_fulfillment(order: Order) -> tuple[str, str]:
+    # Purely DERIVED from which of the three delivery-selection ids (if
+    # any) is set - the same three-path logic checkout() already enforces
+    # (see its own big comment above). Not its own stored column: it's a
+    # deterministic function of data the order already has, so storing it
+    # too would just be one more place it could drift out of sync.
+    if order.regional_pickup_station_id is not None:
+        return "pickup", "outside_kampala"
+    if order.delivery_area_id is not None:
+        return "delivery", "kampala"
+    # All three ids None -> Kampala pickup from our own shop.
+    return "pickup", "kampala"
+
+
+def is_kampala_store_pickup(order: Order) -> bool:
+    # Client-requested 2026-08-31 (Nyson): a customer who chose "Pickup
+    # from Kampala store" at checkout skips the out_for_delivery step
+    # entirely - staff move straight from packed to delivered, shown to
+    # the customer as "Collected". Deliberately checks fulfillment_method
+    # AND location AND delivery_fee together, matching Nyson's own
+    # frontend detection helper exactly - never inferred from
+    # delivery_fee == 0 alone, since a legacy/edge-case delivery order
+    # could coincidentally also have a zero fee.
+    fulfillment_method, location = _resolve_fulfillment(order)
+    return fulfillment_method == "pickup" and location == "kampala" and order.delivery_fee == 0
+
+
 def _resolve_order_actor(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: Session = Depends(get_db),
@@ -149,6 +178,7 @@ def _find_short_items(db: Session, cart_items: list[CartItem]) -> list[dict]:
 
 def _build_order_read(order: Order, db: Session) -> OrderRead:
     items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+    fulfillment_method, location = _resolve_fulfillment(order)
     return OrderRead(
         id=order.id,
         order_number=order.order_number,
@@ -166,6 +196,8 @@ def _build_order_read(order: Order, db: Session) -> OrderRead:
         delivery_area_name=order.delivery_area_name,
         pickup_town=order.pickup_town,
         delivery_instructions=order.delivery_instructions,
+        fulfillment_method=fulfillment_method,
+        location=location,
         status=order.status,
         requires_prepayment=order.requires_prepayment,
         subtotal=order.subtotal,
@@ -286,7 +318,7 @@ def checkout(
     # have no order to justify.
     order_items = []
     # Plain dicts, built alongside order_items above - what
-    # send_order_confirmation_email actually gets handed (see jobs.py for
+    # send_order_placed_email actually gets handed (see jobs.py for
     # why: it runs after this request's DB session has closed, so it can
     # only safely receive plain values, not the OrderItem ORM objects
     # themselves).
@@ -394,7 +426,7 @@ def checkout(
     # checkout has nothing for this job to send to.
     if request.guest_email:
         background_tasks.add_task(
-            send_order_confirmation_email,
+            send_order_placed_email,
             request.guest_email,
             request.guest_full_name,
             new_order.order_number,
@@ -407,7 +439,7 @@ def checkout(
     # Every active staff member, regardless of role - queried NOW (this
     # request's db session is still open) rather than inside the job
     # itself, keeping notify_staff_new_order free of any DB dependency,
-    # same reasoning send_order_confirmation_email above takes plain
+    # same reasoning send_order_placed_email above takes plain
     # values instead of ORM objects.
     active_staff_emails = [
         email for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
@@ -618,7 +650,15 @@ def advance_order_status(
             "Cannot cancel an order through this endpoint - use PATCH /orders/{order_id}/cancel instead"
         )
 
-    if update.to_status not in VALID_STATUS_TRANSITIONS[order.status]:
+    # Kampala store pickup orders skip out_for_delivery entirely (Nyson,
+    # 2026-08-31) - packed jumps straight to delivered. Every other status
+    # (and every non-pickup order) still follows the plain lifecycle table.
+    if order.status == OrderStatus.PACKED and is_kampala_store_pickup(order):
+        allowed_next_statuses = {OrderStatus.DELIVERED}
+    else:
+        allowed_next_statuses = VALID_STATUS_TRANSITIONS[order.status]
+
+    if update.to_status not in allowed_next_statuses:
         raise InvalidStateTransitionError(
             f"Cannot transition order from '{order.status.value}' to '{update.to_status.value}'"
         )
@@ -652,7 +692,19 @@ def advance_order_status(
     # own confirmation email already uses (a phone-only guest checkout has
     # nothing for either job to send to).
     if order.guest_email:
-        if order.status == OrderStatus.OUT_FOR_DELIVERY:
+        # Order Placed (checkout) vs Order Confirmed (this transition) are
+        # now two genuinely separate emails - client-requested 2026-08-31,
+        # since customers were getting an "order confirmed" email at
+        # checkout while staff still saw it sitting in "pending", which
+        # read as a lie about what had actually happened.
+        if order.status == OrderStatus.CONFIRMED:
+            background_tasks.add_task(
+                send_order_confirmed_email,
+                order.guest_email,
+                order.guest_full_name,
+                order.order_number,
+            )
+        elif order.status == OrderStatus.OUT_FOR_DELIVERY:
             background_tasks.add_task(
                 send_order_out_for_delivery_email,
                 order.guest_email,
@@ -662,13 +714,25 @@ def advance_order_status(
             )
         elif order.status == OrderStatus.DELIVERED:
             rating_token = create_order_rating_token(str(order.id))
-            background_tasks.add_task(
-                send_order_delivered_email,
-                order.guest_email,
-                order.guest_full_name,
-                order.order_number,
-                rating_token,
-            )
+            # Kampala store pickup skipped out_for_delivery above, so its
+            # "delivered" is really a collection - a distinct email with
+            # pickup wording, not the door-to-door "Delivered" one.
+            if is_kampala_store_pickup(order):
+                background_tasks.add_task(
+                    send_order_collected_email,
+                    order.guest_email,
+                    order.guest_full_name,
+                    order.order_number,
+                    rating_token,
+                )
+            else:
+                background_tasks.add_task(
+                    send_order_delivered_email,
+                    order.guest_email,
+                    order.guest_full_name,
+                    order.order_number,
+                    rating_token,
+                )
 
     return _build_order_read(order, db)
 

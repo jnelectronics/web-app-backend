@@ -650,6 +650,15 @@ class OrderRead(BaseModel):
     delivery_area_name: str | None
     pickup_town: str | None
     delivery_instructions: str | None
+    # Derived, not stored columns (see routers/orders.py's
+    # _resolve_fulfillment) - Nyson's 2026-08-31 pickup-aware status spec
+    # needs the frontend to be able to tell a Kampala store pickup order
+    # apart from a delivery order without re-deriving the three-id logic
+    # itself. fulfillment_method is "pickup" for both Kampala store pickup
+    # AND outside-Kampala regional pickup - location is what tells those
+    # two apart.
+    fulfillment_method: Literal["pickup", "delivery"]
+    location: Literal["kampala", "outside_kampala"]
     status: OrderStatus
     requires_prepayment: bool
     subtotal: float

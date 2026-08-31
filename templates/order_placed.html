@@ -1,5 +1,5 @@
 <!--
-  Rendered by jobs.py's send_order_confirmation_email using Jinja2 - see
+  Rendered by jobs.py's send_order_placed_email using Jinja2 - see
   templates/password_reset.html's comment for how this rendering works and
   why every style below is inline (a rule that applies here too: never
   write a literal pair of curly braces as plain example text in this file).
@@ -20,11 +20,11 @@
       />
     </div>
 
-    <h1 style="color: #1a1a1a; font-size: 20px; margin: 0 0 16px 0; text-align: center;">Order Confirmed</h1>
+    <h1 style="color: #1a1a1a; font-size: 20px; margin: 0 0 16px 0; text-align: center;">Order Placed</h1>
 
     <p style="color: #444444; font-size: 15px; line-height: 1.5; margin: 0 0 24px 0;">
       Hi {{ full_name }}, thanks for your order! <strong>{{ order_number }}</strong> has been placed
-      and is now being processed.
+      and is now pending confirmation.
     </p>
 
     <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin-bottom: 16px;">
