@@ -1,0 +1,40 @@
+<!--
+  Shared partial, pulled into every order-lifecycle email template
+  (order_placed/order_confirmed/order_out_for_delivery/order_delivered/
+  order_collected.html) via Jinja2's include directive - see
+  templates/password_reset.html's comment for how this rendering works,
+  why every style below is inline, and why a literal pair of curly braces
+  (or a literal Jinja2 block tag) must never appear as plain example text
+  anywhere in this file.
+
+  Renders the SAME step-by-step "Order Progress" stepper the account's
+  own Order Progress UI shows (client-requested 2026-08-31, Joan via
+  Nyson) - a row of circles (checked once the order has reached that
+  step, grey otherwise) connected by lines, with each step's label
+  underneath. jobs.py's _order_progress_steps() builds the `steps` list
+  this expects: [{"label": "...", "completed": True/False}, ...], in
+  order.
+
+  Built as a <table> (not a flexbox <div> row) because email clients -
+  Outlook especially - render tables far more reliably than modern CSS
+  layout, the same "bulletproof email HTML" reasoning behind every other
+  table already used in these templates (see order_placed.html's items
+  table).
+-->
+<table width="100%" cellpadding="0" cellspacing="0" style="margin: 0 0 24px 0;">
+  <tr>
+    {% for step in steps %}
+    <td align="center" style="vertical-align: top;">
+      <div style="width: 26px; height: 26px; line-height: 26px; border-radius: 50%; margin: 0 auto; font-size: 13px; font-weight: bold; color: #ffffff; background-color: {{ '#f5821f' if step.completed else '#d9d9d9' }};">
+        {% if step.completed %}&#10003;{% endif %}
+      </div>
+      <div style="font-size: 10px; color: {{ '#f5821f' if step.completed else '#999999' }}; margin-top: 6px; white-space: nowrap;">{{ step.label }}</div>
+    </td>
+    {% if not loop.last %}
+    <td style="width: 24px; vertical-align: top;">
+      <div style="height: 2px; background-color: {{ '#f5821f' if step.completed else '#d9d9d9' }}; margin-top: 13px;"></div>
+    </td>
+    {% endif %}
+    {% endfor %}
+  </tr>
+</table>

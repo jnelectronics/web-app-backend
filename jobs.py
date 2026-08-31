@@ -101,6 +101,47 @@ def send_password_reset_email(email: str, reset_token: str, full_name: str | Non
     logger.info("Password reset email sent to %s", email)
 
 
+def _order_progress_steps(current_status: str, is_kampala_pickup: bool) -> list[dict]:
+    # Client-requested 2026-08-31 (Joan, via Nyson) - every order-lifecycle
+    # email should show the SAME step-by-step progress the account's
+    # "Order Progress" page shows, so a customer reading the email already
+    # knows where their order stands without having to log in. A Kampala
+    # store pickup order's pipeline has no Out for Delivery step and ends
+    # in "Collected" rather than "Delivered" - see
+    # routers/orders.py's is_kampala_store_pickup, which the caller here
+    # has already resolved into this one plain boolean (jobs.py never
+    # touches the Order ORM object itself - see the module docstring for
+    # why).
+    if is_kampala_pickup:
+        pipeline = [
+            ("pending", "Pending"),
+            ("confirmed", "Confirmed"),
+            ("packed", "Packed"),
+            ("delivered", "Collected"),
+        ]
+    else:
+        pipeline = [
+            ("pending", "Pending"),
+            ("confirmed", "Confirmed"),
+            ("packed", "Packed"),
+            ("out_for_delivery", "Out for Delivery"),
+            ("delivered", "Delivered"),
+        ]
+    statuses = [status for status, _ in pipeline]
+    current_index = statuses.index(current_status)
+    # A step is "completed" (checkmarked) once the order has REACHED it -
+    # including the current step itself, matching the account UI's own
+    # stepper (every step up to and including "Collected" shows a
+    # checkmark once the order's actually been collected).
+    return [{"label": label, "completed": index <= current_index} for index, (_, label) in enumerate(pipeline)]
+
+
+def _order_progress_text(steps: list[dict]) -> str:
+    # Plain-text equivalent of the same stepper, for the non-HTML part of
+    # the email - "[x]" for a reached step, "[ ]" for one still ahead.
+    return " -> ".join(f"[x] {step['label']}" if step["completed"] else f"[ ] {step['label']}" for step in steps)
+
+
 def send_order_placed_email(
     email: str,
     full_name: str,
@@ -109,6 +150,7 @@ def send_order_placed_email(
     subtotal: float,
     total: float,
     delivery_address: str,
+    is_kampala_pickup: bool,
 ) -> None:
     # Spec'd in docs/JN_API_Specification.md's checkout sequence diagram
     # (§4.2: "Enqueue send_order_confirmation_email") - only called by
@@ -132,6 +174,7 @@ def send_order_placed_email(
     # objects tied to that session - only plain Python values survive that
     # boundary safely.
     subject = f"Your JN Electronics Order {order_number} Has Been Placed"
+    steps = _order_progress_steps("pending", is_kampala_pickup)
 
     item_lines = "\n".join(
         f"- {item['name']}"
@@ -142,6 +185,7 @@ def send_order_placed_email(
     body = (
         f"Hi {full_name},\n\n"
         f"Thanks for your order! {order_number} has been placed and is now pending confirmation.\n\n"
+        f"Order progress: {_order_progress_text(steps)}\n\n"
         f"Items:\n{item_lines}\n\n"
         f"Subtotal: UGX {subtotal:,.2f}\n"
         f"Total: UGX {total:,.2f}\n\n"
@@ -160,6 +204,7 @@ def send_order_placed_email(
         subtotal=f"{subtotal:,.2f}",
         total=f"{total:,.2f}",
         delivery_address=delivery_address,
+        steps=steps,
     )
 
     if not email_client.is_configured():
@@ -175,7 +220,7 @@ def send_order_placed_email(
     logger.info("Order placed email sent to %s for order %s", email, order_number)
 
 
-def send_order_confirmed_email(email: str, full_name: str, order_number: str) -> None:
+def send_order_confirmed_email(email: str, full_name: str, order_number: str, is_kampala_pickup: bool) -> None:
     # NEW 2026-08-31 (client-requested fix, alongside the send_order_placed
     # rename above): fires from routers/orders.py's advance_order_status,
     # only on the specific pending -> confirmed transition - this is the
@@ -183,14 +228,17 @@ def send_order_confirmed_email(email: str, full_name: str, order_number: str) ->
     # and confirmed it", which send_order_placed_email (checkout time)
     # never claimed.
     subject = f"Your JN Electronics Order {order_number} Is Confirmed"
+    steps = _order_progress_steps("confirmed", is_kampala_pickup)
     body = (
         f"Hi {full_name},\n\n"
         f"Good news - your order {order_number} has been confirmed and is now being prepared.\n\n"
+        f"Order progress: {_order_progress_text(steps)}\n\n"
         "We'll notify you as your order's status changes."
     )
     html = _template_env.get_template("order_confirmed.html").render(
         full_name=full_name,
         order_number=order_number,
+        steps=steps,
     )
 
     if not email_client.is_configured():
@@ -424,10 +472,16 @@ def send_order_out_for_delivery_email(
     # address the customer gave at checkout - it needs no separate town/
     # zone lookup here, unlike Order.district which is the zone NAME, not
     # the full address.
+    # This transition only ever happens for a delivery order - a Kampala
+    # store pickup order skips out_for_delivery entirely (see
+    # routers/orders.py's advance_order_status), so is_kampala_pickup is
+    # always False here, not something the caller needs to pass in.
     subject = f"Your JN Electronics Order {order_number} Is Out for Delivery"
+    steps = _order_progress_steps("out_for_delivery", is_kampala_pickup=False)
     body = (
         f"Hi {full_name},\n\n"
         f"Your order {order_number} is out for delivery and should arrive soon.\n\n"
+        f"Order progress: {_order_progress_text(steps)}\n\n"
         f"Delivering to: {delivery_address}\n\n"
         "Thanks for shopping with JN Electronics."
     )
@@ -435,6 +489,7 @@ def send_order_out_for_delivery_email(
         full_name=full_name,
         order_number=order_number,
         delivery_address=delivery_address,
+        steps=steps,
     )
 
     if not email_client.is_configured():
@@ -464,11 +519,16 @@ def send_order_delivered_email(
     # by the caller (which has DB access to the order) - this function
     # itself never touches the database, same reasoning every other job
     # here takes plain values instead of ORM objects.
+    # Structurally always a delivery order - send_order_collected_email
+    # (below) is what fires instead for a Kampala store pickup order's
+    # delivered transition, so is_kampala_pickup is always False here.
     subject = f"Your JN Electronics Order {order_number} Has Been Delivered"
+    steps = _order_progress_steps("delivered", is_kampala_pickup=False)
     rating_url = f"{RATING_URL}?token={rating_token}"
     body = (
         f"Hi {full_name},\n\n"
         f"Your order {order_number} has been delivered. We hope you're happy with it!\n\n"
+        f"Order progress: {_order_progress_text(steps)}\n\n"
         f"Rate your experience: {rating_url}\n\n"
         "Thanks for shopping with JN Electronics."
     )
@@ -476,6 +536,7 @@ def send_order_delivered_email(
         full_name=full_name,
         order_number=order_number,
         rating_url=rating_url,
+        steps=steps,
     )
 
     if not email_client.is_configured():
@@ -508,11 +569,13 @@ def send_order_collected_email(
     # as send_order_delivered_email - the customer's experience is worth
     # rating either way.
     subject = f"Your JN Electronics Order {order_number} Has Been Collected"
+    steps = _order_progress_steps("delivered", is_kampala_pickup=True)
     rating_url = f"{RATING_URL}?token={rating_token}"
     body = (
         f"Hi {full_name},\n\n"
         f"Your order {order_number} has been collected from our Kampala store. "
         "We hope you're happy with it!\n\n"
+        f"Order progress: {_order_progress_text(steps)}\n\n"
         f"Rate your experience: {rating_url}\n\n"
         "Thanks for shopping with JN Electronics."
     )
@@ -520,6 +583,7 @@ def send_order_collected_email(
         full_name=full_name,
         order_number=order_number,
         rating_url=rating_url,
+        steps=steps,
     )
 
     if not email_client.is_configured():

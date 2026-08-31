@@ -27,6 +27,13 @@ All changes below are already pushed to `main` (Render auto-deploys on push).
 8. A **new, separate** "Your Order Is Confirmed" email now fires specifically when a staff member advances the order from `pending` to `confirmed` — this is the email that should have existed all along for the word "confirmed" to mean anything. Same `guest_email`-gated behavior as every other order-status email (a phone-only guest checkout gets nothing).
 9. No API shape changed for either of these — same `POST /orders` and `PATCH /orders/{id}/status` endpoints, same request/response bodies. This is purely which email gets sent and what it says.
 
+**Order progress in every email (Checklist Item No. 8, Joan):**
+
+10. Every order-lifecycle email (Order Placed, Order Confirmed, Out for Delivery, Delivered, Collected) now includes a step-by-step progress row — the same steps and checkmarks as the account's own "Order Progress" UI, so a customer reading the email already sees where their order stands without logging in.
+11. A Kampala store pickup order's emails show 4 steps ending in **Collected** (`Pending → Confirmed → Packed → Collected`); every other order's emails show the full 5 steps ending in **Delivered** (`Pending → Confirmed → Packed → Out for Delivery → Delivered`) — matching whichever pipeline that order is actually on.
+12. Each step shows as reached (checkmarked, filled) once the order has gotten that far by the time that specific email was sent, and not-yet-reached (grey, empty) otherwise — e.g. the Order Confirmed email shows Pending + Confirmed checked, Packed/Collected still grey.
+13. No API shape changed here either — this is purely a visual addition to the email HTML (plus a plain-text equivalent for non-HTML mail clients), nothing new to call.
+
 ### API contract (unchanged endpoints, no new routes)
 
 | Method | Path | Change |
@@ -45,6 +52,8 @@ All changes below are already pushed to `main` (Render auto-deploys on push).
 - [ ] `fulfillment_method`/`location` populated correctly on both order shapes
 - [ ] Checkout email now reads "Order Placed", not "Order Confirmed"
 - [ ] A separate "Order Confirmed" email arrives only once staff actually advance the order to `confirmed`
+- [ ] Every order-lifecycle email shows the progress stepper, with the right steps checked for that order's current status
+- [ ] A Kampala pickup order's emails show the 4-step (Collected) pipeline; every other order's emails show the 5-step (Delivered) pipeline
 
 ### Deploy status
 

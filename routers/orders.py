@@ -434,6 +434,7 @@ def checkout(
             subtotal,
             new_order.total,
             request.delivery_address,
+            is_kampala_store_pickup(new_order),
         )
 
     # Every active staff member, regardless of role - queried NOW (this
@@ -703,6 +704,7 @@ def advance_order_status(
                 order.guest_email,
                 order.guest_full_name,
                 order.order_number,
+                is_kampala_store_pickup(order),
             )
         elif order.status == OrderStatus.OUT_FOR_DELIVERY:
             background_tasks.add_task(
