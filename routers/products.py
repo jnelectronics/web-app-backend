@@ -322,12 +322,25 @@ def list_products(
         )
         query = query.filter(Product.id.in_(member_ids))
     if search:
-        # Matches name OR description, per the request - ILIKE is
-        # Postgres's case-insensitive LIKE, so "phone" matches "iPhone".
-        like_pattern = f"%{search}%"
-        query = query.filter(
-            or_(Product.name.ilike(like_pattern), Product.description.ilike(like_pattern))
-        )
+        # Word-by-word AND match, not one big substring - added 2026-09-10
+        # after a real customer-facing miss: searching the exact product
+        # name "oraimo Watch 5 (OSW-805, Berry Grey)" (skipping the word
+        # "Smartwatch" that's actually in the middle of the real name)
+        # returned zero results under the old single `ILIKE
+        # '%{search}%'` match, even though every individual word in the
+        # query does appear on that product. Splitting on whitespace and
+        # ANDing a separate ILIKE per word - each still matched against
+        # name OR description - means word order and gaps between words
+        # no longer matter, while still requiring every word the customer
+        # typed to show up somewhere. Doesn't handle typos or word
+        # variants (e.g. "watches" vs "watch") - that would need a real
+        # text-search approach (Postgres full-text search or pg_trgm),
+        # deliberately not taken on here.
+        for word in search.split():
+            like_pattern = f"%{word}%"
+            query = query.filter(
+                or_(Product.name.ilike(like_pattern), Product.description.ilike(like_pattern))
+            )
     if featured is not None:
         query = query.filter(Product.is_featured == featured)
     if new_arrival is not None:
