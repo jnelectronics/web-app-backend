@@ -38,9 +38,16 @@ router = APIRouter(prefix="/storefront", tags=["storefront"])
 # shared caches) before either has to revalidate with us again.
 BUNDLE_CACHE_CONTROL = "public, max-age=60, s-maxage=300"
 
-# Mirrors GET /products' own page-size idea when a bundle wants
-# "everything" in one page - large enough to cover a real catalogue
-# without turning this into a second pagination system of its own.
+# Homepage-only cap, as of 2026-09-10. This used to also gate
+# catalogue-bundle's full "All Products" page - a real bug, found while
+# investigating why several real, in-stock products with images were
+# unsearchable-by-browsing on the live site: with 259 active products,
+# a hard LIMIT 100 silently hid the other 159 from that page entirely.
+# The homepage's use of this list (catalogue_products, feeding its
+# price-filter bounds - see _catalogue_products() below) genuinely
+# doesn't need to be exhaustive, just "recent enough" - so it keeps this
+# cap. catalogue-bundle's own products list now calls
+# _all_active_catalogue_products() instead, with no limit at all.
 BUNDLE_PRODUCT_LIMIT = 100
 
 # A homepage section only earns a spot in section_products once it has at
@@ -78,11 +85,26 @@ def _store_settings_row(db: Session) -> StoreSettings:
 
 
 def _catalogue_products(db: Session) -> list[Product]:
+    # Homepage use only - see BUNDLE_PRODUCT_LIMIT's comment above. Do NOT
+    # reuse this for anything that needs the full catalogue.
     return (
         db.query(Product)
         .filter(Product.is_active == True)  # noqa: E712
         .order_by(Product.created_at.desc())
         .limit(BUNDLE_PRODUCT_LIMIT)
+        .all()
+    )
+
+
+def _all_active_catalogue_products(db: Session) -> list[Product]:
+    # The real "All Products" browse page - every active product, no cap.
+    # Same ordering as _catalogue_products() (newest first) purely for a
+    # consistent default browsing order, not because anything relies on
+    # only seeing recent ones here.
+    return (
+        db.query(Product)
+        .filter(Product.is_active == True)  # noqa: E712
+        .order_by(Product.created_at.desc())
         .all()
     )
 
@@ -126,6 +148,6 @@ def get_homepage_bundle(db: Session = Depends(get_db)):
 def get_catalogue_bundle(db: Session = Depends(get_db)):
     bundle = CatalogueBundleRead(
         categories=_active_categories(db),
-        products=[_build_product_read(p, db) for p in _catalogue_products(db)],
+        products=[_build_product_read(p, db) for p in _all_active_catalogue_products(db)],
     )
     return JSONResponse(content=jsonable_encoder(bundle), headers={"Cache-Control": BUNDLE_CACHE_CONTROL})
