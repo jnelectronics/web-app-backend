@@ -14,6 +14,7 @@ from models import (
     DeliveryArea,
     DeliveryDivision,
     Order,
+    OrderStatus,
     OrderStatusHistory,
     Product,
     ProductVariant,
@@ -76,6 +77,12 @@ def order_setup(db):
         delivery_area_name=area.name,
         subtotal=1000.0,
         total=1000.0 + area.fee,
+        # This fixture tests staff-driven status ADVANCEMENT, which starts
+        # only after payment - the AWAITING_PAYMENT gate itself is tested
+        # separately (test_payments.py). Built already-paid/placed so the
+        # existing pending->confirmed->...->delivered regression coverage
+        # stays meaningful.
+        status=OrderStatus.PENDING,
     )
     db.add(order)
     db.commit()
@@ -142,6 +149,7 @@ def pickup_order_setup(db):
         district="Kampala",
         subtotal=1000.0,
         total=1000.0,
+        status=OrderStatus.PENDING,  # already-paid/placed - see order_setup's comment above
     )
     db.add(order)
     db.commit()

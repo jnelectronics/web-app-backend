@@ -869,9 +869,14 @@ class PaymentProvider(str, enum.Enum):
     # stays a plain VARCHAR(50) (see that column's own comment: the set of
     # providers is expected to grow without needing a migration each
     # time), this just validates what a CLIENT is allowed to send.
+    #
+    # CASH_ON_DELIVERY removed 2026-09-16 - Norman's explicit instruction
+    # that every order must be paid via PesaPal before it's placed, with no
+    # pay-in-store/pay-on-collection path left at all. Old Payment rows
+    # with provider="cash_on_delivery" are untouched (this enum only
+    # validates NEW requests) - see CLAUDE.md for the full story.
     MOBILE_MONEY = "mobile_money"
     CARD = "card"
-    CASH_ON_DELIVERY = "cash_on_delivery"
 
 
 class PaymentInitiate(BaseModel):

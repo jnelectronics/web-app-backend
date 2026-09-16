@@ -47,7 +47,10 @@ def read_dashboard_summary(
     current_staff: StaffUser = Depends(require_staff_role(*VIEW_SUMMARY_ROLES)),
     db: Session = Depends(get_db),
 ):
-    total_orders = db.query(Order).count()
+    # AWAITING_PAYMENT orders excluded here (2026-09-16, "must be paid
+    # before it's placed") - an abandoned/failed PesaPal checkout isn't a
+    # real order yet, so it shouldn't inflate what staff see as "orders".
+    total_orders = db.query(Order).filter(Order.status != OrderStatus.AWAITING_PAYMENT).count()
     pending_orders = db.query(Order).filter(Order.status == OrderStatus.PENDING).count()
     total_customers = db.query(Customer).count()
 
@@ -75,7 +78,15 @@ def read_recent_orders(
     _current_staff: StaffUser = Depends(require_staff_role(*VIEW_SUMMARY_ROLES)),
     db: Session = Depends(get_db),
 ):
-    orders = db.query(Order).order_by(Order.created_at.desc()).limit(limit).all()
+    # Same AWAITING_PAYMENT exclusion as read_dashboard_summary above - an
+    # unpaid, abandoned checkout has nothing for staff to act on yet.
+    orders = (
+        db.query(Order)
+        .filter(Order.status != OrderStatus.AWAITING_PAYMENT)
+        .order_by(Order.created_at.desc())
+        .limit(limit)
+        .all()
+    )
     return [_build_order_read(o, db) for o in orders]
 
 
@@ -98,7 +109,11 @@ def read_sales_summary(
     _current_staff: StaffUser = Depends(require_staff_role(*VIEW_SUMMARY_ROLES)),
     db: Session = Depends(get_db),
 ):
-    total_orders = db.query(Order).filter(Order.status != OrderStatus.CANCELLED).count()
+    total_orders = (
+        db.query(Order)
+        .filter(Order.status != OrderStatus.CANCELLED, Order.status != OrderStatus.AWAITING_PAYMENT)
+        .count()
+    )
     total_revenue = _total_revenue(db)
     average_order_value = total_revenue / total_orders if total_orders > 0 else 0.0
 

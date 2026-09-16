@@ -1,9 +1,14 @@
 # Covers the two background jobs spec'd in docs/JN_API_Specification.md's
-# checkout sequence diagram (§4.2) that were never actually built until
-# now: send_order_placed_email (customer-facing, renamed 2026-08-31 from
-# send_order_confirmation_email - see jobs.py for why) and
-# notify_staff_new_order (every active staff member). Both fire from
-# routers/orders.py's checkout - see jobs.py for what each actually sends.
+# checkout sequence diagram (§4.2): send_order_placed_email (customer-
+# facing) and notify_staff_new_order (every active staff member).
+#
+# NEITHER fires from checkout anymore (2026-09-16, "must be paid before
+# it's placed") - checkout() only creates an order in awaiting_payment;
+# both jobs now fire from routers/payments.py's _apply_pesapal_outcome,
+# the moment PesaPal actually confirms payment. So most tests here drive a
+# real checkout THROUGH a mocked-but-confirmed PesaPal payment (via
+# conftest.py's mock_pesapal fixture and pay_order helper) before checking
+# for an email at all - see jobs.py for what each actually sends.
 #
 # email_client's real Resend call is mocked here (mock_email, defined in
 # conftest.py) - same idea as every other suite that triggers a real email
@@ -14,7 +19,7 @@ import uuid
 
 import pytest
 
-from conftest import uncategorized_group_id, unwrap
+from conftest import pay_order, uncategorized_group_id, unwrap
 from models import (
     Cart,
     CartItem,
@@ -24,6 +29,8 @@ from models import (
     InventoryRecord,
     Order,
     OrderItem,
+    OrderStatus,
+    Payment,
     Product,
     ProductVariant,
     StaffRole,
@@ -71,6 +78,10 @@ def checkout_setup(db):
     # point at.
     order_ids = [o.id for o in db.query(Order).filter(Order.customer_id == customer.id).all()]
     if order_ids:
+        # Payment rows exist now too - tests here drive a real payment via
+        # conftest.py's pay_order helper (2026-09-16), not just checkout.
+        db.query(Payment).filter(Payment.order_id.in_(order_ids)).delete(synchronize_session=False)
+        db.commit()
         db.query(InventoryMovement).filter(InventoryMovement.order_id.in_(order_ids)).delete(synchronize_session=False)
         db.commit()
         db.query(OrderItem).filter(OrderItem.order_id.in_(order_ids)).delete(synchronize_session=False)
@@ -161,7 +172,45 @@ def test_checkout_409_reports_which_items_are_short(client, checkout_setup, acti
     ]
 
 
-def test_checkout_sends_order_confirmation_when_email_given(client, checkout_setup, active_staff, mock_email):
+def test_checkout_alone_sends_no_email_and_order_stays_awaiting_payment(
+    client, db, checkout_setup, active_staff, mock_email
+):
+    # THE core regression test for this file, added 2026-09-16 alongside
+    # "must be paid before it's placed": checkout on its own - no payment
+    # attempted at all - must not email anyone or place a real order. This
+    # is the exact bug Norman found in real UAT testing: abandoning
+    # PesaPal's page used to still leave a placed order + a sent "Order
+    # Placed" email behind, because that email used to fire right here, at
+    # checkout, before payment had even been attempted.
+    _add_to_cart(client, checkout_setup["token"], checkout_setup["variant"].id)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "guest_full_name": "Notify Test Customer",
+            "guest_phone_number": "+256700000005",
+            "guest_email": "customer-inbox@example.com",
+            "delivery_address": "1 Test Way, Kampala",
+            "district": "Test District",
+        },
+        headers=_auth(checkout_setup["token"]),
+    )
+    assert response.status_code == 200
+    order = unwrap(response)
+    assert order["status"] == "awaiting_payment"
+
+    assert mock_email == []
+
+    db_order = db.get(Order, uuid.UUID(order["id"]))
+    assert db_order.status == OrderStatus.AWAITING_PAYMENT
+    # Stock untouched either - see routers/orders.py's checkout comment.
+    inventory = db.query(InventoryRecord).filter(InventoryRecord.variant_id == checkout_setup["variant"].id).first()
+    assert inventory.quantity_available == 10
+
+
+def test_checkout_sends_order_confirmation_when_email_given(
+    client, checkout_setup, active_staff, mock_email, mock_pesapal
+):
     _add_to_cart(client, checkout_setup["token"], checkout_setup["variant"].id)
 
     response = client.post(
@@ -178,6 +227,10 @@ def test_checkout_sends_order_confirmation_when_email_given(client, checkout_set
     assert response.status_code == 200
     order = unwrap(response)
 
+    # Nothing sent yet - only once payment is confirmed does this fire.
+    assert mock_email == []
+    pay_order(client, order["id"], mock_pesapal, headers=_auth(checkout_setup["token"]))
+
     confirmation = next((e for e in mock_email if e["to_email"] == "customer-inbox@example.com"), None)
     assert confirmation is not None
     assert order["order_number"] in confirmation["subject"]
@@ -185,7 +238,9 @@ def test_checkout_sends_order_confirmation_when_email_given(client, checkout_set
     assert order["order_number"] in confirmation["html"]
 
 
-def test_checkout_skips_confirmation_when_no_email_given(client, checkout_setup, active_staff, mock_email):
+def test_checkout_skips_confirmation_when_no_email_given(
+    client, checkout_setup, active_staff, mock_email, mock_pesapal
+):
     _add_to_cart(client, checkout_setup["token"], checkout_setup["variant"].id)
 
     response = client.post(
@@ -199,13 +254,18 @@ def test_checkout_skips_confirmation_when_no_email_given(client, checkout_setup,
         headers=_auth(checkout_setup["token"]),
     )
     assert response.status_code == 200
+    order = unwrap(response)
+    pay_order(client, order["id"], mock_pesapal, headers=_auth(checkout_setup["token"]))
 
     # No guest_email given - nothing addressed to a customer inbox, only
     # the staff notification (active_staff's address) should be present.
     assert not any(e["subject"].startswith("Your JN Electronics Order") for e in mock_email)
+    assert any(e["to_email"] == active_staff.email for e in mock_email)
 
 
-def test_checkout_notifies_only_active_staff(client, checkout_setup, active_staff, inactive_staff, mock_email):
+def test_checkout_notifies_only_active_staff(
+    client, checkout_setup, active_staff, inactive_staff, mock_email, mock_pesapal
+):
     _add_to_cart(client, checkout_setup["token"], checkout_setup["variant"].id)
 
     response = client.post(
@@ -220,6 +280,7 @@ def test_checkout_notifies_only_active_staff(client, checkout_setup, active_staf
     )
     assert response.status_code == 200
     order = unwrap(response)
+    pay_order(client, order["id"], mock_pesapal, headers=_auth(checkout_setup["token"]))
 
     notified_emails = {e["to_email"] for e in mock_email if e["subject"] == f"New Order {order['order_number']} Placed"}
     assert active_staff.email in notified_emails

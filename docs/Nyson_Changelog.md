@@ -2,59 +2,59 @@
 
 All changes below are already pushed to `main` (Render auto-deploys on push).
 
-## Pickup-aware order status lifecycle + Order Placed/Order Confirmed emails (2026-08-31)
+## Must be paid before it's placed — every order now requires a confirmed PesaPal payment (2026-09-16)
+
+Norman (the client) ran real UAT testing and found a genuine bug: starting checkout, proceeding to PesaPal's page, and abandoning it without entering any payment details still left a placed order behind, and the customer still got an "Order Placed" email. That's fixed by changing WHEN an order actually counts as placed - this is the biggest contract change in this batch, please read carefully.
 
 ### What you need to do
 
-**Skip `out_for_delivery` for Kampala store pickup:**
+**1. `POST /orders` (checkout) no longer returns a placed order - it returns an unpaid one, waiting for payment.**
 
-1. A Kampala store pickup order (`fulfillment_method = "pickup"`, `location = "kampala"`, `delivery_fee = 0` — all three together, exactly your spec) now skips `out_for_delivery` entirely. `PATCH /orders/{id}/status`:
-   - `packed` → `out_for_delivery` on a Kampala pickup order is rejected with `409` (`error_code: "INVALID_STATE_TRANSITION"`).
-   - `packed` → `delivered` on a Kampala pickup order succeeds directly.
-   - Every other transition, and every non-pickup order, is unchanged (delivery orders still require the full `pending → confirmed → packed → out_for_delivery → delivered` pipeline; `packed → delivered` directly is still rejected for them).
-2. Outside-Kampala regional pickup is **unchanged for now** — it still goes through the full five-step pipeline, per your note that this wasn't confirmed otherwise yet.
-3. `fulfillment_method` (`"pickup" | "delivery"`) and `location` (`"kampala" | "outside_kampala"`) are now present on `GET /orders/{id}` and every staff list response, exactly as you asked — derived server-side from the order's delivery-selection fields, not stored separately, so they can never disagree with them.
-4. No new `OrderStatus` value was added — `delivered` is still the one terminal status for both pickup and delivery orders, as you specified. Use `fulfillment_method`/`location` (and which status-lifecycle email arrived — see below) to decide whether to render "Delivered" or "Collected" copy.
-5. Customer edit/cancel eligibility needed no backend change — it already blocks at `out_for_delivery` and later, and a Kampala pickup order simply never reaches that status, so `packed` remains editable/cancellable for it exactly like every other pre-`out_for_delivery` status.
+- The response's `status` field is now `"awaiting_payment"`, not `"pending"`. Nothing has been decremented, emailed, or shown to staff yet - this order does not really exist yet from the business's point of view.
+- Your checkout flow must immediately follow this call with `POST /orders/{id}/payments` (unchanged endpoint/shape) and send the customer to the `redirect_url` PesaPal hands back, exactly like today - the only difference is there is no "come back later and pay" option anymore. **There is no flow where a customer can leave an order unpaid and finish paying some other way** - cash-on-delivery/pay-in-store is gone entirely (see below).
+- If the customer abandons/fails the PesaPal page, the order simply stays `awaiting_payment` forever - no email was sent, nothing was decremented, staff never saw it. If your UI shows an "order confirmation" screen right after checkout, it should now wait for payment to actually resolve (poll `GET /payments/{id}` the same way you already do) before treating the order as real - don't treat the `POST /orders` response alone as "done."
 
-**New "Marked as Collected" email:**
+**2. The order only becomes real - `status: "pending"` - once PesaPal confirms payment.**
 
-6. When a Kampala store pickup order transitions into `delivered`, the customer now gets a distinct **"Your Order Has Been Collected"** email (pickup-worded — no mention of delivery/riders) instead of the door-to-door "Delivered" email. It still carries the same "Rate your experience" link as the Delivered email. A door-to-door delivery order's `delivered` transition still sends the original "Delivered" email, unchanged.
+- This is now the actual moment: `GET /payments/{id}` (your existing polling endpoint) resolves to `status: "paid"`, and in that same moment the order flips from `awaiting_payment` to `pending`. Fetch the order again (`GET /orders/{id}`) after a payment resolves to `paid` if you need its up-to-date status.
+- Everything downstream is unchanged from here: staff still separately confirm `pending -> confirmed`, then `packed -> ... -> delivered`, exactly as before.
 
-**Order Placed vs. Order Confirmed (bug fix):**
+**3. Cash-on-delivery / pay-in-store is removed entirely.**
 
-7. Checkout's own confirmation email no longer says "Order Confirmed" — it now says **"Order Placed"** (subject: "Your JN Electronics Order {order_number} Has Been Placed"), sent at the same point as before (right after checkout, before any staff review). This matches what actually happened: at that point the order is only `pending`.
-8. A **new, separate** "Your Order Is Confirmed" email now fires specifically when a staff member advances the order from `pending` to `confirmed` — this is the email that should have existed all along for the word "confirmed" to mean anything. Same `guest_email`-gated behavior as every other order-status email (a phone-only guest checkout gets nothing).
-9. No API shape changed for either of these — same `POST /orders` and `PATCH /orders/{id}/status` endpoints, same request/response bodies. This is purely which email gets sent and what it says.
+- `POST /orders/{id}/payments`'s `provider` field no longer accepts `"cash_on_delivery"` at all - only `"mobile_money"` and `"card"` are valid now. Sending `cash_on_delivery` gets a `422`.
+- Remove any "pay in store" / "pay on delivery" option from checkout, for every fulfillment method (delivery, Kampala pickup, or outside-Kampala regional pickup) - Norman's own words: "All orders being paid for via MM or Bank in Pesapal regardless of picking from the store, within or outside kampala."
+- `PATCH /payments/{payment_id}/mark-paid` (the staff cash-collection endpoint) no longer exists - `404` if called.
 
-**Order progress in every email (Checklist Item No. 8, Joan):**
+**4. Staff never see an unpaid order, and can't act on one even if they somehow got its id.**
 
-10. Every order-lifecycle email (Order Placed, Order Confirmed, Out for Delivery, Delivered, Collected) now includes a step-by-step progress row — the same steps and checkmarks as the account's own "Order Progress" UI, so a customer reading the email already sees where their order stands without logging in.
-11. A Kampala store pickup order's emails show 4 steps ending in **Collected** (`Pending → Confirmed → Packed → Collected`); every other order's emails show the full 5 steps ending in **Delivered** (`Pending → Confirmed → Packed → Out for Delivery → Delivered`) — matching whichever pipeline that order is actually on.
-12. Each step shows as reached (checkmarked, filled) once the order has gotten that far by the time that specific email was sent, and not-yet-reached (grey, empty) otherwise — e.g. the Order Confirmed email shows Pending + Confirmed checked, Packed/Collected still grey.
-13. No API shape changed here either — this is purely a visual addition to the email HTML (plus a plain-text equivalent for non-HTML mail clients), nothing new to call.
+- `GET /orders/staff` (the default, unfiltered view) no longer includes `awaiting_payment` orders - only real, placed orders show up. (Still reachable with an explicit `?order_status=awaiting_payment` filter, if you ever need a "stuck checkouts" support view.)
+- `PATCH /orders/{id}/status` has no valid transition out of `awaiting_payment` at all - attempting one gets a `409`, same error shape as any other invalid transition.
+- The Admin Dashboard's order counts/recent-orders/sales-summary all exclude `awaiting_payment` orders too.
 
-### API contract (unchanged endpoints, no new routes)
+**5. The "New Order" admin email now shows the same items/qty/subtotal/total breakdown the customer email already had** (Norman's second ask) - purely a content change, not a contract change, nothing to build for this.
+
+**6. The email logo changed** (Norman's third, lowest-priority ask) - purely visual, nothing for the frontend to do.
+
+### API contract (what actually changed)
 
 | Method | Path | Change |
 | --- | --- | --- |
-| PATCH | `/orders/{id}/status` | Rejects `packed → out_for_delivery` with `409` for a Kampala store pickup order; allows `packed → delivered` directly for one |
-| GET | `/orders/{id}` | Now includes `fulfillment_method`, `location` |
-| GET | `/orders` (staff) | Same two fields on list items |
+| POST | `/orders` | Now returns the order with `status: "awaiting_payment"`, not `"pending"`. No email sent yet, no stock reserved. |
+| POST | `/orders/{id}/payments` | `provider` no longer accepts `"cash_on_delivery"` (`422` if sent) |
+| PATCH | `/payments/{payment_id}/mark-paid` | **Removed** - `404` |
+| GET | `/orders/staff` | Excludes `awaiting_payment` orders by default (opt in via `?order_status=awaiting_payment`) |
+| PATCH | `/orders/{id}/status` | `409` on any attempted transition out of `awaiting_payment` |
 
 ### Verification checklist
 
-- [ ] Kampala store pickup order: `pending → confirmed → packed → delivered` succeeds
-- [ ] Kampala store pickup order: `packed → out_for_delivery` returns `409`
-- [ ] Kampala store pickup order's status history never contains `out_for_delivery`
-- [ ] Kampala store pickup order's `delivered` transition sends the "Collected" email, not "Delivered"
-- [ ] Delivery order (regression): `packed → out_for_delivery → delivered` still works; `packed → delivered` directly is still blocked
-- [ ] `fulfillment_method`/`location` populated correctly on both order shapes
-- [ ] Checkout email now reads "Order Placed", not "Order Confirmed"
-- [ ] A separate "Order Confirmed" email arrives only once staff actually advance the order to `confirmed`
-- [ ] Every order-lifecycle email shows the progress stepper, with the right steps checked for that order's current status
-- [ ] A Kampala pickup order's emails show the 4-step (Collected) pipeline; every other order's emails show the 5-step (Delivered) pipeline
+- [ ] Checkout (`POST /orders`) returns `status: "awaiting_payment"`
+- [ ] Abandoning/failing PesaPal's page leaves the order `awaiting_payment` forever - no email sent, nothing shown to staff
+- [ ] A confirmed PesaPal payment flips the order to `status: "pending"` and NOW sends the "Order Placed" email + notifies staff
+- [ ] `provider: "cash_on_delivery"` on `POST /orders/{id}/payments` returns `422`
+- [ ] `PATCH /payments/{id}/mark-paid` returns `404`
+- [ ] Staff's default order list never shows an unpaid/abandoned checkout
+- [ ] The admin "New Order" email shows items/qty/subtotal/total, same as the customer email
 
 ### Deploy status
 
-Pushed to `main`. Render auto-deploys on push — not yet manually confirmed live on the deployed URL.
+Pushed to `main`. Render auto-deploys on push - not yet manually confirmed live on the deployed URL.

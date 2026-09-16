@@ -66,3 +66,67 @@ def mock_email(monkeypatch):
     monkeypatch.setattr("email_client.is_configured", lambda: True)
     monkeypatch.setattr("email_client.send_email", fake_send_email)
     return sent
+
+
+@pytest.fixture
+def mock_pesapal(monkeypatch):
+    # Shared (moved here from test_payments.py 2026-09-16) - now that every
+    # order must be paid before it's placed, more than one test file needs
+    # to drive a real checkout through to a confirmed PesaPal payment, not
+    # just test_payments.py itself.
+    #
+    # Patched where it's USED (routers.payments), not where it's defined
+    # (pesapal_client) - routers/payments.py already imported these names
+    # directly, so patching pesapal_client itself wouldn't affect the
+    # reference routers/payments.py is holding.
+    #
+    # status_responses lets each test control what "PesaPal" reports back
+    # for a given order_tracking_id before hitting the webhook - defaults
+    # to FAILED for anything a test didn't explicitly set.
+    status_responses = {}
+
+    def fake_submit_order_request(merchant_reference, amount, currency, description, billing_email, billing_phone, billing_first_name, billing_last_name, callback_url=None):
+        return {
+            "order_tracking_id": f"PESAPAL-{merchant_reference}",
+            "redirect_url": f"https://cybqa.pesapal.com/pesapalv3/mock-checkout/{merchant_reference}",
+        }
+
+    def fake_get_transaction_status(order_tracking_id):
+        return status_responses.get(order_tracking_id, {"payment_status_description": "FAILED"})
+
+    # Also patched - there are no real PesaPal credentials in this dev/test
+    # environment, so without this every test using this fixture would hit
+    # PaymentsUnavailableError before ever reaching the fakes above.
+    monkeypatch.setattr("routers.payments.is_configured", lambda: True)
+    monkeypatch.setattr("routers.payments.submit_order_request", fake_submit_order_request)
+    monkeypatch.setattr("routers.payments.get_transaction_status", fake_get_transaction_status)
+
+    return status_responses
+
+
+def pay_order(client, order_id, mock_pesapal, headers=None):
+    # Drives a real order through to a CONFIRMED PesaPal payment, the same
+    # two real calls a paying customer's frontend makes (POST .../payments,
+    # then PesaPal's own webhook hitting us back) - added 2026-09-16
+    # alongside "must be paid before it's placed": checkout() alone no
+    # longer produces a placed order, so any test that needs one now has to
+    # actually pay for it, not just check it out. headers=None means a
+    # guest order - the caller is expected to have already put the right
+    # X-Guest-Token in headers itself if so.
+    response = client.post(
+        f"/api/v1/orders/{order_id}/payments",
+        json={"provider": "mobile_money"},
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text
+    payment = unwrap(response)
+
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Completed"}
+    response = client.get(
+        "/api/v1/payments/webhook",
+        params={"OrderTrackingId": payment["provider_reference"], "OrderMerchantReference": payment["id"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == 200
+
+    return payment

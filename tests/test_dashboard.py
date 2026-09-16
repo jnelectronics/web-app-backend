@@ -10,7 +10,7 @@ import uuid
 import pytest
 
 from conftest import unwrap
-from models import StaffRole, StaffUser
+from models import Order, StaffRole, StaffUser
 from security import create_access_token, hash_password
 
 
@@ -63,6 +63,37 @@ def test_recent_orders_rejects_sales_attendant(client, staff_tokens):
         "/api/v1/admin/dashboard/recent-orders", headers=_auth(staff_tokens[StaffRole.OWNER])
     )
     assert response.status_code == 200
+
+
+def test_recent_orders_excludes_unpaid_orders(client, db, staff_tokens):
+    # 2026-09-16: an order still sitting in awaiting_payment (an abandoned/
+    # failed PesaPal checkout) isn't a real, placed order yet - it must not
+    # show up on the recent-orders widget at all. A high limit (this
+    # endpoint's default recent-orders feed on the shared dev DB can be
+    # large) keeps this from being a flaky "is it on the first page" check.
+    order = Order(
+        order_number=f"JN-DASH-{uuid.uuid4().hex[:8]}",
+        guest_full_name="Unpaid Dashboard Buyer",
+        guest_phone_number="+256700000098",
+        delivery_address="Test Address",
+        district="Test District",
+        subtotal=1000.0,
+        total=1000.0,
+    )
+    db.add(order)
+    db.commit()
+
+    try:
+        response = client.get(
+            "/api/v1/admin/dashboard/recent-orders?limit=1000",
+            headers=_auth(staff_tokens[StaffRole.OWNER]),
+        )
+        assert response.status_code == 200
+        order_ids = {o["id"] for o in unwrap(response)}
+        assert str(order.id) not in order_ids
+    finally:
+        db.query(Order).filter(Order.id == order.id).delete()
+        db.commit()
 
 
 def test_low_inventory_and_sales_summary_reject_sales_attendant(client, staff_tokens):

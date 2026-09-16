@@ -232,7 +232,7 @@ def promo_cart_setup(db):
     db.commit()
 
 
-def test_discount_actually_reduces_cart_order_and_payment_totals(client, db, promo_cart_setup):
+def test_discount_actually_reduces_cart_order_and_payment_totals(client, db, promo_cart_setup, mock_pesapal):
     variant = promo_cart_setup
     guest_token = f"guest-{uuid.uuid4().hex}"
     headers = {"X-Guest-Token": guest_token}
@@ -275,10 +275,11 @@ def test_discount_actually_reduces_cart_order_and_payment_totals(client, db, pro
     # whatever amount a client might (still, harmlessly) send - the
     # request below deliberately sends no `amount` field at all, since
     # PaymentInitiate no longer accepts one (see that schema's own
-    # comment).
+    # comment). mobile_money, not cash_on_delivery (removed 2026-09-16) -
+    # every order now pays through PesaPal.
     payment_response = client.post(
         f"/api/v1/orders/{order_id}/payments",
-        json={"provider": "cash_on_delivery"},
+        json={"provider": "mobile_money"},
         headers=headers,
     )
     assert payment_response.status_code == 201

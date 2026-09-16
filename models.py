@@ -494,6 +494,19 @@ class CartItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class OrderStatus(str, enum.Enum):
+    # New 2026-09-16, client-requested (Norman): every order must be PAID
+    # before it counts as "placed" at all - checkout() now creates the
+    # Order row in THIS status (no stock decrement, no emails, invisible to
+    # staff), and only PesaPal actually confirming payment (see
+    # routers/payments.py's _apply_pesapal_outcome) moves it to PENDING -
+    # the real "placed" moment. A payment that fails or is abandoned just
+    # leaves the order stuck here forever, harmlessly (no stock was ever
+    # reserved for it). This replaces the old world where checkout alone
+    # made an order PENDING (and emailed/decremented stock) before payment
+    # had even been attempted - see CLAUDE.md's dated bullet for the full
+    # story of the bug that caused (a "placed" email for a payment that
+    # went on to fail).
+    AWAITING_PAYMENT = "awaiting_payment"
     PENDING = "pending"
     CONFIRMED = "confirmed"
     PACKED = "packed"
@@ -636,7 +649,11 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
-        default=OrderStatus.PENDING,
+        # AWAITING_PAYMENT, not PENDING - every order starts unpaid now (see
+        # OrderStatus's own comment). checkout() also sets this explicitly
+        # for clarity, but the default matters too: it's what a fresh
+        # Order() would get if this column were ever left unset.
+        default=OrderStatus.AWAITING_PAYMENT,
     )
 
     # Whether this order must be paid online before staff will process it -
@@ -741,9 +758,13 @@ class Payment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orders.id"))
 
-    # e.g. "mobile_money", "card", "cash_on_delivery" - a plain string, not
-    # a Postgres enum, since the docs list it as VARCHAR(50) (the set of
-    # providers is expected to grow without needing a migration each time).
+    # e.g. "mobile_money", "card" - a plain string, not a Postgres enum,
+    # since the docs list it as VARCHAR(50) (the set of providers is
+    # expected to grow without needing a migration each time). Old rows
+    # with provider="cash_on_delivery" can still exist (that value was
+    # removed from schemas.py's PaymentProvider 2026-09-16, but this
+    # column itself was never restricted to it) - this comment's example
+    # values are just what NEW rows use now.
     provider: Mapped[str] = mapped_column(String(50))
 
     status: Mapped[PaymentStatus] = mapped_column(

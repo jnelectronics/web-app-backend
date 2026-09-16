@@ -21,11 +21,23 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from envelope import EnvelopeRoute
-from jobs import notify_staff_payment_received, send_payment_confirmed_email
-from models import Customer, Order, OrderStatus, Payment, PaymentStatus, StaffRole, StaffUser
+from jobs import notify_staff_new_order, send_order_placed_email
+from models import (
+    Customer,
+    InventoryMovement,
+    InventoryRecord,
+    MovementType,
+    Order,
+    OrderItem,
+    OrderStatus,
+    Payment,
+    PaymentStatus,
+    StaffUser,
+)
 from pesapal_client import PesaPalError, get_transaction_status, is_configured, submit_order_request
+from routers.orders import is_kampala_store_pickup
 from schemas import PaymentInitiate, PaymentProvider, PaymentRead
-from security import decode_token_claims, require_staff_role
+from security import decode_token_claims
 
 router = APIRouter(tags=["payments"], route_class=EnvelopeRoute)
 
@@ -251,31 +263,6 @@ def initiate_payment(
             "Please wait a few minutes, or check its status, before trying again."
         )
 
-    # Not in the original spec (added 2026-08-06) - cash/pay-on-collection
-    # never touches PesaPal at all: no redirect, no gateway session, just a
-    # record that stock/fulfillment can proceed against, waiting for staff
-    # to confirm the cash was actually collected (see mark_cash_payment_paid
-    # below). PaymentStatus.PENDING is exactly this - "recorded, not yet
-    # resolved, no gateway involved" - already in the enum, just never
-    # actually reachable through any code path before this one.
-    if request.provider == PaymentProvider.CASH_ON_DELIVERY:
-        new_payment = Payment(
-            order_id=order.id,
-            provider=request.provider.value,
-            # order.total, not a client-supplied amount (removed 2026-08-22
-            # - see PaymentInitiate's own comment) - already reflects any
-            # active discount, since routers/orders.py's checkout computes
-            # it from each item's discounted price.
-            amount=order.total,
-            status=PaymentStatus.PENDING,
-            initiated_at=datetime.now(timezone.utc),
-        )
-        db.add(new_payment)
-        db.commit()
-        db.refresh(new_payment)
-        logger.info("Cash-on-delivery payment %s recorded for order %s", new_payment.id, order.id)
-        return new_payment
-
     if not is_configured():
         raise PaymentsUnavailableError("Payment services will be available soon. Please check back later.")
 
@@ -399,74 +386,13 @@ def read_payment(
     return payment
 
 
-# Used to match routers/orders.py's STATUS_ADVANCE_ROLES (whoever's handling
-# the order at collection/delivery time confirms cash changed hands too) -
-# but the client explicitly asked, during UAT on 2026-08-30, to remove
-# Sales Attendant's access to Payments entirely, so this is now narrower
-# than order-status advancement on purpose. System Administrator still
-# passes regardless, as always (security.py's require_staff_role superset).
-MARK_CASH_PAID_ROLES = (StaffRole.OWNER,)
-
-
-@router.patch("/payments/{payment_id}/mark-paid", response_model=PaymentRead)
-def mark_cash_payment_paid(
-    payment_id: uuid.UUID,
-    background_tasks: BackgroundTasks,
-    _current_staff: StaffUser = Depends(require_staff_role(*MARK_CASH_PAID_ROLES)),
-    db: Session = Depends(get_db),
-):
-    # Not in the original spec - the staff-side half of cash-on-delivery
-    # (see initiate_payment above): there's no gateway webhook for cash, so
-    # a human has to be the one confirming it was actually collected.
-    payment = db.get(Payment, payment_id)
-    if payment is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
-
-    if payment.provider != PaymentProvider.CASH_ON_DELIVERY.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only cash-on-delivery payments can be marked paid this way",
-        )
-    if payment.status != PaymentStatus.PENDING:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Payment is not awaiting cash collection (status: {payment.status.value})",
-        )
-
-    payment.status = PaymentStatus.PAID
-    payment.completed_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(payment)
-
-    order = db.get(Order, payment.order_id)
-    if order.guest_email:
-        # Same job the PesaPal webhook fires on a successful online
-        # payment - the customer gets the same confirmation regardless of
-        # how they actually paid.
-        background_tasks.add_task(
-            send_payment_confirmed_email,
-            order.guest_email,
-            order.guest_full_name,
-            order.order_number,
-            payment.amount,
-            payment.provider,
-        )
-
-    active_staff_emails = [
-        email for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
-    ]
-    background_tasks.add_task(
-        notify_staff_payment_received,
-        active_staff_emails,
-        order.order_number,
-        order.guest_full_name,
-        order.guest_email,
-        payment.amount,
-        payment.provider,
-    )
-
-    logger.info("Cash-on-delivery payment %s marked paid for order %s", payment.id, payment.order_id)
-    return payment
+# mark_cash_payment_paid (and CASH_ON_DELIVERY as a whole) removed
+# 2026-09-16 - Norman's explicit instruction: every order must be paid via
+# PesaPal (mobile money or bank/card) before it's placed, "regardless of
+# picking from the store, within or outside kampala" - there's no more
+# pay-in-store/pay-on-collection path left for this endpoint to serve. Hard
+# removal, not deprecation, matching this project's existing precedent for
+# a client-driven pivot (see CLAUDE.md's branches-removal bullet).
 
 
 def _apply_pesapal_outcome(
@@ -538,50 +464,106 @@ def _apply_pesapal_outcome(
     logger.info("Payment %s resolved: status=%s", payment.id, new_status.value)
 
     if new_status == PaymentStatus.PAID:
-        # A DIFFERENT event from send_order_confirmation_email (fires at
-        # ORDER placement, before any payment exists) - this one only
-        # fires once money has actually been confirmed received. Only
-        # enqueued when there's an email to send to, same optional-email
-        # reasoning as checkout()'s order confirmation job.
+        # THIS is "the order is placed" now (2026-09-16, "must be paid
+        # before it's placed") - everything checkout() used to do
+        # immediately (decrement stock, email the customer, notify staff)
+        # now happens right here, the moment payment is actually confirmed,
+        # not a moment before. An order only ever reaches here in
+        # AWAITING_PAYMENT (checkout() no longer creates one any other
+        # way) - the `if` below is a defensive no-op guard, not the normal
+        # case, for a payment somehow re-confirming against an order that's
+        # already past that point (the already_paid re-check above should
+        # already have caught that, but this is cheap insurance against
+        # ever double-decrementing stock or double-emailing).
         order = db.get(Order, payment.order_id)
 
-        if order.status == OrderStatus.PENDING:
-            # Prepaid order: payment came back PAID before any staff member
-            # got a chance to manually confirm it - skip that step instead
-            # of leaving a paid order sitting in "pending" until someone
-            # notices. Deliberately NOT logged to order_status_history -
-            # that table's changed_by_staff_id is NOT NULL (see its own
-            # comment in models.py) because it only ever records
-            # STAFF-driven transitions through the one PATCH /status
-            # endpoint. This is a system-driven transition, same category
-            # as a customer's own self-service cancel, which already skips
-            # that table for the identical reason.
-            order.status = OrderStatus.CONFIRMED
+        if order.status == OrderStatus.AWAITING_PAYMENT:
+            order_items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+            item_summaries = []
+            for item in order_items:
+                record = (
+                    db.query(InventoryRecord).filter(InventoryRecord.variant_id == item.variant_id).first()
+                )
+                new_quantity = record.quantity_available - item.quantity
+                if new_quantity < 0:
+                    # Norman's own call (2026-09-16): a customer who already
+                    # paid real money keeps their order regardless - this
+                    # can only happen if two people were paying for the
+                    # last unit at nearly the same instant, so it's logged
+                    # as a warning for staff to notice and restock/contact
+                    # the customer, not blocked. Clamped at 0, not left
+                    # negative - InventoryRecord.quantity_available has a DB
+                    # CHECK (>= 0) constraint (ck_quantity_available_non_negative),
+                    # so actually storing a negative number here would crash
+                    # this whole commit with an IntegrityError, undoing the
+                    # very thing this branch exists to guarantee (the order
+                    # still goes through). The InventoryMovement row below
+                    # still logs the real, un-clamped quantity that was
+                    # sold, so the discrepancy between it and the clamped 0
+                    # IS the oversell signal staff see.
+                    logger.warning(
+                        "Inventory oversold: variant %s requested %s more than available after order %s paid",
+                        item.variant_id,
+                        -new_quantity,
+                        order.id,
+                    )
+                    new_quantity = 0
+                record.quantity_available = new_quantity
+                # staff_user_id=None - system-generated, same reasoning
+                # checkout()'s old decrement loop already documented.
+                db.add(
+                    InventoryMovement(
+                        inventory_record_id=record.id,
+                        movement_type=MovementType.SOLD,
+                        quantity_changed=-item.quantity,
+                        staff_user_id=None,
+                        order_id=order.id,
+                    )
+                )
+                item_summaries.append(
+                    {
+                        "name": item.product_name_snapshot,
+                        "variant_label": item.variant_label_snapshot,
+                        "quantity": item.quantity,
+                        "line_total": item.line_total,
+                    }
+                )
+
+            order.status = OrderStatus.PENDING
             db.commit()
-            logger.info("Order %s auto-confirmed on payment %s", order.id, payment.id)
+            logger.info("Order %s placed - payment %s confirmed", order.id, payment.id)
 
-        if order.guest_email:
+            # Only enqueued when there's an email to send to - guest_email
+            # is optional (schemas.py's CheckoutRequest), same as before.
+            if order.guest_email:
+                background_tasks.add_task(
+                    send_order_placed_email,
+                    order.guest_email,
+                    order.guest_full_name,
+                    order.order_number,
+                    item_summaries,
+                    order.subtotal,
+                    order.total,
+                    order.delivery_address,
+                    is_kampala_store_pickup(order),
+                )
+
+            active_staff_emails = [
+                email
+                for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
+            ]
             background_tasks.add_task(
-                send_payment_confirmed_email,
-                order.guest_email,
-                order.guest_full_name,
+                notify_staff_new_order,
+                active_staff_emails,
                 order.order_number,
-                payment.amount,
-                payment.provider,
+                order.guest_full_name,
+                order.guest_email,
+                order.district,
+                item_summaries,
+                order.subtotal,
+                order.total,
+                order.delivery_address,
             )
-
-        active_staff_emails = [
-            email for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
-        ]
-        background_tasks.add_task(
-            notify_staff_payment_received,
-            active_staff_emails,
-            order.order_number,
-            order.guest_full_name,
-            order.guest_email,
-            payment.amount,
-            payment.provider,
-        )
 
 
 @webhook_router.get("/payments/webhook")

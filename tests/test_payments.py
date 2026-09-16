@@ -18,9 +18,11 @@ from conftest import uncategorized_group_id, unwrap
 from models import (
     Category,
     Customer,
+    InventoryMovement,
     InventoryRecord,
     Order,
     OrderItem,
+    OrderStatus,
     Payment,
     Product,
     ProductVariant,
@@ -31,38 +33,9 @@ from models import (
 from routers.payments import _map_pesapal_status
 from security import create_access_token, hash_password
 
-
-@pytest.fixture
-def mock_pesapal(monkeypatch):
-    # Patched where it's USED (routers.payments), not where it's defined
-    # (pesapal_client) - routers/payments.py already imported these names
-    # directly, so patching pesapal_client itself wouldn't affect the
-    # reference routers/payments.py is holding.
-    #
-    # status_responses lets each test control what "PesaPal" reports back
-    # for a given order_tracking_id before hitting the webhook - defaults
-    # to FAILED for anything a test didn't explicitly set.
-    status_responses = {}
-
-    def fake_submit_order_request(merchant_reference, amount, currency, description, billing_email, billing_phone, billing_first_name, billing_last_name, callback_url=None):
-        return {
-            "order_tracking_id": f"PESAPAL-{merchant_reference}",
-            "redirect_url": f"https://cybqa.pesapal.com/pesapalv3/mock-checkout/{merchant_reference}",
-        }
-
-    def fake_get_transaction_status(order_tracking_id):
-        return status_responses.get(order_tracking_id, {"payment_status_description": "FAILED"})
-
-    # Also patched - there are no real PesaPal credentials in this dev/test
-    # environment (see test_initiate_payment_returns_503_when_not_configured
-    # below for the genuine, un-mocked behavior), so without this every
-    # test here would hit PaymentsUnavailableError before ever reaching the
-    # fakes above.
-    monkeypatch.setattr("routers.payments.is_configured", lambda: True)
-    monkeypatch.setattr("routers.payments.submit_order_request", fake_submit_order_request)
-    monkeypatch.setattr("routers.payments.get_transaction_status", fake_get_transaction_status)
-
-    return status_responses
+# mock_pesapal now lives in conftest.py (moved 2026-09-16) - more than one
+# test file needs to drive a real payment to completion now that every
+# order must be paid before it's placed, not just this one.
 
 
 @pytest.fixture
@@ -128,13 +101,26 @@ def order_setup(db):
     owner_token = create_access_token(subject=str(owner.id), account_type="customer")
     other_token = create_access_token(subject=str(other_customer.id), account_type="customer")
 
-    yield {"order": order, "owner_token": owner_token, "other_token": other_token}
+    yield {
+        "order": order,
+        "owner_token": owner_token,
+        "other_token": other_token,
+        "variant": variant,
+        "inventory": inventory,
+    }
 
     # Teardown in FK-dependency order - this project has no ORM
     # relationship() wiring, so SQLAlchemy can't infer delete order itself
     # (see CLAUDE.md); each table needs its own commit before the table it
-    # points to is deleted.
+    # points to is deleted. InventoryMovement rows are new here as of
+    # 2026-09-16 - a confirmed payment now logs a real SOLD movement
+    # (routers/payments.py's _apply_pesapal_outcome), which this fixture
+    # never produced before (it built the Order directly, bypassing
+    # checkout) - must go before BOTH Order and InventoryRecord, since it
+    # references both.
     db.query(Payment).filter(Payment.order_id == order.id).delete()
+    db.commit()
+    db.query(InventoryMovement).filter(InventoryMovement.order_id == order.id).delete()
     db.commit()
     db.query(OrderItem).filter(OrderItem.order_id == order.id).delete()
     db.commit()
@@ -174,9 +160,8 @@ def staff_token(db):
 def owner_staff_token(db):
     # A real StaffRole.OWNER account - NOT to be confused with order_setup's
     # "owner_token", which is a customer token (the customer who owns the
-    # order). Needed because mark-paid became Owner/System-Administrator-only
-    # on 2026-08-30 (Sales Attendant lost Payments access) - staff_token
-    # above is a Sales Attendant and can no longer call it.
+    # order). Used by test_mark_paid_endpoint_removed below to confirm the
+    # route is genuinely gone, not just newly forbidden to a lower role.
     staff = StaffUser(
         full_name="Test Owner",
         email=f"owner-{uuid.uuid4().hex[:8]}@example.com",
@@ -189,6 +174,25 @@ def owner_staff_token(db):
     token = create_access_token(subject=str(staff.id), account_type="staff")
     yield token
 
+    db.query(StaffUser).filter(StaffUser.id == staff.id).delete()
+    db.commit()
+
+
+@pytest.fixture
+def active_staff(db):
+    # An active StaffUser to verify notify_staff_new_order actually reaches
+    # (added 2026-09-16 - that job now fires from the payment-success path,
+    # not checkout, so this file needs its own real recipient to check for,
+    # same idea as test_order_notifications.py's identically-named fixture).
+    staff = StaffUser(
+        full_name="Active Payments Staff",
+        email=f"activepaystaff-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("Password123"),
+        role=StaffRole.SALES_ATTENDANT,
+    )
+    db.add(staff)
+    db.commit()
+    yield staff
     db.query(StaffUser).filter(StaffUser.id == staff.id).delete()
     db.commit()
 
@@ -262,20 +266,24 @@ def test_payment_lifecycle(client, order_setup, mock_pesapal):
     assert response.status_code == 409
 
 
-def test_payment_confirmed_email_sent_when_webhook_marks_paid(client, db, order_setup, mock_pesapal, mock_email):
+def test_paid_payment_places_the_order_and_notifies_everyone(
+    client, db, order_setup, mock_pesapal, mock_email, active_staff
+):
+    # THE core regression test for "must be paid before it's placed"
+    # (2026-09-16): order_setup's Order starts in awaiting_payment (the
+    # model default) with 10 units of stock and one real OrderItem (qty 1,
+    # "Test Product") - nothing has happened to it yet. Only once PesaPal
+    # confirms payment should it actually become a real, placed order.
     order = order_setup["order"]
     headers = _auth(order_setup["owner_token"])
-
-    # order_setup's Order has no guest_email set (see that fixture) - set
-    # one here directly, since send_payment_confirmed_email only fires
-    # when there's actually somewhere to send it (same optional-email
-    # reasoning as send_order_confirmation_email).
     order.guest_email = "payer-inbox@example.com"
     db.commit()
 
+    assert order.status == OrderStatus.AWAITING_PAYMENT
+
     response = client.post(
         f"/api/v1/orders/{order.id}/payments",
-        json={"provider": "mobile_money", "amount": 50000.0},
+        json={"provider": "mobile_money"},
         headers=headers,
     )
     payment = unwrap(response)
@@ -284,14 +292,42 @@ def test_payment_confirmed_email_sent_when_webhook_marks_paid(client, db, order_
     response = _webhook_call(client, payment["provider_reference"], payment["id"])
     assert response.status_code == 200
 
-    confirmation = next((e for e in mock_email if e["to_email"] == "payer-inbox@example.com"), None)
-    assert confirmation is not None
-    assert order.order_number in confirmation["subject"]
-    assert order.order_number in confirmation["body"]
-    assert order.order_number in confirmation["html"]
+    db.refresh(order)
+    assert order.status == OrderStatus.PENDING
+
+    # Stock decremented NOW, not at checkout - order_setup's InventoryRecord
+    # started at 10, one unit was "sold".
+    db.refresh(order_setup["inventory"])
+    assert order_setup["inventory"].quantity_available == 9
+
+    # The customer gets the SAME "Order Placed" email checkout used to send
+    # immediately - it now only fires here, with the real item/subtotal/
+    # total details (order_setup's one OrderItem: "Test Product" x1).
+    customer_email = next((e for e in mock_email if e["to_email"] == "payer-inbox@example.com"), None)
+    assert customer_email is not None
+    assert "Placed" in customer_email["subject"]
+    assert order.order_number in customer_email["subject"]
+    assert "Test Product" in customer_email["body"]
+    assert "Test Product" in customer_email["html"]
+
+    # Every active staff member gets the upgraded admin notification, now
+    # also carrying the item/subtotal/total breakdown (2026-09-16, Norman's
+    # explicit request) - not just the order's grand total.
+    staff_email = next((e for e in mock_email if e["to_email"] == active_staff.email), None)
+    assert staff_email is not None
+    assert f"New Order {order.order_number} Placed" == staff_email["subject"]
+    assert "Test Product" in staff_email["body"]
+    assert "Test Product" in staff_email["html"]
+    assert "Subtotal" in staff_email["html"]
 
 
-def test_no_payment_confirmed_email_when_webhook_marks_failed(client, db, order_setup, mock_pesapal, mock_email):
+def test_no_order_placed_email_when_payment_fails(client, db, order_setup, mock_pesapal, mock_email):
+    # Pins the exact bug Norman found in real UAT testing (2026-09-16):
+    # proceeding to PesaPal's page and abandoning it without paying must
+    # NOT produce an "Order Placed" email - under the old design it did,
+    # because that email fired at checkout (before payment), not at
+    # payment success. Now checkout doesn't email anyone at all, so a
+    # failed/abandoned payment should leave mock_email completely empty.
     order = order_setup["order"]
     headers = _auth(order_setup["owner_token"])
     order.guest_email = "payer-inbox@example.com"
@@ -299,7 +335,7 @@ def test_no_payment_confirmed_email_when_webhook_marks_failed(client, db, order_
 
     response = client.post(
         f"/api/v1/orders/{order.id}/payments",
-        json={"provider": "card", "amount": 50000.0},
+        json={"provider": "card"},
         headers=headers,
     )
     payment = unwrap(response)
@@ -308,7 +344,99 @@ def test_no_payment_confirmed_email_when_webhook_marks_failed(client, db, order_
     response = _webhook_call(client, payment["provider_reference"], payment["id"])
     assert response.status_code == 200
 
-    assert not any(e["to_email"] == "payer-inbox@example.com" for e in mock_email)
+    assert mock_email == []
+
+    db.refresh(order)
+    assert order.status == OrderStatus.AWAITING_PAYMENT
+    # Stock was never touched by the failed attempt either.
+    db.refresh(order_setup["inventory"])
+    assert order_setup["inventory"].quantity_available == 10
+
+
+def test_awaiting_payment_order_hidden_from_staff_list_until_paid(
+    client, order_setup, staff_token, mock_pesapal
+):
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+    staff_headers = _auth(staff_token)
+
+    response = client.get("/api/v1/orders/staff", headers=staff_headers)
+    order_ids = {o["id"] for o in unwrap(response)["items"]}
+    assert str(order.id) not in order_ids
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money"},
+        headers=headers,
+    )
+    payment = unwrap(response)
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Completed"}
+    _webhook_call(client, payment["provider_reference"], payment["id"])
+
+    response = client.get("/api/v1/orders/staff", headers=staff_headers)
+    order_ids = {o["id"] for o in unwrap(response)["items"]}
+    assert str(order.id) in order_ids
+
+
+def test_oversold_payment_still_succeeds(client, db, order_setup, mock_pesapal, caplog):
+    # Norman's explicit call (2026-09-16): a customer who already paid real
+    # money keeps their order even if two people happened to pay for the
+    # last unit at nearly the same instant - refusing it now would mean an
+    # awkward refund, which is worse than a rare oversold item. Simulated
+    # here by draining stock to 0 BEFORE the payment confirms (the exact
+    # shape a real race would leave behind), rather than actually racing
+    # two requests against each other.
+    order = order_setup["order"]
+    order_setup["inventory"].quantity_available = 0
+    db.commit()
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "mobile_money"},
+        headers=headers,
+    )
+    payment = unwrap(response)
+    mock_pesapal[payment["provider_reference"]] = {"payment_status_description": "Completed"}
+
+    with caplog.at_level("WARNING"):
+        response = _webhook_call(client, payment["provider_reference"], payment["id"])
+    assert response.status_code == 200
+
+    db.refresh(order)
+    assert order.status == OrderStatus.PENDING  # placed anyway, not blocked
+    db.refresh(order_setup["inventory"])
+    # Clamped at 0, not left negative - InventoryRecord.quantity_available
+    # has its own DB CHECK (>= 0) constraint (see routers/payments.py's
+    # comment); the warning log is the actual oversell signal, not a
+    # negative number in the row itself.
+    assert order_setup["inventory"].quantity_available == 0
+    assert "oversold" in caplog.text.lower()
+
+
+def test_payment_provider_rejects_cash_on_delivery(client, order_setup):
+    # cash_on_delivery removed entirely 2026-09-16 - every order must now
+    # be paid via PesaPal (mobile money or card/bank), "regardless of
+    # picking from the store, within or outside kampala" (Norman's own
+    # words). No longer a valid PaymentProvider value at all.
+    order = order_setup["order"]
+    headers = _auth(order_setup["owner_token"])
+
+    response = client.post(
+        f"/api/v1/orders/{order.id}/payments",
+        json={"provider": "cash_on_delivery"},
+        headers=headers,
+    )
+    assert response.status_code == 422
+
+
+def test_mark_paid_endpoint_removed(client, order_setup, owner_staff_token):
+    # PATCH /payments/{id}/mark-paid no longer exists at all - removed
+    # alongside cash-on-delivery.
+    response = client.patch(
+        f"/api/v1/payments/{uuid.uuid4()}/mark-paid", headers=_auth(owner_staff_token)
+    )
+    assert response.status_code == 404
 
 
 def test_webhook_failed_payment(client, order_setup, mock_pesapal):
@@ -371,12 +499,15 @@ def test_read_payment_recheck_resolves_paid_when_webhook_missed(
     response = client.get(f"/api/v1/payments/{payment['id']}", headers=headers)
     assert unwrap(response)["status"] == "paid"
 
-    # The same confirmation email the webhook path sends still fires here -
-    # a customer shouldn't miss it just because the recheck, not the
+    # The same "Order Placed" email the webhook path sends still fires here
+    # - a customer shouldn't miss it just because the recheck, not the
     # webhook, was what actually discovered the payment succeeded.
     confirmation = next((e for e in mock_email if e["to_email"] == "payer-inbox@example.com"), None)
     assert confirmation is not None
     assert order.order_number in confirmation["subject"]
+
+    db.refresh(order)
+    assert order.status == OrderStatus.PENDING
 
 
 def test_read_payment_recheck_does_not_mark_failed(client, order_setup, mock_pesapal):
@@ -537,7 +668,7 @@ def test_staff_can_manage_any_orders_payments(client, order_setup, staff_token, 
 
     response = client.post(
         f"/api/v1/orders/{order.id}/payments",
-        json={"provider": "cash_on_delivery", "amount": 50000.0},
+        json={"provider": "mobile_money"},
         headers=headers,
     )
     assert response.status_code == 201
@@ -666,87 +797,8 @@ def test_payment_provider_rejects_unknown_value(client, order_setup):
     assert response.status_code == 422
 
 
-def test_cash_on_delivery_skips_pesapal_and_staff_can_mark_it_paid(
-    client, db, order_setup, owner_staff_token, mock_email
-):
-    # Deliberately NOT using mock_pesapal - cash-on-delivery should never
-    # touch pesapal_client at all, so if it did, this test would fail with
-    # a real network call instead of a mocked one.
-    order = order_setup["order"]
-    order.guest_email = "cash-payer@example.com"
-    db.commit()
-    headers = _auth(order_setup["owner_token"])
-
-    response = client.post(
-        f"/api/v1/orders/{order.id}/payments",
-        json={"provider": "cash_on_delivery", "amount": 50000.0},
-        headers=headers,
-    )
-    assert response.status_code == 201
-    payment = unwrap(response)
-    assert payment["status"] == "pending"
-    assert payment["redirect_url"] is None
-    assert payment["provider_reference"] is None
-
-    # mark-paid is Owner/System-Administrator-only as of 2026-08-30 (Sales
-    # Attendant lost Payments access entirely - see
-    # test_mark_paid_rejects_sales_attendant below), so this uses a real
-    # StaffRole.OWNER token, not the Sales Attendant staff_token fixture.
-    staff_headers = _auth(owner_staff_token)
-    response = client.patch(f"/api/v1/payments/{payment['id']}/mark-paid", headers=staff_headers)
-    assert response.status_code == 200
-    assert unwrap(response)["status"] == "paid"
-
-    confirmation = next((e for e in mock_email if e["to_email"] == "cash-payer@example.com"), None)
-    assert confirmation is not None
-    assert order.order_number in confirmation["subject"]
-
-    # Can't mark it paid twice
-    response = client.patch(f"/api/v1/payments/{payment['id']}/mark-paid", headers=staff_headers)
-    assert response.status_code == 409
-
-    # A customer (not staff) can't mark it paid
-    response = client.post(
-        f"/api/v1/orders/{order.id}/payments",
-        json={"provider": "cash_on_delivery", "amount": 50000.0},
-        headers=headers,
-    )
-    assert response.status_code == 409  # already paid (the first cash payment)
-
-
-def test_mark_paid_rejects_non_cash_payments(client, order_setup, owner_staff_token, mock_pesapal):
-    order = order_setup["order"]
-    headers = _auth(order_setup["owner_token"])
-
-    response = client.post(
-        f"/api/v1/orders/{order.id}/payments",
-        json={"provider": "mobile_money", "amount": 50000.0},
-        headers=headers,
-    )
-    payment = unwrap(response)
-
-    response = client.patch(
-        f"/api/v1/payments/{payment['id']}/mark-paid", headers=_auth(owner_staff_token)
-    )
-    assert response.status_code == 400
-
-
-def test_mark_paid_rejects_sales_attendant(client, order_setup, staff_token, mock_pesapal):
-    # Pins the 2026-08-30 client-requested RBAC narrowing: Sales Attendant
-    # lost Payments access entirely, so even a legitimate cash-on-delivery
-    # payment can no longer be marked paid by that role - a plain 403, not
-    # reaching any of the business-rule checks inside the route at all.
-    order = order_setup["order"]
-    headers = _auth(order_setup["owner_token"])
-
-    response = client.post(
-        f"/api/v1/orders/{order.id}/payments",
-        json={"provider": "cash_on_delivery", "amount": 50000.0},
-        headers=headers,
-    )
-    payment = unwrap(response)
-
-    response = client.patch(
-        f"/api/v1/payments/{payment['id']}/mark-paid", headers=_auth(staff_token)
-    )
-    assert response.status_code == 403
+# test_cash_on_delivery_skips_pesapal_and_staff_can_mark_it_paid,
+# test_mark_paid_rejects_non_cash_payments, and
+# test_mark_paid_rejects_sales_attendant were removed 2026-09-16 alongside
+# cash-on-delivery itself (see test_payment_provider_rejects_cash_on_delivery
+# and test_mark_paid_endpoint_removed above, which pin its actual removal).

@@ -260,6 +260,8 @@ def notify_staff_new_order(
     customer_name: str,
     customer_email: str | None,
     district: str,
+    items: list[dict],
+    subtotal: float,
     total: float,
     delivery_address: str,
 ) -> None:
@@ -269,6 +271,11 @@ def notify_staff_new_order(
     # every staff role even manages orders day to day, but
     # the docs don't specify a narrower audience, and "everyone sees it"
     # is easy to reason about and safe to start with).
+    #
+    # Gained items/subtotal/total 2026-09-16, at Norman's explicit request
+    # ("Lets do the same for Admin Email... List of products, Qnty, Total,
+    # Sub Total, Total. Just the same way for customers.") - staff used to
+    # only see the order's grand total, not what was actually bought.
     if not staff_emails:
         # Nothing to do - not an error, just no active staff to notify
         # (shouldn't happen in practice; the seeded System Administrator
@@ -276,12 +283,20 @@ def notify_staff_new_order(
         return
 
     subject = f"New Order {order_number} Placed"
+    item_lines = "\n".join(
+        f"- {item['name']}"
+        + (f" ({item['variant_label']})" if item.get("variant_label") else "")
+        + f" x{item['quantity']} - UGX {item['line_total']:,.2f}"
+        for item in items
+    )
     body = (
         "A new order has been placed.\n\n"
         f"Order: {order_number}\n"
         f"Customer: {customer_name}\n"
         f"Email: {customer_email or 'N/A'}\n"
-        f"District: {district}\n"
+        f"District: {district}\n\n"
+        f"Items:\n{item_lines}\n\n"
+        f"Subtotal: UGX {subtotal:,.2f}\n"
         f"Total: UGX {total:,.2f}\n"
         f"Delivering to: {delivery_address}\n\n"
         "Log in to the staff dashboard to process it."
@@ -291,6 +306,8 @@ def notify_staff_new_order(
         customer_name=customer_name,
         customer_email=customer_email or "N/A",
         district=district,
+        items=[{**item, "line_total": f"{item['line_total']:,.2f}"} for item in items],
+        subtotal=f"{subtotal:,.2f}",
         total=f"{total:,.2f}",
         delivery_address=delivery_address,
         dashboard_url=STAFF_DASHBOARD_URL,
@@ -316,53 +333,13 @@ def notify_staff_new_order(
     logger.info("New-order notification sent to %d/%d staff for order %s", sent_count, len(staff_emails), order_number)
 
 
-def notify_staff_payment_received(
-    staff_emails: list[str],
-    order_number: str,
-    customer_name: str,
-    customer_email: str | None,
-    amount: float,
-    provider: str,
-) -> None:
-    # Staff-facing counterpart to send_payment_confirmed_email (which goes
-    # to the CUSTOMER) - fires to every active staff member once a payment
-    # actually resolves to PAID, same "everyone sees it" reasoning as
-    # notify_staff_new_order above.
-    if not staff_emails:
-        return
-
-    subject = f"Payment Received for Order {order_number}"
-    body = (
-        "A payment has been received.\n\n"
-        f"Order: {order_number}\n"
-        f"Customer: {customer_name}\n"
-        f"Email: {customer_email or 'N/A'}\n"
-        f"Amount: UGX {amount:,.2f}\n"
-        f"Payment method: {provider}\n\n"
-        "Log in to the staff dashboard to process this order."
-    )
-    html = _template_env.get_template("staff_payment_received.html").render(
-        order_number=order_number,
-        customer_name=customer_name,
-        customer_email=customer_email,
-        amount=f"{amount:,.2f}",
-        provider=provider,
-        dashboard_url=STAFF_DASHBOARD_URL,
-    )
-
-    if not email_client.is_configured():
-        logger.info("Resend not configured - staff payment notification for order %s not sent", order_number)
-        return
-
-    sent_count = 0
-    for staff_email in staff_emails:
-        try:
-            email_client.send_email(staff_email, subject, body, html=html)
-            sent_count += 1
-        except email_client.EmailError:
-            logger.exception("Failed to send payment notification to %s for order %s", staff_email, order_number)
-
-    logger.info("Payment notification sent to %d/%d staff for order %s", sent_count, len(staff_emails), order_number)
+# notify_staff_payment_received / send_payment_confirmed_email removed
+# 2026-09-16 - "order placed" and "payment confirmed" are now the exact
+# same event (see routers/payments.py's _apply_pesapal_outcome), so a
+# separate payment-received email/notification firing a moment after
+# notify_staff_new_order/send_order_placed_email would just be a duplicate
+# telling staff/the customer the same thing twice. See CLAUDE.md for the
+# full story.
 
 
 def send_staff_welcome_email(
@@ -413,49 +390,6 @@ def send_staff_welcome_email(
         return
 
     logger.info("Welcome email sent to new staff %s", email)
-
-
-def send_payment_confirmed_email(
-    email: str,
-    full_name: str,
-    order_number: str,
-    amount: float,
-    provider: str,
-) -> None:
-    # NOT in the original spec's checkout sequence diagram (that one only
-    # covers send_order_placed_email/notify_staff_new_order at ORDER
-    # placement, before any payment exists) - added afterward because an
-    # order being PLACED and an order being PAID FOR are genuinely
-    # different events or a customer, worth its own confirmation. Fires
-    # from routers/payments.py's payment_webhook, only when a payment
-    # attempt actually resolves to PaymentStatus.PAID.
-    subject = f"Payment Received for Order {order_number}"
-    body = (
-        f"Hi {full_name},\n\n"
-        f"We've received your payment for order {order_number}. Your order is confirmed "
-        "and will be processed shortly.\n\n"
-        f"Amount paid: UGX {amount:,.2f}\n"
-        f"Payment method: {provider}\n\n"
-        "Thanks for shopping with JN Electronics."
-    )
-    html = _template_env.get_template("payment_confirmed.html").render(
-        full_name=full_name,
-        order_number=order_number,
-        amount=f"{amount:,.2f}",
-        provider=provider,
-    )
-
-    if not email_client.is_configured():
-        logger.info("Resend not configured - payment confirmation for %s not sent (order %s)", email, order_number)
-        return
-
-    try:
-        email_client.send_email(email, subject, body, html=html)
-    except email_client.EmailError:
-        logger.exception("Failed to send payment confirmation email to %s for order %s", email, order_number)
-        return
-
-    logger.info("Payment confirmation email sent to %s for order %s", email, order_number)
 
 
 def send_order_out_for_delivery_email(

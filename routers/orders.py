@@ -14,12 +14,10 @@ from audit import write_audit_log
 from database import get_db
 from envelope import EnvelopeRoute
 from jobs import (
-    notify_staff_new_order,
     send_order_collected_email,
     send_order_confirmed_email,
     send_order_delivered_email,
     send_order_out_for_delivery_email,
-    send_order_placed_email,
 )
 from models import (
     Cart,
@@ -75,7 +73,15 @@ class InvalidStateTransitionError(Exception):
 # advance_order_status's explicit to_status==CANCELLED check below for
 # the friendlier error that points callers there. Delivered/cancelled are
 # terminal either way - no further transition is ever valid from either.
+#
+# AWAITING_PAYMENT has NO valid outgoing transition here, on purpose - the
+# only thing that can ever move an order out of it is a confirmed PesaPal
+# payment (routers/payments.py's _apply_pesapal_outcome), never a staff
+# PATCH. This is what makes "must be paid before it can be confirmed"
+# (Norman's own wording, 2026-09-16) actually enforced, not just a matter
+# of staff not bothering to click confirm early.
 VALID_STATUS_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
+    OrderStatus.AWAITING_PAYMENT: set(),
     OrderStatus.PENDING: {OrderStatus.CONFIRMED},
     OrderStatus.CONFIRMED: {OrderStatus.PACKED},
     OrderStatus.PACKED: {OrderStatus.OUT_FOR_DELIVERY},
@@ -313,16 +319,15 @@ def checkout(
             short_items=short_items,
         )
 
-    # Build the order's line items BEFORE touching inventory, so if
-    # anything here fails, we haven't already decremented stock we then
-    # have no order to justify.
+    # Build the order's line items - no inventory touched here at all
+    # anymore (2026-09-16, client-requested "must be paid before it's
+    # placed"). Stock is only ever checked here (via _find_short_items
+    # above), never decremented - the actual decrement now happens in
+    # routers/payments.py's _apply_pesapal_outcome, the moment PesaPal
+    # confirms the payment that makes this a real order. Reserving stock
+    # for an order nobody has paid for yet (and might never pay for) would
+    # tie up inventory for no reason.
     order_items = []
-    # Plain dicts, built alongside order_items above - what
-    # send_order_placed_email actually gets handed (see jobs.py for
-    # why: it runs after this request's DB session has closed, so it can
-    # only safely receive plain values, not the OrderItem ORM objects
-    # themselves).
-    item_summaries = []
     subtotal = 0.0
     for item in cart_items:
         variant = db.get(ProductVariant, item.variant_id)
@@ -346,14 +351,6 @@ def checkout(
                 unit_price=unit_price,
                 line_total=line_total,
             )
-        )
-        item_summaries.append(
-            {
-                "name": product.name,
-                "variant_label": variant.variant_label,
-                "quantity": item.quantity,
-                "line_total": line_total,
-            }
         )
 
     new_order = Order(
@@ -382,6 +379,13 @@ def checkout(
         # delivery_fee resolved above from the area/station lookup, 0 for
         # a Kampala pickup order with none selected.
         total=subtotal + delivery_fee,
+        # Explicit, even though it's also the column's own default (see
+        # models.py) - this is the one line that actually enforces "not
+        # placed until paid": nothing below sends an email or touches
+        # stock, and staff have no valid transition out of this status at
+        # all (VALID_STATUS_TRANSITIONS) until a real PesaPal payment
+        # confirms and routers/payments.py moves it to PENDING itself.
+        status=OrderStatus.AWAITING_PAYMENT,
     )
     db.add(new_order)
     db.flush()  # assigns new_order.id without fully committing yet, so
@@ -391,71 +395,25 @@ def checkout(
         order_item.order_id = new_order.id
         db.add(order_item)
 
-    # Decrement each item's single global stock row now that the order is
-    # committed to existing.
-    for item in cart_items:
-        record = db.query(InventoryRecord).filter(InventoryRecord.variant_id == item.variant_id).first()
-        record.quantity_available -= item.quantity
-        # staff_user_id=None - a checkout is system-generated (the docs
-        # explicitly call this out: null for system-generated 'sold'
-        # movements), there's no staff actor to attribute it to.
-        db.add(
-            InventoryMovement(
-                inventory_record_id=record.id,
-                movement_type=MovementType.SOLD,
-                quantity_changed=-item.quantity,
-                staff_user_id=None,
-                order_id=new_order.id,
-            )
-        )
-
     # The cart that was just checked out is done being "active" - a later
-    # add-to-cart call will create a fresh one.
+    # add-to-cart call will create a fresh one. This happens regardless of
+    # whether the customer ever actually pays - retrying payment for THIS
+    # order (still sitting in awaiting_payment) doesn't need the cart, it
+    # already has its own order_items.
     cart.status = CartStatus.CONVERTED
 
     db.commit()
     db.refresh(new_order)
-    logger.info("Order %s placed (total=%s)", new_order.order_number, new_order.total)
+    logger.info("Order %s created, awaiting payment (total=%s)", new_order.order_number, new_order.total)
 
-    # Spec'd in docs/JN_API_Specification.md's checkout sequence diagram
-    # (§4.2) - both run AFTER this response is sent (see jobs.py's module
-    # docstring for the BackgroundTasks vs RQ trade-off this project made).
-    #
-    # Only enqueued when there's actually an email to send to - guest_email
-    # is optional (schemas.py's CheckoutRequest), so a phone-only guest
-    # checkout has nothing for this job to send to.
-    if request.guest_email:
-        background_tasks.add_task(
-            send_order_placed_email,
-            request.guest_email,
-            request.guest_full_name,
-            new_order.order_number,
-            item_summaries,
-            subtotal,
-            new_order.total,
-            request.delivery_address,
-            is_kampala_store_pickup(new_order),
-        )
-
-    # Every active staff member, regardless of role - queried NOW (this
-    # request's db session is still open) rather than inside the job
-    # itself, keeping notify_staff_new_order free of any DB dependency,
-    # same reasoning send_order_placed_email above takes plain
-    # values instead of ORM objects.
-    active_staff_emails = [
-        email for (email,) in db.query(StaffUser.email).filter(StaffUser.is_active == True).all()  # noqa: E712
-    ]
-    background_tasks.add_task(
-        notify_staff_new_order,
-        active_staff_emails,
-        new_order.order_number,
-        request.guest_full_name,
-        request.guest_email,
-        new_order.district,
-        new_order.total,
-        request.delivery_address,
-    )
-
+    # No emails fire here anymore - send_order_placed_email/
+    # notify_staff_new_order (the ones the old checkout() sent immediately,
+    # before any payment existed) now fire only once PesaPal actually
+    # confirms payment (routers/payments.py's _apply_pesapal_outcome). This
+    # is the direct fix for a real bug Norman found: proceeding to
+    # PesaPal's page and abandoning it without paying still produced an
+    # "Order Placed" email, because that email used to be tied to checkout
+    # (cart -> order), not to payment succeeding.
     return _build_order_read(new_order, db)
 
 
@@ -497,6 +455,14 @@ def list_all_orders_staff(
 
     if order_status is not None:
         query = query.filter(Order.status == order_status)
+    else:
+        # An unpaid order isn't a real order to staff yet (2026-09-16,
+        # "must be paid before it's placed") - excluded from the default
+        # view so an abandoned/failed PesaPal checkout doesn't show up as
+        # something to fulfil. Still reachable by explicitly filtering
+        # ?order_status=awaiting_payment, e.g. for a support agent tracing
+        # a customer's stuck checkout.
+        query = query.filter(Order.status != OrderStatus.AWAITING_PAYMENT)
     if search:
         # order number OR the guest phone number on file - staff typically
         # have one or the other in hand (a customer reading out their

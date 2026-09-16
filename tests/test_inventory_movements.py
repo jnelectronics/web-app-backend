@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from conftest import uncategorized_group_id, unwrap
+from conftest import pay_order, uncategorized_group_id, unwrap
 from models import (
     AuditLog,
     Cart,
@@ -17,6 +17,7 @@ from models import (
     InventoryRecord,
     Order,
     OrderItem,
+    Payment,
     Product,
     ProductVariant,
     StaffRole,
@@ -137,7 +138,14 @@ def test_adjust_logs_custom_movement_type_and_reason(client, db, movement_varian
     db.commit()
 
 
-def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, movement_variant, staff_tokens):
+def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, movement_variant, staff_tokens, mock_pesapal):
+    # 2026-09-16: checkout alone no longer logs a SOLD movement (or touches
+    # stock at all) - that now only happens once a real PesaPal payment is
+    # confirmed (see routers/payments.py's _apply_pesapal_outcome), so this
+    # test has to actually pay for the order (via conftest.py's mock_pesapal
+    # fixture and pay_order helper) before the SOLD movement shows up, and
+    # before the order is even eligible to be cancelled (an unpaid,
+    # awaiting_payment order isn't in EDITABLE_STATUSES at all).
     variant = movement_variant
     record = InventoryRecord(variant_id=variant.id, quantity_available=10)
     db.add(record)
@@ -171,6 +179,9 @@ def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, movement
     )
     assert checkout_response.status_code == 200
     order = unwrap(checkout_response)
+    assert order["status"] == "awaiting_payment"
+
+    pay_order(client, order["id"], mock_pesapal, headers=_auth(customer_token))
 
     staff_headers = _auth(staff_tokens[StaffRole.OWNER])
     response = client.get(f"/api/v1/inventory/{record.id}/movements", headers=staff_headers)
@@ -188,6 +199,8 @@ def test_checkout_and_cancel_log_sold_and_restore_movements(client, db, movement
     )
 
     db.query(InventoryMovement).filter(InventoryMovement.inventory_record_id == record.id).delete()
+    db.commit()
+    db.query(Payment).filter(Payment.order_id == uuid.UUID(order["id"])).delete()
     db.commit()
     db.query(OrderItem).filter(OrderItem.order_id == uuid.UUID(order["id"])).delete()
     db.commit()
